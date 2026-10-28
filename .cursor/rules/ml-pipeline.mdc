@@ -47,7 +47,7 @@ alwaysApply: false
 - `models/<model_version>/` = файл моделі + `model_metadata.json` (схема ТЗ §5.4), генерується лише пайплайном.
 - Обов'язково: `git_commit`, `git_dirty`, версії бібліотек, `data_hash`, seed, `experiment_id`, `n_trials_total`, DSR, PBO, `validated_by`, `live_corridor`, `primary_strategy`, `decision_rule`.
 - `git_dirty = true` → модель не може стати `CANDIDATE`.
-- Hold-out перевіряє рецепт; у live йде модель, перенавчена за тим самим рецептом на всіх даних **без підбору**, після Paper/Testnet.
+- Hold-out перевіряє рецепт; у live йде модель, перенавчена за тим самим рецептом на всіх даних **без підбору**, після Demo/Testnet.
 - Статуси `TRAINED → CANDIDATE → APPROVED → RETIRED`; `APPROVED` ставить лише людина.
 - Інференс блокується при розбіжності `feature_schema_hash`, `preprocessing_version` або версії бібліотеки моделі.
 - Важкі обчислення — лише у воркері, не в торговому процесі.

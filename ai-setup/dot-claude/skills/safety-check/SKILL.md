@@ -15,7 +15,7 @@ disable-model-invocation: true
    ```
    Для фронтенду (якщо змінений): `npm run typecheck && npm test`.
    Також: `python3 scripts/sync_ai_rules.py --check`.
-3. Визнач клас ризику змін (за `docs/ai/TASKS.md`): R3 якщо зачеплено `exchange/ trading/ risk/ protection/ reconcile/`, Emergency Stop, шифрування ключів.
+3. Визнач клас ризику змін (за `docs/ai/TASKS.md`): R3 якщо зачеплено `exchange/ trading/ risk/ protection/ reconcile/`, Emergency Stop, робота з ключами біржі.
 4. Незалежне рев'ю:
    - у Claude Code — делегуй субагенту `trading-safety-reviewer` (для `ml/` — ще й `ml-leakage-auditor`), передай лише список файлів/дифф, **без** своїх пояснень, щоб рев'ю було незалежним;
    - у Cursor — пройди чекліст нижче сам, у новому чаті, бажано іншою моделлю.

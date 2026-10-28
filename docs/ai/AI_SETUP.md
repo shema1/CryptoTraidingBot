@@ -18,7 +18,7 @@
 |---|---|
 | `order-state-machine` | машина станів ордера, `SUBMISSION_UNKNOWN`, fills |
 | `risk-engine-change` | Risk Engine, sizing, захист позицій |
-| `exchange-adapter` | `ExchangeAdapter`, Bybit, Paper, rate limiter, WS |
+| `exchange-adapter` | `ExchangeAdapter`, Bybit (live / demo / testnet), rate limiter, WS |
 | `ml-pipeline` | фічі, таргет, бектест, валідація |
 | `db-migration` | схема БД, Alembic, TimescaleDB |
 | `field-help` | підказки в UI |
