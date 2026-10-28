@@ -1,0 +1,33 @@
+# Встановлення: `pre-commit install` (pre-commit входить у dev-групу apps/backend: `uv run pre-commit install`).
+# Усі хуки локальні й виконуються через uv, тому версії беруться з apps/backend/uv.lock.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --directory apps/backend ruff check .
+        language: system
+        pass_filenames: false
+        files: ^apps/backend/.*\.py$
+      - id: ruff-format
+        name: ruff format --check
+        entry: uv run --directory apps/backend ruff format --check .
+        language: system
+        pass_filenames: false
+        files: ^apps/backend/.*\.py$
+      - id: mypy
+        name: mypy
+        entry: uv run --directory apps/backend mypy
+        language: system
+        pass_filenames: false
+        files: ^apps/backend/.*\.py$
+      - id: sync-ai-rules
+        name: sync_ai_rules --check (.claude/rules → .cursor/rules)
+        entry: uv run --project apps/backend python scripts/sync_ai_rules.py --check
+        language: system
+        pass_filenames: false
+        files: ^(\.claude/rules/|\.cursor/rules/|scripts/sync_ai_rules\.py)
+      - id: no-env-files
+        name: заборона комітів .env / ключів
+        entry: uv run --project apps/backend python scripts/check_no_env_files.py
+        language: system

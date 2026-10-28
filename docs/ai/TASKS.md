@@ -115,10 +115,11 @@
 
 ### Етап 0. Фундамент
 
-#### T0.1 · Каркас монорепозиторію та інструменти якості `[ ]`
+#### T0.1 · Каркас монорепозиторію та інструменти якості `[~]`
 - **Ризик:** R1 · **Модель:** Sonnet 5.5 (`sonnet`, `high`) · **ТЗ:** §2, §3, §14
 - **Зробити:** структура тек з ТЗ §3; `apps/backend/pyproject.toml` (uv, Python 3.11+), ruff (вкл. правила `S`, `B`, `DTZ`), mypy (strict для `exchange/ trading/ risk/ protection/ reconcile/ core/`), pytest з маркерами `unit/integration/testnet/slow/chaos`, hypothesis; `apps/web` (Vite + React + TS, скрипти `typecheck`, `test`, `gen:api`); pre-commit (ruff, mypy, `python3 scripts/sync_ai_rules.py --check`, заборона комітів `.env`); `.env.example` без значень; README з командами; `git init` (потрібен для hook перевірки документації); шаблон `docs/decisions/0000-template.md`; шаблон `README.md` для модулів бекенду; тест, що всі поля конфігу присутні в `.env.example`.
 - **Готово, коли:** `uv run pytest`, `ruff`, `mypy`, `npm run typecheck` проходять на порожньому каркасі; pre-commit встановлено; кожен пакет у `apps/backend/app/` має `README.md`.
+- **Примітки (2026-10-28):** створено каркас: `apps/backend` (pyproject з ruff/mypy/pytest/hypothesis, пакети ТЗ §3 з README, мінімальний `core/config.py`, тести структури, `.env.example` і `scripts/check_no_env_files.py`), `apps/web` (Vite + React + TS; `gen:api` — заглушка до T6.4), `.pre-commit-config.yaml`, `.env.example`, README кореня й модулів, шаблон `docs/templates/backend-module-README.md`. Git-репозиторій уже існував. ruff і pytest (22 тести) пройдено в хмарному середовищі; **На Mac (2026-10-28) виконано:** `uv sync`, `npm install` (створено `uv.lock`, `package-lock.json` — закомітити), `uv run mypy`, `npm run typecheck`, pytest (22), `pre-commit run --all-files`; додано `pythonpath` у pytest та відсутній `.pre-commit-config.yaml`. `.claude/` встановлено (`ai-setup/install.sh`), усі хуки `pre-commit run --all-files` проходять. **Лишилось:** `pre-commit install` на постійному `uv` у `PATH`; `npm audit` — 3 вразливості у dev-залежності vitest: рішення користувача (2026-10-28) — залишити до наступної задачі (апгрейд до 5.x — breaking change) → після `pre-commit install` `[x]`. Документація: README.md, apps/backend/README.md, apps/web/README.md, README модулів, .env.example, AGENTS.md (mypy strict включає `core/`).
 
 #### T0.2 · Docker Compose: TimescaleDB `[ ]`
 - **Ризик:** R1 · **Модель:** Sonnet 5.5 (`sonnet`, `medium`) · **ТЗ:** §2, §12.1, §12.2
