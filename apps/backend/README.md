@@ -30,8 +30,10 @@ uv run mypy                                       # app/ і tests/; strict дл�
 
 ## Інструменти якості (`pyproject.toml`)
 
-- **ruff:** E, W, F, I, UP, B, **S** (безпека), **DTZ** (naive datetime), BLE, **T20** (заборона `print`), C4, SIM, PT, ASYNC, RUF.
-  RUF001–003 вимкнено, бо коментарі та рядки — українською. У `tests/` дозволено `assert` (S101).
+- **ruff:** E, W, F, I, UP, B, **S** (безпека), **DTZ** (naive datetime), BLE, **T20** (заборона `print`), C4, SIM, PT, ASYNC, RUF,
+  **TID251** (заборона `time.time()`, `time.monotonic()`, `datetime.now()` тощо поза `app/core/clock.py`).
+  RUF001–003 вимкнено, бо коментарі та рядки — українською. У `tests/` дозволено `assert` (S101); вигадані «секрети»
+  (S105/S106) — лише в `tests/test_logging.py` і `tests/test_config.py`.
 - **mypy:** `disallow_untyped_defs` для всього коду; повний набір прапорців `--strict` для торгового ядра і `core`.
 - **pytest:** маркери `unit` (ставиться автоматично), `integration`, `testnet`, `demo`, `slow`, `chaos`; `--strict-markers`.
   `testnet` і `demo` вимкнені через `addopts` і вмикаються лише явним `-m`.
@@ -41,3 +43,13 @@ uv run mypy                                       # app/ і tests/; strict дл�
 
 `app/core/config.py` читає `.env` з **кореня репозиторію**. Усі змінні описані в `/.env.example`
 (тест `tests/test_env_example.py` перевіряє відповідність в обидва боки).
+
+## Логи і час
+
+- Кожен процес на старті викликає `configure_logging(settings, process=...)` (`app/core/logging.py`): JSON-рядки
+  у `<LOG_DIR>/<process>/` — `app.log` (усе), `trading.log` (торгові рішення), `orders.log` (ордери),
+  `errors.log` (ERROR+ з будь-якого логера), з ротацією за розміром (`LOG_MAX_BYTES`, `LOG_BACKUP_COUNT`).
+  Секрети маскуються в усіх записах, включно з винятками та логами сторонніх бібліотек — деталі в
+  [`app/core/README.md`](app/core/README.md).
+- Час — лише через `app.core.clock` (`now_ms()`, `monotonic_ms()`), UTC у мілісекундах. У тестах autouse-фікстура
+  `fake_clock` (`tests/conftest.py`) підміняє годинник на `FakeClock`; реальний час — лише явним `SystemClock()`.

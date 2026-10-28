@@ -8,6 +8,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3", # конфіг з .env (core/config.py, T0.1/T0.3)
+    "structlog>=25.1,<26", # JSON-логи з маскуванням секретів (core/logging.py, T0.3)
 ]
 
 [dependency-groups]
@@ -41,6 +42,7 @@ select = [
     "BLE",          # заборона «голого» except Exception без обробки
     "T20",          # заборона print (лише structlog)
     "C4", "SIM", "PT", "ASYNC", "RUF",
+    "TID",          # banned-api: час лише через app.core.clock (ТЗ §4.3)
 ]
 # RUF001–003: кирилиця в рядках/коментарях — не помилка, документація українською.
 ignore = ["RUF001", "RUF002", "RUF003"]
@@ -50,6 +52,24 @@ known-first-party = ["app"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"] # assert у тестах
+# Вигадані «секрети» в тестах маскування (T0.3); реальних ключів у тестах немає. Лише ці файли.
+"tests/test_logging.py" = ["S101", "S105", "S106"]
+"tests/test_config.py" = ["S101", "S105", "S106"]
+# Єдине місце, де читається реальний час.
+"app/core/clock.py" = ["TID251"]
+"tests/test_clock.py" = ["TID251"]
+
+# Прямий доступ до часу заборонено: лише app.core.clock (now_ms / monotonic_ms), щоб тести підміняли годинник.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"time.time".msg = "Використовуйте app.core.clock.now_ms() (ТЗ §4.3)"
+"time.time_ns".msg = "Використовуйте app.core.clock.now_ms() (ТЗ §4.3)"
+"time.monotonic".msg = "Використовуйте app.core.clock.monotonic_ms()"
+"time.monotonic_ns".msg = "Використовуйте app.core.clock.monotonic_ms()"
+"time.perf_counter".msg = "Використовуйте app.core.clock.monotonic_ms()"
+"datetime.datetime.now".msg = "Використовуйте app.core.clock.now_ms() (ТЗ §4.3)"
+"datetime.datetime.utcnow".msg = "Використовуйте app.core.clock.now_ms() (ТЗ §4.3)"
+"datetime.datetime.today".msg = "Використовуйте app.core.clock.now_ms() (ТЗ §4.3)"
+"datetime.date.today".msg = "Використовуйте app.core.clock.now_ms() (ТЗ §4.3)"
 
 [tool.ruff.format]
 quote-style = "double"

@@ -57,3 +57,70 @@ def test_env_example_has_no_values() -> None:
 def test_empty_env_value_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOG_LEVEL", "")
     assert Settings(_env_file=None).log_level == "INFO"
+
+
+# --- Значення за замовчуванням і межі в документації збігаються з кодом (documentation.md, правило 4) ---
+
+CORE_README = REPO_ROOT / "apps" / "backend" / "app" / "core" / "README.md"
+
+
+def _literal_defaults() -> dict[str, str]:
+    """Поля з простим default (int/bool/str) → як він має бути записаний у документації."""
+    result: dict[str, str] = {}
+    for name, field in Settings.model_fields.items():
+        default = field.default
+        if isinstance(default, bool):
+            result[name] = "true" if default else "false"
+        elif isinstance(default, int | str):
+            result[name] = str(default)
+    return result
+
+
+def _env_comment(name: str) -> str:
+    """Коментарі над рядком `NAME=` (до порожнього рядка), разом із коментарями сусідніх змінних групи."""
+    lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    index = next(i for i, line in enumerate(lines) if line.startswith(f"{name}="))
+    comments: list[str] = []
+    for line in reversed(lines[:index]):
+        if not line.strip():
+            break
+        if line.startswith("#"):
+            comments.append(line)
+    return "\n".join(comments)
+
+
+@pytest.mark.parametrize(("field", "default"), sorted(_literal_defaults().items()))
+def test_env_example_states_code_default(field: str, default: str) -> None:
+    comment = _env_comment(field.upper())
+    assert f"за замовчуванням {default}" in comment, f"{field.upper()}: у .env.example має бути default {default}"
+
+
+@pytest.mark.parametrize(("field", "default"), sorted(_literal_defaults().items()))
+def test_core_readme_states_code_default(field: str, default: str) -> None:
+    row = next(
+        (line for line in CORE_README.read_text(encoding="utf-8").splitlines() if line.startswith(f"| `{field}` |")),
+        None,
+    )
+    assert row is not None, f"немає рядка для {field} у {CORE_README.name}"
+    default_cell = row.split("|")[3]
+    assert f"`{default}`" in default_cell, f"{field}: у README має бути default `{default}`"
+
+
+def _bounds() -> dict[str, tuple[int, int]]:
+    result: dict[str, tuple[int, int]] = {}
+    for name, field in Settings.model_fields.items():
+        ge = next((m.ge for m in field.metadata if getattr(m, "ge", None) is not None), None)
+        le = next((m.le for m in field.metadata if getattr(m, "le", None) is not None), None)
+        if isinstance(ge, int) and isinstance(le, int):
+            result[name] = (ge, le)
+    return result
+
+
+def test_bounded_fields_exist() -> None:
+    assert set(_bounds()) >= {"log_max_bytes", "log_backup_count"}
+
+
+@pytest.mark.parametrize(("field", "bounds"), sorted(_bounds().items()))
+def test_env_example_states_code_bounds(field: str, bounds: tuple[int, int]) -> None:
+    ge, le = bounds
+    assert f"{ge} … {le}" in _env_comment(field.upper()), f"{field.upper()}: у .env.example мають бути межі {ge} … {le}"
