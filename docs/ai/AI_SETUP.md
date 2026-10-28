@@ -71,6 +71,5 @@ echo '{"command":"ls"}' | python3 .claude/hooks/guard.py cursor-shell           
 |---|---|---|
 | `context7` | актуальна документація CCXT, FastAPI, SQLAlchemy, LightGBM тощо — щоб агент не вигадував API | лише читання публічних доків |
 | `postgres-readonly` | агент бачить схему й дані dev-БД, перевіряє запити та індекси | `--access-mode=restricted` + окрема read-only роль |
-| `playwright` | e2e-перевірка UI (T6.11) | працює з локальним UI |
 
 **Свідомо не підключено:** MCP із торговими ключами біржі. Агент не повинен мати можливості відправити ордер поза кодом проєкту.

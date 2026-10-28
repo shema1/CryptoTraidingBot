@@ -88,5 +88,5 @@
       }
     ]
   },
-  "enabledMcpjsonServers": ["context7", "postgres-readonly", "playwright"]
+  "enabledMcpjsonServers": ["context7", "postgres-readonly"]
 }
