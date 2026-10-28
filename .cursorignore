@@ -1,0 +1,23 @@
+# Cursor не індексує і не передає в AI ці файли
+.env
+.env.*
+!.env.example
+**/*.pem
+**/*.key
+secrets/
+backups/
+*.dump
+*.sql.gz
+
+# Великі/згенеровані дані — шум для контексту
+models/**/*.json.bak
+models/**/*.ubj
+models/**/*.txt
+models/**/*.pt
+models/**/*.bin
+data/
+logs/
+**/node_modules/
+**/.venv/
+**/__pycache__/
+apps/web/dist/

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      { "command": "python3 .claude/hooks/guard.py cursor-shell" }
+    ],
+    "beforeReadFile": [
+      { "command": "python3 .claude/hooks/guard.py cursor-read" }
+    ],
+    "afterFileEdit": [
+      { "command": "python3 .claude/hooks/post_edit.py cursor" }
+    ]
+  }
+}

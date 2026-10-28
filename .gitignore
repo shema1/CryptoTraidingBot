@@ -1,0 +1,40 @@
+# Секрети
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Локальні налаштування AI-інструментів (персональні)
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+apps/web/dist/
+
+# Дані, логи, бекапи
+data/
+logs/
+backups/
+*.dump
+
+# Артефакти моделей (великі файли). Метадані можна комітити окремо за потреби.
+models/*/
+!models/.gitkeep
+
+# ОС / IDE
+.DS_Store
+Thumbs.db

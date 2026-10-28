@@ -1,0 +1,24 @@
+---
+description: Правила для моделей БД, міграцій Alembic і TimescaleDB
+globs: apps/backend/migrations/**,apps/backend/app/**/models.py,apps/backend/app/**/repository.py,apps/backend/app/core/db*.py,docker-compose.yml
+alwaysApply: false
+---
+<!-- ЗГЕНЕРОВАНО scripts/sync_ai_rules.py з .claude/rules/database.md. Не редагувати вручну. -->
+
+# База даних (ТЗ §4.1, §15)
+
+- Міграції — лише Alembic. **Застосовану міграцію не редагувати** — тільки нова. Кожна міграція має `downgrade()` (або явне пояснення, чому неможливо).
+- Інваріанти — на рівні БД, не лише в коді: `UNIQUE`, `CHECK`, `FOREIGN KEY`, часткові унікальні індекси. Обов'язкові:
+  - `orders.client_order_id UNIQUE`; вхідний ордер `UNIQUE(signal_id)`;
+  - `signals UNIQUE(bot_id, entry_candle_open_time_ms)`;
+  - `fills.exec_id UNIQUE`;
+  - `bots`: частковий `UNIQUE(account_id, symbol) WHERE status <> 'STOPPED'`;
+  - `candles` PK `(exchange, symbol, timeframe, open_time_ms)`.
+- Час — `BIGINT` мілісекунди UTC (єдиний формат у проєкті). Не змішувати з `timestamptz`.
+- Гроші/ціни/кількості — `NUMERIC`, не `double precision`.
+- `order_events`, `audit_log`, `ledger` — append-only (без UPDATE/DELETE у коді; бажано тригер або REVOKE).
+- Статуси — `TEXT` + `CHECK` або PostgreSQL enum; набір значень — як у ТЗ.
+- Вставка свічок — `ON CONFLICT DO NOTHING`; зберігаються лише закриті свічки. Compression після 7 днів, retention не застосовується.
+- Поля `mode` (paper/testnet/live) у таблицях ордерів/позицій/fills обов'язкові.
+- Транзакції — короткі; мережеві виклики до біржі всередині транзакції заборонені.
+- Тести міграцій: `upgrade head` на порожній БД + `downgrade -1` + `upgrade head`.
