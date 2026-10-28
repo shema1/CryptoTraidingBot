@@ -11,7 +11,7 @@
 ## Стек
 
 - Backend `apps/backend`: Python 3.11+, FastAPI, SQLAlchemy 2 + Alembic, asyncpg, CCXT (async/Pro), pydantic v2, structlog.
-- ML: pandas, numpy, LightGBM, XGBoost, PyTorch, Optuna, scikit-learn.
+- ML: pandas, numpy, LightGBM (основна модель, CPU), scikit-learn, Optuna. XGBoost і PyTorch/GPU відкладено (ТЗ §5.6). Підхід — meta-labeling (ТЗ §5.1).
 - Frontend `apps/web`: React + Vite + TypeScript, Lightweight Charts. TS-типи API генеруються з OpenAPI.
 - БД: PostgreSQL + TimescaleDB (Docker Compose). Черги — таблиця `jobs`, блокування — advisory lock.
 - Якість: pytest, ruff, mypy (strict для `exchange/ trading/ risk/ protection/ reconcile/`), pre-commit.
@@ -41,7 +41,7 @@ cd apps/web && npm ci && npm run gen:api && npm run typecheck && npm test
 7. **Ордери:** машина станів — граф із ТЗ §7.1; недозволений перехід = помилка інваріанта. Write-ahead: запис `SUBMITTING` з `clientOrderId` комітиться **до** мережевого виклику. `clientOrderId = "tb" + uuid4().hex`. Повтор — лише з тим самим `clientOrderId`.
 8. **Fills** дедуплікуються за `exec_id`; середня ціна, комісії, PnL рахуються лише з `fills`.
 9. **Захист позиції:** позиція без підтвердженого біржового SL існує не довше `protection_timeout_s`; інакше — примусове закриття. SL можна рухати лише в бік зменшення ризику.
-10. **ML без look-ahead:** фічі для свічки `t` — лише із закритих свічок до `t-1`. Один `compute_features()` для навчання та live. Інтерполяція OHLCV заборонена. Hold-out не відкривається поза Gate G1.
+10. **ML без look-ahead і без самообману:** фічі для свічки `t` — лише з даних, відомих на закриття `t-1` (свічки, закриті старші ТФ, дані деривативів). Один `compute_features()` для навчання та live; один симулятор угоди `ml/trade_sim.py`; ліміти й розмір — ті самі функції, що в live. Інтерполяція OHLCV заборонена. Кожна спроба записується в журнал (DSR/PBO). Hold-out не відкривається поза Gate G1.
 11. **Ідемпотентність:** повторна обробка тієї самої свічки/події не створює дублів (UNIQUE-обмеження в БД, а не лише перевірки в коді).
 12. **Секрети** ніколи не потрапляють у логи, API-відповіді, тести, фікстури, коміти. Ключі без права виводу.
 13. **Сервіси слухають лише `127.0.0.1`.**

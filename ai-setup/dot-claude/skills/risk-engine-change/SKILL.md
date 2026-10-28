@@ -26,7 +26,7 @@ paths:
    - property-based: `qty * |entry - sl| ≤ risk_usd` (з урахуванням запасу на комісію/slippage); `qty % qtyStep == 0`; ціни кратні `tickSize`;
    - `sizing_equity = min(wallet_balance, total_equity)`; нереалізований прибуток не збільшує розмір;
    - денний ліміт і просадка рахуються з `total_equity`; депозит/виведення коригують `peak_equity` і `day_start_equity`;
-   - parity: той самий вхід → той самий розмір у бектестері та `RiskGate`;
+   - parity: той самий вхід → той самий розмір і ті самі рішення `risk/limits.py` у бектестері та `RiskGate`;
    - захист: немає підтвердженого SL за `protection_timeout_s` → 3 повтори → `reduceOnly` market → `ERROR`; нові входи заблоковані весь цей час;
    - SL можна змінити лише в бік зменшення ризику.
 3. Реалізуй з `Decimal`. Кожна відмова — код причини (`RISK_*`) у `risk_events` і `decision_log`.

@@ -23,6 +23,7 @@ paths:
 4. `PaperExchangeAdapter` реалізує той самий інтерфейс (ТЗ §13): ціни з live WS, комісія, slippage від спреду, затримка 100–300 мс, SL/TP за mark price.
 5. Приватний WS: ping/pong, `ws_stale_s`, реконект з backoff+jitter, після реконекту — REST-дозавантаження пропущених подій.
 6. `FakeExchangeAdapter` для тестів з ін'єкцією збоїв оновлюється разом з інтерфейсом.
+7. Публічні дані деривативів (open interest, premium/mark/index-свічки, long/short ratio) і WS-потік ліквідацій (ТЗ §4.4) отримуються також через адаптер/публічний клієнт `data/`; глибину історії кожного ендпоінта перевір і задокументуй, а не припускай.
 
 ## Тести
 - Contract-тест: один набір тестів проганяється проти `FakeExchangeAdapter`, `PaperExchangeAdapter` і (з маркером `testnet`) Bybit Testnet.
