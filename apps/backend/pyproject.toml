@@ -6,8 +6,11 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 # Залежності додаються лише тими задачами, яким вони потрібні (AGENTS.md), версії фіксує uv.lock.
 dependencies = [
+    "alembic>=1.14,<2", # міграції схеми БД (migrations/, T0.4)
+    "asyncpg>=0.30,<1", # async-драйвер PostgreSQL для SQLAlchemy (T0.4)
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3", # конфіг з .env (core/config.py, T0.1/T0.3)
+    "sqlalchemy[asyncio]>=2.0.36,<2.1", # моделі БД і async-сесії (app/core/db.py, T0.4)
     "structlog>=25.1,<26", # JSON-логи з маскуванням секретів (core/logging.py, T0.3)
 ]
 
@@ -20,6 +23,7 @@ dev = [
     "pre-commit>=4.0",
     "pyyaml>=6.0", # scripts/sync_ai_rules.py у pre-commit
     "types-pyyaml>=6.0",
+    "pytest-asyncio>=0.24", # async integration-тести з БД (tests/db, T0.4)
 ]
 
 [tool.uv]
@@ -55,6 +59,8 @@ known-first-party = ["app"]
 # Вигадані «секрети» в тестах маскування (T0.3); реальних ключів у тестах немає. Лише ці файли.
 "tests/test_logging.py" = ["S101", "S105", "S106"]
 "tests/test_config.py" = ["S101", "S105", "S106"]
+# Згенеровані міграції: SQL-тексти CHECK з моделей не переносяться (T0.4).
+"migrations/versions/**" = ["E501"]
 # Єдине місце, де читається реальний час.
 "app/core/clock.py" = ["TID251"]
 "tests/test_clock.py" = ["TID251"]
@@ -77,7 +83,10 @@ quote-style = "double"
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
 python_version = "3.11"
-files = ["app", "tests"]
+files = ["app", "tests", "migrations/env.py"]
+# Модулі рахуються від apps/backend (`tests.db.conftest` ≠ `tests.conftest`).
+mypy_path = "."
+explicit_package_bases = true
 plugins = ["pydantic.mypy"]
 warn_unused_configs = true
 warn_redundant_casts = true
@@ -121,6 +130,10 @@ pythonpath = ["."] # `package = false`: пакет `app` береться з к�
 # (останній `-m` у командному рядку перекриває цей).
 addopts = ["-ra", "--strict-markers", "--strict-config", "-m", "not testnet and not demo"]
 xfail_strict = true
+# Async-тести позначаються явно `@pytest.mark.asyncio` (strict); кожен тест — власний цикл подій.
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
 markers = [
     "unit: швидкий ізольований тест без мережі та БД (ставиться автоматично, якщо немає іншого маркера)",
     "integration: потрібна локальна тестова БД (docker compose)",

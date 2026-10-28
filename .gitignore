@@ -26,7 +26,8 @@ node_modules/
 apps/web/dist/
 
 # Дані, логи, бекапи
-data/
+# Лише тека даних у корені (не пакет apps/backend/app/data/).
+/data/
 logs/
 backups/
 *.dump

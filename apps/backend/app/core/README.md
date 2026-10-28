@@ -3,13 +3,14 @@
 ## Призначення
 
 Спільна інфраструктура всіх трьох процесів (торговий, воркер, колектор): конфігурація з `.env`,
-структуроване логування з маскуванням секретів, єдиний годинник `clock`, Telegram-сповіщення.
+структуроване логування з маскуванням секретів, єдиний годинник `clock`, основа БД (`db.py`), Telegram-сповіщення.
 
 ## Розділи ТЗ
 
 - ТЗ §4.3 — час (UTC, мілісекунди)
 - ТЗ §12 — моніторинг, сповіщення, логи
 - ТЗ §14 — безпека, ключі в `.env`
+- ТЗ §15 — модель даних (спільна основа моделей і міграцій)
 
 ## Публічний інтерфейс
 
@@ -18,6 +19,14 @@
 | `Settings` | `config.py` | налаштування процесу з `.env` у корені репозиторію; ім'я змінної = назва поля у верхньому регістрі; порожнє значення = default; незмінний (`frozen`) |
 | `Settings.secret_values()` | `config.py` | відкриті значення всіх заданих `SecretStr`/`SecretBytes`, включно з вкладеними моделями й колекціями — лише для реєстрації в маскері логів |
 | `REPO_ROOT`, `ENV_FILE` | `config.py` | корінь репозиторію і шлях до `.env` |
+| `Settings.database_url(*, test=False)` | `config.py` | `sqlalchemy.engine.URL` (`postgresql+asyncpg`) основної або тестової (`<POSTGRES_DB>_test`) БД; у `repr`/`str` пароль `***`; без `POSTGRES_PASSWORD` — `ValueError` |
+| `Settings.postgres_test_db`, `TEST_DB_SUFFIX`, `LOOPBACK_HOSTS` | `config.py` | ім'я тестової БД; суфікс `_test`; дозволені значення `POSTGRES_HOST` |
+| `Base`, `NAMING_CONVENTION` | `db.py` | декларативна основа всіх моделей; детерміновані назви обмежень (`pk_`, `uq_`, `ck_`, `fk_`, `ix_`) |
+| `TimeMs`, `CreatedMs`, `Money` | `db.py` | анотації колонок: `BIGINT` мс; `BIGINT` мс з default `now_ms()` при вставці; `NUMERIC` (`Decimal`) |
+| `enum_check(column, values)`, `sql_list(values)`, `MODES` | `db.py` | `CHECK (column IN (...))` для статусів; режими `demo`/`testnet`/`live` |
+| `SYMBOL_RE`, `symbol_check(column)` | `db.py` | канонічний символ CCXT (`BTC/USDT:USDT`) і його `CHECK` — в усіх таблицях із символом |
+| `MODEL_MODULES`, `load_models()` | `db.py` | перелік модулів `app/*/models.py`; імпорт усіх і спільний `MetaData` (Alembic, тести) |
+| `create_engine(url, **kw)`, `session_factory(engine)` | `db.py` | async engine (asyncpg, `pool_pre_ping`) і фабрика `AsyncSession` (`expire_on_commit=False`) |
 | `now_ms()`, `monotonic_ms()` | `clock.py` | системний час (UTC epoch, `int` мс) і монотонний годинник (`int` мс, лише для інтервалів) |
 | `Clock`, `SystemClock`, `FakeClock` | `clock.py` | протокол годинника, реальний і фейковий; `FakeClock.advance(ms)` рухає обидва, `jump_wall(delta_ms)` / `set_now(ms)` — лише системний (імітація стрибка) |
 | `get_clock()`, `use_clock(clock)` | `clock.py` | поточний годинник і context manager підміни (відновлює попередній і при винятку) |
@@ -36,6 +45,8 @@
 | `log_max_bytes` | `LOG_MAX_BYTES` | `52428800` (50 MiB) | розмір файла до ротації, байти; 1 MiB … 1 GiB |
 | `log_backup_count` | `LOG_BACKUP_COUNT` | `10` | ротованих копій на файл; 1 … 100 |
 | `log_console` | `LOG_CONSOLE` | `true` | дублювати JSON-логи в stderr (під launchd/systemd можна вимкнути: stderr-файл не ротується) |
+| `postgres_host` | `POSTGRES_HOST` | `127.0.0.1` | хост БД; лише loopback (`127.0.0.1`, `localhost`, `::1`), інше → помилка валідації |
+| `postgres_port` | `POSTGRES_PORT` | `5432` | порт БД; 1 … 65535 |
 | `postgres_db` | `POSTGRES_DB` | `ctb` | ім'я основної БД (docker-compose.yml); тестова БД — `<ім'я>_test` |
 | `postgres_user` | `POSTGRES_USER` | `ctb` | власник БД (superuser контейнера, лише локально) |
 | `postgres_password` | `POSTGRES_PASSWORD` | — (обов'язково для compose) | `SecretStr` |
@@ -112,6 +123,15 @@
 > Заплановано: порівняння з `fetch_time()` біржі, детектор стрибка системного годинника відносно монотонного,
 > `recvWindow` — T1.6; T5.6 — Telegram.
 
+## База даних (`db.py`)
+
+- Моделі — у `app/<модуль>/models.py` (перелік — `MODEL_MODULES`; тест `tests/db/test_models_registry.py`
+  перевіряє, що жоден `models.py` не пропущено). Опис таблиць — README відповідних модулів і ТЗ §15.
+- Домовленості: час — лише `BIGINT` мс (`*_ms`), default часу ставить код через `now_ms()` (у тестах — `FakeClock`),
+  а не `server_default`; гроші/ціни/кількості — `NUMERIC` без обмеження точності; статуси — `TEXT` + `CHECK`;
+  інваріанти — обмеженнями БД (`UNIQUE`, `CHECK`, FK, часткові індекси), а не лише в коді.
+- Міграції — `apps/backend/migrations/` (Alembic, async). DSN береться з `Settings.database_url()`, не з `alembic.ini`.
+
 ## Інваріанти
 
 - Кожне поле `Settings` є в `.env.example` без значення, і навпаки; значення за замовчуванням у `.env.example` і в
@@ -126,4 +146,5 @@
 | T0.1 | `[x]` | мінімальний `Settings` (`log_level`), тест відповідності `.env.example` |
 | T0.2 | `[x]` | поля `postgres_*` для docker-compose; повний DSN — T0.4 |
 | T0.3 | `[x]` | повний `Settings` (`frozen`, межі, `LOG_*`, `hide_input_in_errors`), `logging.py` з каналами, ротацією, маскуванням і хуками винятків, `clock.py` з `FakeClock`, заборона прямого доступу до часу (`TID251`) |
+| T0.4 | `[x]` | `POSTGRES_HOST` (лише loopback), `POSTGRES_PORT`, `database_url()`; `db.py` — `Base`, naming convention, типи колонок, engine/сесії |
 | T5.6 | `[ ]` | Telegram-сповіщення |

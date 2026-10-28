@@ -66,8 +66,16 @@ docker compose stop timescaledb                  # зупинка (дані ли
 - Init-скрипт (`infra/db/init/`) виконується **лише при першій ініціалізації порожнього volume**. Зміна пароля пізніше — `ALTER ROLE` у `psql`.
   Видалення volume знищує всі дані БД — робіть це лише свідомо й на dev-БД.
 
-> Заплановано: `uv run alembic upgrade head` (T0.4),
-> `npm run gen:api` — генерація типів з OpenAPI (T6.4, зараз заглушка).
+Схема — міграції Alembic (`apps/backend/migrations/`, T0.4); DSN береться з `.env` через `Settings`, не з `alembic.ini`:
+
+```bash
+cd apps/backend
+uv run alembic upgrade head                      # основна dev-БД
+uv run alembic -x db=test upgrade head           # тестова БД ctb_test (integration-тести роблять це самі)
+uv run pytest -q -m integration                  # тести схеми й міграцій (без запущеної БД — skip; CTB_REQUIRE_DB=1 — помилка)
+```
+
+> Заплановано: `npm run gen:api` — генерація типів з OpenAPI (T6.4, зараз заглушка).
 
 ## Pre-commit
 

@@ -16,10 +16,14 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, SecretBytes, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 # app/core/config.py -> core -> app -> backend -> apps -> корінь репозиторію
 REPO_ROOT = Path(__file__).resolve().parents[4]
 ENV_FILE = REPO_ROOT / ".env"
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+TEST_DB_SUFFIX = "_test"
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 
@@ -55,7 +59,11 @@ class Settings(BaseSettings):
     # Дублювати логи в stderr (JSON). Під launchd/systemd можна вимкнути, щоб stderr-файл не ріс без ротації.
     log_console: bool = True
 
-    # --- База даних (docker-compose.yml, T0.2). Паролі обов'язкові для `docker compose up`; повний DSN — T0.4. ---
+    # --- База даних (docker-compose.yml, T0.2; DSN — `database_url()`, T0.4). ---
+    # Лише loopback (AGENTS.md, інваріант 13): БД працює на тому ж комп'ютері, що й бекенд.
+    postgres_host: str = "127.0.0.1"
+    # Порт БД (1 … 65535).
+    postgres_port: Annotated[int, Field(ge=1, le=65535)] = 5432
     postgres_db: str = "ctb"
     postgres_user: str = "ctb"
     postgres_password: SecretStr | None = None
@@ -67,6 +75,34 @@ class Settings(BaseSettings):
     def _resolve_log_dir(cls, value: Path) -> Path:
         value = value.expanduser()
         return value if value.is_absolute() else REPO_ROOT / value
+
+    @field_validator("postgres_host")
+    @classmethod
+    def _loopback_only(cls, value: str) -> str:
+        if value not in LOOPBACK_HOSTS:
+            raise ValueError(f"POSTGRES_HOST має бути loopback-адресою: {sorted(LOOPBACK_HOSTS)}")
+        return value
+
+    @property
+    def postgres_test_db(self) -> str:
+        """Окрема БД для integration-тестів (створюється init-скриптом, T0.2)."""
+        return f"{self.postgres_db}{TEST_DB_SUFFIX}"
+
+    def database_url(self, *, test: bool = False) -> URL:
+        """DSN для SQLAlchemy (`postgresql+asyncpg`). У `repr`/`str` пароль прихований (`***`).
+
+        `test=True` — тестова БД `<POSTGRES_DB>_test`. Без `POSTGRES_PASSWORD` — помилка, а не порожній пароль.
+        """
+        if self.postgres_password is None:
+            raise ValueError("POSTGRES_PASSWORD не задано в .env")
+        return URL.create(
+            drivername="postgresql+asyncpg",
+            username=self.postgres_user,
+            password=self.postgres_password.get_secret_value(),
+            host=self.postgres_host,
+            port=self.postgres_port,
+            database=self.postgres_test_db if test else self.postgres_db,
+        )
 
     def secret_values(self) -> list[str]:
         """Відкриті значення всіх заданих `SecretStr`/`SecretBytes` — лише для реєстрації в маскері логів.

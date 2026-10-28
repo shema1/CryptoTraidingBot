@@ -128,3 +128,43 @@ def test_validation_error_does_not_echo_input(monkeypatch: pytest.MonkeyPatch) -
         _StrictSecretSettings(_env_file=None)  # type: ignore[call-arg]
     assert "short-real-secret-ABC" not in str(info.value)
     assert "short-real-secret-ABC" not in repr(info.value)
+
+
+# --- База даних (T0.4) ---
+
+
+@pytest.mark.parametrize("host", ["10.0.0.5", "db.example.com", "0.0.0.0", ""])  # noqa: S104 — перевіряємо відмову
+def test_postgres_host_must_be_loopback(host: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(postgres_host=host)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_postgres_loopback_hosts_are_accepted(host: str) -> None:
+    assert _settings(postgres_host=host).postgres_host == host
+
+
+@pytest.mark.parametrize("port", [0, 65536])
+def test_postgres_port_bounds(port: int) -> None:
+    with pytest.raises(ValidationError):
+        _settings(postgres_port=port)
+
+
+def test_database_url_main_and_test() -> None:
+    settings = _settings(postgres_password=DB_PASSWORD, postgres_db="ctb", postgres_port=5433)
+    main = settings.database_url()
+    test = settings.database_url(test=True)
+    assert (main.drivername, main.host, main.port, main.database) == ("postgresql+asyncpg", "127.0.0.1", 5433, "ctb")
+    assert test.database == "ctb_test"
+    assert main.password == DB_PASSWORD
+
+
+def test_database_url_hides_password() -> None:
+    url = _settings(postgres_password=DB_PASSWORD).database_url()
+    assert DB_PASSWORD not in repr(url)
+    assert DB_PASSWORD not in str(url)
+
+
+def test_database_url_requires_password() -> None:
+    with pytest.raises(ValueError, match="POSTGRES_PASSWORD"):
+        _settings().database_url()

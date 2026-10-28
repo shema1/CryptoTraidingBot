@@ -52,3 +52,26 @@ def test_check_no_env_files(files: list[str], expected_code: int) -> None:
         [sys.executable, str(CHECK_NO_ENV), *files], check=False, capture_output=True, text=True
     )
     assert result.returncode == expected_code, result.stdout + result.stderr
+
+
+def test_source_files_are_not_git_ignored() -> None:
+    """Код, міграції й тести не можуть бути приховані `.gitignore` (T0.4: правило `data/` ховало `app/data/`).
+
+    Інакше локально все зелене, а в чистому клоні на іншому комп'ютері (ТЗ §6.4) модулів немає.
+    """
+    backend = REPO_ROOT / "apps" / "backend"
+    files = [
+        str(p.relative_to(REPO_ROOT))
+        for root in ("app", "migrations", "tests")
+        for p in (backend / root).rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts
+    ]
+    files += ["apps/backend/alembic.ini", "apps/backend/pyproject.toml", "apps/backend/uv.lock"]
+    result = subprocess.run(  # noqa: S603 — фіксована команда git без shell
+        ["git", "check-ignore", "--no-index", *files],  # noqa: S607
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "", f"файли під .gitignore:\n{result.stdout}"

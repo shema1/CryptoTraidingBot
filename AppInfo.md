@@ -2,7 +2,7 @@
 
 *Особистий проєкт, запуск лише локально на одному ПК. Технічні терміни наведено англійською.*
 
-*v3.1 (2026-10-28): ревізія ML-методології (meta-labeling, кілька символів, дані деривативів, ваги унікальності, DSR/PBO, правило EV, коридор результатів, GPU відкладено) — див. `docs/decisions/0001-ml-methodology.md`. Ключі біржі зберігаються в `.env` без шифрованого сховища в БД — див. `docs/decisions/0002-keys-in-env.md`. Власний Paper-симулятор замінено на Bybit Demo Trading — див. `docs/decisions/0003-demo-instead-of-paper.md`. Фінальна узгодженість (повтор ордерів, ризик окремо для кожного акаунта, паузи, два комп'ютери) — див. `docs/decisions/0004-consistency-review.md`.*
+*v3.1 (2026-10-28): ревізія ML-методології (meta-labeling, кілька символів, дані деривативів, ваги унікальності, DSR/PBO, правило EV, коридор результатів, GPU відкладено) — див. `docs/decisions/0001-ml-methodology.md`. Ключі біржі зберігаються в `.env` без шифрованого сховища в БД — див. `docs/decisions/0002-keys-in-env.md`. Власний Paper-симулятор замінено на Bybit Demo Trading — див. `docs/decisions/0003-demo-instead-of-paper.md`. Фінальна узгодженість (повтор ордерів, ризик окремо для кожного акаунта, паузи, два комп'ютери) — див. `docs/decisions/0004-consistency-review.md`. Уточнення моделі даних (`price_type` у `mark_index_candles`, `holdout_openings`) — див. `docs/decisions/0005-schema-t0-4.md`.*
 
 ## 0. Прийняті рішення (зафіксовано)
 
@@ -850,15 +850,16 @@ qty        = floor_to_lot( min(qty_risk, qty_lev, qty_expo, qty_symbol_cap) )
 | Таблиця | Призначення та ключові обмеження |
 | --- | --- |
 | `exchange_accounts` | біржа, режим (`demo`/`testnet`/`live`), посилання на набір змінних `.env` (без самих ключів), `allowed_host_id`, результат і час перевірки дозволів |
-| `bots` | конфіг, статус, `pause_reasons`, `model_version`, `pending_model_version`, `mode`, `version` (OCC); `UNIQUE(account_id, symbol)` для активних |
+| `bots` | конфіг, статус, `pause_reasons`, `model_version`, `pending_model_version`, `mode`, `version` (OCC); `UNIQUE(account_id, symbol)` для активних; акаунт, режим і символ незмінні; `STOPPED` неможливий, поки в бота є відкрита позиція або незавершені ордери |
 | `candles` | hypertable свічок; PK `(exchange, symbol, timeframe, open_time_ms)` |
-| `data_gaps`, `funding_rates` | прогалини з полем `source` (`candles`, `open_interest`, `premium_index`, `mark_index`, `long_short`, `liquidations`); історія funding |
-| `open_interest`, `premium_index`, `mark_index_candles`, `long_short_ratio`, `liquidations_hourly` | дані деривативів (розділ 4.4); hypertables з PK `(exchange, symbol, interval, ts_ms)` |
+| `data_gaps`, `funding_rates` | прогалини з полем `source` (`candles`, `open_interest`, `premium_index`, `mark_candles`, `index_candles`, `long_short`, `liquidations`; mark- і index-ряди мають окремі прогалини — `docs/decisions/0005-schema-t0-4.md`); історія funding |
+| `open_interest`, `premium_index`, `mark_index_candles`, `long_short_ratio`, `liquidations_hourly` | дані деривативів (розділ 4.4); hypertables з PK `(exchange, symbol, interval, ts_ms)`; у `mark_index_candles` — `(exchange, symbol, price_type, interval, ts_ms)`, `price_type` = `mark` / `index` (`docs/decisions/0005-schema-t0-4.md`) |
 | `models` | метадані артефактів (розділ 5.4, включно з `validated_by`, `live_corridor`, версіями бібліотек), статус `TRAINED/CANDIDATE/APPROVED/RETIRED` |
 | `experiments`, `experiment_trials` | журнал досліджень: символи, первинна стратегія, параметри, OOS-результати кожної спроби, загальна кількість спроб, DSR, PBO, відкриття hold-out (розділи 5.2.5, 5А.10) |
+| `holdout_openings` | кожне відкриття hold-out (лінія, відрізок, номер відкриття, експеримент, модель, результат); `opening_no ∈ {1, 2}` + `UNIQUE` на відрізок — третє відкриття відхиляє БД (розділ 5А.10, `docs/decisions/0005-schema-t0-4.md`) |
 | `jobs` | Optuna/backfill/навчання, статус, прогрес |
 | `signals` | сигнал первинної стратегії, `probability`, `expected_edge_atr`, `decision`, статус `NEW/EXECUTING/DONE/EXPIRED_UNEXECUTED`; `UNIQUE(bot_id, entry_candle_open_time_ms)` |
-| `orders` | стан, `client_order_id UNIQUE`, `mode`, `reduce_only`, `version` |
+| `orders` | стан, `client_order_id UNIQUE`, `mode`, `reduce_only`, `version`, `origin` (`BOT` / `MANUAL_TEST` / `ORPHAN` / `EXCHANGE`); у ордерів, створених біржею (спрацювання TP/SL позиції, ліквідація), `client_order_id` порожній, але їхні fills записуються; з термінального стану переходів немає (тригер БД) |
 | `order_events` | append-only журнал переходів |
 | `fills` | `exec_id UNIQUE`, ціна, кількість, комісія |
 | `positions` | поточні та закриті позиції, SL/TP, `protection_status` |
