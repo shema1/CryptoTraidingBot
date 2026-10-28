@@ -26,6 +26,6 @@ paths:
 7. Публічні дані деривативів (open interest, premium/mark/index-свічки, long/short ratio) і WS-потік ліквідацій (ТЗ §4.4) отримуються також через адаптер/публічний клієнт `data/`; глибину історії кожного ендпоінта перевір і задокументуй, а не припускай.
 
 ## Тести
-- Contract-тест: один набір тестів проганяється проти `FakeExchangeAdapter` і (з маркером `testnet`) Bybit Testnet та Bybit Demo.
+- Contract-тест: один набір тестів проганяється проти `FakeExchangeAdapter` і (з маркерами `testnet` / `demo`) Bybit Testnet та Bybit Demo.
 - Мапінг кожного коду помилки Bybit → доменний виняток.
 - Округлення до `tickSize`/`qtyStep` з `fetch_instruments`.

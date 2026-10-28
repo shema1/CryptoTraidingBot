@@ -35,10 +35,10 @@ paths:
 4. Реалізуй. Перевір:
    - write-ahead: `SUBMITTING` комітиться ДО мережевого виклику; мережевий виклик поза транзакцією;
    - таймаут/обрив/5xx → `SUBMISSION_UNKNOWN`, не `REJECTED`;
-   - повторна відправка — лише з тим самим `clientOrderId` і лише після розв'язання UNKNOWN;
-   - `clientOrderId = "tb" + uuid4().hex` (34 символи, без дефісів);
+   - з термінальних станів переходів немає; після «не знайдено → REJECTED» **вхідний ордер не повторюється** (сигнал → `EXPIRED_UNEXECUTED`), а вихід `reduceOnly` повторюється **новим** ордером з новим `clientOrderId`, якщо позиція ще відкрита (ТЗ §7.2);
+   - `clientOrderId = "tb" + HOST_ID + uuid4().hex` (36 символів, без дефісів; `HOST_ID` — 2 символи з `.env`);
    - fills дедуплікуються за `exec_id` (UNIQUE у БД + `ON CONFLICT DO NOTHING`); подія з WS і REST — одна й та сама;
    - `filled_qty`, середня ціна, комісії — лише з `fills`.
-5. Алгоритм `SUBMISSION_UNKNOWN` (ТЗ §7.2): блок нових ордерів бота → `fetch_order_by_client_id` + WS → до 3 перевірок з інтервалом 2–3 с + звірка позиції → знайдено: відповідний стан / не знайдено: REJECTED → ескалація через `unknown_escalation_s` (бот `ERROR`, CRITICAL у Telegram). Покрий тестами кожну гілку з `FakeExchangeAdapter`.
+5. Алгоритм `SUBMISSION_UNKNOWN` (ТЗ §7.2): блок нових ордерів бота → `fetch_order_by_client_id` + WS → до 3 перевірок з інтервалом 2–3 с + звірка позиції → знайдено: відповідний стан / не знайдено: REJECTED (вхід — без повтору, вихід — новий ордер) → ескалація через `unknown_escalation_s` (бот `ERROR`, CRITICAL у Telegram). Покрий тестами кожну гілку з `FakeExchangeAdapter`.
 6. Запусти `uv run pytest -q tests/trading && uv run mypy app/trading`.
 7. Запусти skill `safety-check` (або субагента `trading-safety-reviewer`).

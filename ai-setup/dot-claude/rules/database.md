@@ -24,6 +24,7 @@ paths:
 - Вставка свічок — `ON CONFLICT DO NOTHING`; зберігаються лише закриті свічки. Compression після 7 днів, retention не застосовується.
 - Поля `mode` (demo/testnet/live) у таблицях ордерів/позицій/fills обов'язкові.
 - Дані деривативів (`open_interest`, `premium_index`, `mark_index_candles`, `long_short_ratio`, `liquidations_hourly`) — hypertables з PK `(exchange, symbol, interval, ts_ms)`, вставка `ON CONFLICT DO NOTHING`.
+- `account_id` обов'язковий у `equity_snapshots`, `ledger`, `risk_config`, `risk_events`, `system_state`, `emergency_runs`: ризик ведеться окремо для кожного акаунта.
 - `experiment_trials` — append-only: спроби не видаляються і не перезаписуються (від цього залежить коректність DSR/PBO).
 - Транзакції — короткі; мережеві виклики до біржі всередині транзакції заборонені.
 - Тести міграцій: `upgrade head` на порожній БД + `downgrade -1` + `upgrade head`.

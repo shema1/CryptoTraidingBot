@@ -9,6 +9,7 @@ paths:
 
 ## Risk Engine
 - `RiskGate` — єдина точка дозволу на збільшення експозиції. Немає параметрів/прапорців «bypass», `force`, `skip_risk` — і не додавай їх.
+- **Усе окремо для кожного акаунта** (`account_id`): `risk_config`, equity, денний ліміт, просадка, лічильники, статус `NORMAL/RESTRICTED/HALTED`, Emergency Stop. Стан Demo ніколи не впливає на Live і навпаки (тест обов'язковий).
 - Pre-trade перевірки — усі шість з ТЗ §8.4, кожна з власним кодом причини (`RISK_DAILY_LOSS`, `RISK_MAX_POSITIONS`, …). Кожна відмова логується в `risk_events` і `decision_log`.
 - Розмір позиції — **єдина** функція `calc_position_size()` у `risk/sizing.py`, яку викликають і `RiskGate`, і бектестер. Формула — ТЗ §8.3. Запас `sl_dist` на slippage — з параметра `slippage_sl` моделі витрат `risk/costs.py`.
 - Перевірки лімітів (одна позиція, cooldown, денний збиток, `max_trades_per_day`, просадка, time-stop) — **чисті функції** `risk/limits.py` без БД, мережі й годинника (час передається параметром). Їх викликають і `RiskGate`, і бектестер; дублювати цю логіку деінде заборонено.

@@ -34,6 +34,8 @@ SHELL_RULES: list[tuple[str, str, str]] = [
      "Звернення до MAINNET Bybit заборонене для агента. Використовуйте testnet (api-testnet / stream-testnet.bybit.com) або demo (api-demo / stream-demo.bybit.com)."),
     (r"\b(?:TRADING_MODE|BOT_MODE|MODE)=['\"]?live\b|\bBYBIT_TESTNET=['\"]?(?:false|0)\b|--mode[= ]live\b", "deny",
      "Запуск у режимі LIVE агентом заборонений. Live запускає лише людина через UI з підтвердженням."),
+    (r"\bBYBIT_LIVE_API_(?:KEY|SECRET)\b", "deny",
+     "Використання live-ключів агентом заборонене. Для перевірок — BYBIT_TESTNET_* або BYBIT_DEMO_*."),
     (r"docker\s+(?:compose\s+down\b.*\s-v\b|compose\s+down\b.*--volumes|volume\s+(?:rm|prune))|docker-compose\s+down\b.*\s-v\b", "deny",
      "Видалення Docker volume знищить дані БД (свічки, ордери, журнал)."),
     (r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+(?:/|~|\$HOME|\.|\*|models\b|apps/backend/migrations\b)(?:\s|/?$)", "deny",
