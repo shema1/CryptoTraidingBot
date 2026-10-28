@@ -15,20 +15,22 @@ apps/backend/   Python-бекенд (FastAPI, воркер, колектор) �
 apps/web/       React + Vite + TypeScript — див. apps/web/README.md
 models/         артефакти моделей (у git не потрапляють)
 docs/           план, рішення, шаблони
-scripts/        службові скрипти (синхронізація правил AI, перевірка секретів)
+scripts/        службові скрипти (синхронізація правил AI, перевірка секретів, перевірка БД)
+infra/db/init/  init-скрипти TimescaleDB (read-only роль, тестова БД)
+docker-compose.yml  TimescaleDB (лише 127.0.0.1:5432)
 ```
 
 ## Потрібно встановити
 
 - [`uv`](https://docs.astral.sh/uv/) (сам встановить Python 3.11 за `apps/backend/.python-version`)
 - Node.js ≥ 20.19 і npm
-- Docker (TimescaleDB, з'явиться в задачі T0.2)
+- Docker (Docker Desktop або OrbStack) — для TimescaleDB
 
 ## Перше налаштування
 
 ```bash
 bash ai-setup/install.sh                          # один раз: розгортає .claude/ і .mcp.json (якщо ще не зроблено)
-cp .env.example .env && chmod 600 .env            # секрети лише тут, файл не комітиться
+cp .env.example .env && chmod 600 .env            # секрети лише тут, файл не комітиться; задайте POSTGRES_PASSWORD і POSTGRES_READONLY_PASSWORD
 (cd apps/backend && uv sync)                      # Python-залежності + uv.lock
 (cd apps/web && npm install)                      # JS-залежності + package-lock.json
 uv run --project apps/backend pre-commit install  # git-хуки
@@ -50,7 +52,21 @@ npm run dev                                       # http://127.0.0.1:5173
 uv run --project apps/backend pre-commit run --all-files
 ```
 
-> Заплановано: `docker compose up -d timescaledb` (T0.2), `uv run alembic upgrade head` (T0.4),
+## База даних (TimescaleDB)
+
+```bash
+docker compose up -d --wait timescaledb          # запуск; чекає стану healthy (потрібні паролі POSTGRES_* у файлі .env)
+PGRO_PASSWORD=<POSTGRES_READONLY_PASSWORD> bash scripts/check_db.sh   # healthy, порт лише 127.0.0.1, ctb_readonly не пише, тестова БД
+docker compose stop timescaledb                  # зупинка (дані лишаються в іменованому volume timescaledb_data)
+```
+
+- Порт публікується лише на `127.0.0.1:5432`; `restart: unless-stopped`, `healthcheck` через `pg_isready`.
+- Основна БД `ctb` (власник `ctb`), окрема БД `ctb_test` для `integration`-тестів, read-only роль `ctb_readonly`
+  для MCP `postgres-readonly` (сесії за замовчуванням read-only, доступ лише до основної БД, `SELECT` на всі поточні й майбутні таблиці).
+- Init-скрипт (`infra/db/init/`) виконується **лише при першій ініціалізації порожнього volume**. Зміна пароля пізніше — `ALTER ROLE` у `psql`.
+  Видалення volume знищує всі дані БД — робіть це лише свідомо й на dev-БД.
+
+> Заплановано: `uv run alembic upgrade head` (T0.4),
 > `npm run gen:api` — генерація типів з OpenAPI (T6.4, зараз заглушка).
 
 ## Pre-commit

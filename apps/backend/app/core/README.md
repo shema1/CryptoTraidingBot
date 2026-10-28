@@ -23,6 +23,10 @@
 | Поле | Змінна | За замовчуванням | Опис |
 | --- | --- | --- | --- |
 | `log_level` | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `postgres_db` | `POSTGRES_DB` | `ctb` | ім'я основної БД (docker-compose.yml); тестова БД — `<ім'я>_test` |
+| `postgres_user` | `POSTGRES_USER` | `ctb` | власник БД (superuser контейнера, лише локально) |
+| `postgres_password` | `POSTGRES_PASSWORD` | — (обов'язково для compose) | `SecretStr` |
+| `postgres_readonly_password` | `POSTGRES_READONLY_PASSWORD` | — (обов'язково для compose) | `SecretStr`; пароль ролі `ctb_readonly`, застосовується лише при першій ініціалізації volume |
 
 ## Інваріанти
 
@@ -36,5 +40,6 @@
 | Задача | Статус | Що зроблено |
 | --- | --- | --- |
 | T0.1 | `[x]` | мінімальний `Settings` (`log_level`), тест відповідності `.env.example` |
+| T0.2 | `[x]` | поля `postgres_*` для docker-compose; повний DSN — T0.4 |
 | T0.3 | `[ ]` | конфіг, логування з маскуванням, `clock` |
 | T5.6 | `[ ]` | Telegram-сповіщення |

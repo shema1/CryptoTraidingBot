@@ -1,0 +1,28 @@
+# Інфраструктура (ТЗ §2, §12.2): лише TimescaleDB. Бекенд, воркер і фронт запускаються локально.
+# Змінні POSTGRES_* беруться з файлу .env у корені — див. .env.example. Паролі обов'язкові:
+# без них `docker compose up` завершиться помилкою, а не стартує з порожнім паролем.
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.17.2-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ctb}
+      POSTGRES_USER: ${POSTGRES_USER:-ctb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD у .env}
+      # Лише для init-скрипта (роль ctb_readonly для MCP); застосовується при першій ініціалізації volume.
+      POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:?задайте POSTGRES_READONLY_PASSWORD у .env}
+    ports:
+      # Лише loopback (AGENTS.md, інваріант 13): з мережі порт недоступний.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  timescaledb_data:

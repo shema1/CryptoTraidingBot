@@ -46,11 +46,11 @@
 
 0. Якщо в корені є тека `ai-setup/` — з кореня проєкту виконайте `bash ai-setup/install.sh`. Скрипт розгорне `.claude/` і `.mcp.json`, перевірить запобіжники й видалить `ai-setup/`.
 1. Потрібні: `python3`, [uv](https://docs.astral.sh/uv/) (для `uvx postgres-mcp`), Node.js (для `npx`), Docker.
-2. Змінна для MCP бази (read-only роль створюється в задачі T0.2), наприклад у `~/.zshrc`:
+2. Змінна для MCP бази (read-only роль `ctb_readonly` створює `docker compose up` при першій ініціалізації БД; пароль — `POSTGRES_READONLY_PASSWORD`), наприклад у `~/.zshrc`:
    ```bash
    export MCP_DATABASE_URI="postgresql://ctb_readonly:<пароль>@127.0.0.1:5432/ctb"
    ```
-   До виконання T0.2 сервер `postgres-readonly` просто не підключиться — це нормально.
+   Поки БД не запущена (`docker compose up -d`), сервер `postgres-readonly` не підключиться — це нормально. Після запуску БД перепідключіть MCP (`/mcp`) або перезапустіть сесію.
 3. **Claude Code:** відкрийте теку проєкту, запустіть `claude`, підтвердіть довіру проєкту та MCP-сервери з `.mcp.json`. Перевірка: `/mcp` (сервери), `/agents` (3 субагенти), `/hooks` (hooks), `/memory` (CLAUDE.md і rules).
 4. **Cursor:** Settings → MCP — увімкніть сервери з `.cursor/mcp.json`; Settings → Rules — мають бути видні правила з `.cursor/rules` і `AGENTS.md`; Settings → Hooks — перевірте, що `.cursor/hooks.json` підхоплено (за потреби перезапустіть Cursor). Skills Cursor знайде в `.claude/skills/`.
 5. **Windows / WSL2:** якщо працюєте в Windows без WSL і команда `python3` недоступна — замініть `python3` на `python` у `.claude/settings.json` та `.cursor/hooks.json`.

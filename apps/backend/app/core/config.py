@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # app/core/config.py -> core -> app -> backend -> apps -> корінь репозиторію
@@ -34,3 +35,10 @@ class Settings(BaseSettings):
     )
 
     log_level: LogLevel = "INFO"
+
+    # База даних (docker-compose.yml, T0.2). Паролі обов'язкові для `docker compose up`; повний DSN — T0.4.
+    postgres_db: str = "ctb"
+    postgres_user: str = "ctb"
+    postgres_password: SecretStr | None = None
+    # Пароль read-only ролі ctb_readonly (MCP `postgres-readonly`); застосовується лише при першій ініціалізації volume.
+    postgres_readonly_password: SecretStr | None = None
