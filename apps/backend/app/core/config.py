@@ -10,12 +10,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Final, Literal
 
 from pydantic import BaseModel, Field, SecretBytes, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy.engine import URL
 
 # app/core/config.py -> core -> app -> backend -> apps -> корінь репозиторію
@@ -26,6 +27,16 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 TEST_DB_SUFFIX = "_test"
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+
+# Локальний API слухає лише цю адресу (ТЗ §14, AGENTS.md, інваріант 13); не конфігурується.
+API_BIND_HOST: Final = "127.0.0.1"
+# Bearer-токен UI: не коротший за 32 символи, алфавіт token68 (RFC 6750) — без пробілів і лапок у заголовку.
+API_TOKEN_MIN_LEN: Final = 32
+# Захист від очевидно слабких значень (`aaaa…`, `1212…`): згенерований токен має десятки різних символів.
+API_TOKEN_MIN_DISTINCT: Final = 10
+_API_TOKEN_RE: Final = re.compile(r"[A-Za-z0-9._~+/-]+=*")
+# Origin UI: лише loopback, явний порт без провідних нулів, без шляху (так його надсилає браузер).
+_LOOPBACK_ORIGIN_RE: Final = re.compile(r"(?:http|https)://(?:127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}")
 
 _MIB = 1024 * 1024
 
@@ -74,6 +85,14 @@ class Settings(BaseSettings):
     # Скільки секунд при старті повторювати спроби взяти lock (0 … 600; 0 — одна спроба), потім — вихід.
     lock_wait_s: Annotated[int, Field(ge=0, le=600)] = 60
 
+    # --- Локальний API торгового процесу (app/api, ТЗ §14, §16, T0.7). Адреса — лише API_BIND_HOST. ---
+    # Порт API (1024 … 65535).
+    api_port: Annotated[int, Field(ge=1024, le=65535)] = 8000
+    # Bearer-токен UI (≥ API_TOKEN_MIN_LEN символів token68). Без нього торговий процес не стартує.
+    api_token: SecretStr | None = None
+    # Origins UI, яким дозволено звертатися до API (перевірка `Origin` і CORS); у `.env` — через кому.
+    api_allowed_origins: Annotated[tuple[str, ...], NoDecode] = ("http://127.0.0.1:5173",)
+
     @field_validator("log_dir")
     @classmethod
     def _resolve_log_dir(cls, value: Path) -> Path:
@@ -86,6 +105,46 @@ class Settings(BaseSettings):
         if value not in LOOPBACK_HOSTS:
             raise ValueError(f"POSTGRES_HOST має бути loopback-адресою: {sorted(LOOPBACK_HOSTS)}")
         return value
+
+    @field_validator("api_token")
+    @classmethod
+    def _strong_api_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if (
+            len(token) < API_TOKEN_MIN_LEN
+            or _API_TOKEN_RE.fullmatch(token) is None
+            or len(set(token)) < API_TOKEN_MIN_DISTINCT
+        ):
+            # Значення в тексті помилки не повторюється (і `hide_input_in_errors`).
+            raise ValueError(
+                f"API_TOKEN: щонайменше {API_TOKEN_MIN_LEN} символів [A-Za-z0-9._~+/-] (token68), "
+                f"з них ≥ {API_TOKEN_MIN_DISTINCT} різних — згенеруйте: secrets.token_urlsafe(32)"
+            )
+        return value
+
+    @field_validator("api_allowed_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        if isinstance(value, str):
+            return tuple(item.strip() for item in value.split(",") if item.strip())
+        return value
+
+    @field_validator("api_allowed_origins")
+    @classmethod
+    def _loopback_origins(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        origins: list[str] = []
+        for origin in value:
+            normalized = origin.strip().lower()
+            port = normalized.rsplit(":", 1)[-1]
+            if _LOOPBACK_ORIGIN_RE.fullmatch(normalized) is None or not 1 <= int(port) <= 65535:
+                raise ValueError(
+                    "API_ALLOWED_ORIGINS: лише http(s)://127.0.0.1|localhost|[::1]:<порт> без шляху, через кому"
+                )
+            if normalized not in origins:
+                origins.append(normalized)
+        return tuple(origins)
 
     @property
     def postgres_test_db(self) -> str:

@@ -25,12 +25,12 @@ uv run pytest -q                                  # тести без мереж
 uv run pytest -q -m "not slow"                    # швидкі тести
 uv run pytest -q -m testnet                       # лише Testnet (потрібні тестові ключі в .env)
 uv run pytest -q -m integration                   # схема БД, міграції, lock на ctb_test (потрібна docker compose БД)
-uv run python -m app                              # торговий процес (single-instance lock; API — T0.7)
+uv run python -m app                              # торговий процес: lock + локальний API на 127.0.0.1:API_PORT
 uv run alembic upgrade head                       # міграції основної dev-БД (`-x db=test` — тестової)
 uv run alembic revision --autogenerate --rev-id 0002 -m "коротко"   # нова міграція (TimescaleDB/тригери — дописати вручну)
 uv run alembic check                              # моделі й міграції не розходяться
 uv run ruff check . && uv run ruff format --check .
-uv run mypy                                       # app/, tests/, migrations/env.py; strict для exchange/ trading/ risk/ protection/ reconcile/ core/
+uv run mypy                                       # app/, tests/, migrations/env.py; strict для api/ exchange/ trading/ risk/ protection/ reconcile/ core/
 ```
 
 ## Інструменти якості (`pyproject.toml`)
@@ -39,7 +39,7 @@ uv run mypy                                       # app/, tests/, migrations/env
   **TID251** (заборона `time.time()`, `time.monotonic()`, `datetime.now()` тощо поза `app/core/clock.py`).
   RUF001–003 вимкнено, бо коментарі та рядки — українською. У `tests/` дозволено `assert` (S101); вигадані «секрети»
   (S105/S106) — лише в `tests/test_logging.py` і `tests/test_config.py`; у `migrations/versions/` дозволено довгі рядки (E501: SQL-тексти CHECK з моделей).
-- **mypy:** `disallow_untyped_defs` для всього коду; повний набір прапорців `--strict` для торгового ядра і `core`.
+- **mypy:** `disallow_untyped_defs` для всього коду; повний набір прапорців `--strict` для торгового ядра, `core` і `api` (межа безпеки).
 - **pytest:** маркери `unit` (ставиться автоматично), `integration`, `testnet`, `demo`, `slow`, `chaos`; `--strict-markers`.
   `testnet` і `demo` вимкнені через `addopts` і вмикаються лише явним `-m`.
 - **hypothesis** — для property-based тестів (округлення, sizing, машина станів).
@@ -50,9 +50,13 @@ uv run mypy                                       # app/, tests/, migrations/env
 uv run python -m app                              # торговий процес: lock → робота до SIGTERM/SIGINT (з apps/backend)
 ```
 
-- Старт: `Settings` → `configure_logging(process="backend")` → single-instance lock (`app/core/instance_lock.py`,
-  деталі — [`app/core/README.md`](app/core/README.md)) → робота під watchdog-ом lock → звільнення lock.
-  Зараз «робота» — лише очікування сигналу (> Заплановано: локальний API — T0.7, цикли ботів — етап 5).
+- Старт: `Settings` → `configure_logging(process="backend")` → перевірка `API_TOKEN` (немає — код 15, до БД) →
+  single-instance lock (`app/core/instance_lock.py`, деталі — [`app/core/README.md`](app/core/README.md)) → робота під
+  watchdog-ом lock → звільнення lock. Робота — локальний API (`app/api/server.py`, деталі —
+  [`app/api/README.md`](app/api/README.md)): uvicorn лише на `127.0.0.1:API_PORT`, bearer-токен, перевірка
+  `Host`/`Origin`, CORS, `Idempotency-Key`, `GET /system/health` (> Заплановано: цикли ботів — етап 5).
+- Перевірка, що API живий (токен через stdin, а не в аргументах — інакше його видно в `ps`):
+  `printf 'Authorization: Bearer %s\n' "$API_TOKEN" | curl -H @- http://127.0.0.1:8000/system/health`.
 - Другий екземпляр на тій самій БД не стартує: `LOCK_WAIT_S` (60 с) повторює спроби, потім пише в лог власника lock
   (`instance_lock_held_by_other`: pid сесії, pid процесу ОС, час старту) і завершується.
 - Прапорець перехоплення lock (`--force-takeover`) — **лише людиною** з інтерактивного терміналу (stdin і stderr — TTY),
@@ -65,13 +69,15 @@ uv run python -m app                              # торговий проце�
 | Код | Константа | Значення |
 | --- | --- | --- |
 | 0 | `EXIT_OK` | завершення за SIGTERM/SIGINT, lock звільнено |
-| 1 | `EXIT_UNCAUGHT` | необроблений виняток під час роботи — записується маскованим `uncaught_exception` (CRITICAL, `errors.log`) до зняття хендлерів. Помилка конфігу (`Settings()` до налаштування логера) — стандартний traceback pydantic без введених значень (`hide_input_in_errors`) |
+| 1 | `EXIT_UNCAUGHT` | необроблений виняток під час роботи (зокрема сервер API зупинився без сигналу) — записується маскованим `uncaught_exception` (CRITICAL, `errors.log`) до зняття хендлерів. Помилка конфігу (`Settings()` до налаштування логера) — стандартний traceback pydantic без введених значень (`hide_input_in_errors`) |
 | 2 | — | неправильні аргументи (argparse; скорочення прапорців вимкнено) |
 | 10 | `EXIT_LOCK_HELD` | lock тримає інший процес весь `LOCK_WAIT_S` |
 | 11 | `EXIT_DB_UNAVAILABLE` | БД недоступна весь `LOCK_WAIT_S` |
 | 12 | `EXIT_LOCK_LOST` | lock втрачено під час роботи (рестарт БД, обрив, перехоплення) — fail-closed; новий старт іде через звірку. Зокрема аварійний вихід (`os._exit`), якщо після втрати робота не зупинилась за 5 с |
 | 13 | `EXIT_TAKEOVER_REFUSED` | перехоплення не підтверджено (вкл. мовчання 120 с), власник змінився, немає TTY або не записано `audit_log` |
 | 14 | `EXIT_STOP_TIMEOUT` | після SIGTERM/SIGINT робота не зупинилась за 5 с — аварійний вихід (`os._exit`) |
+| 15 | `EXIT_CONFIG_INVALID` | не задано `API_TOKEN` — процес не стартує (до підключення до БД і перевірки TTY) |
+| 16 | `EXIT_API_BIND_FAILED` | `127.0.0.1:API_PORT` зайнятий або недоступний (`api_bind_failed`) — lock звільнено |
 
 ## Конфігурація
 

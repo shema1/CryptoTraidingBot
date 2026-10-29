@@ -31,6 +31,7 @@ FUNCTIONS = {
     "ctb_orders_guard",
     "ctb_bots_guard",
     "ctb_require_confirmed_audit",
+    "ctb_api_idempotency_guard",
 }
 
 
@@ -74,13 +75,19 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
     assert await _public_tables(migrated_db) == expected
     assert await _functions(migrated_db) >= FUNCTIONS
 
+    # 0002 (T0.7): лише таблиця ключів ідемпотентності API.
     await run_alembic(migrated_db, "downgrade", "-1")
+    assert await _public_tables(migrated_db) == expected - {"api_idempotency_keys"}
+    assert "ctb_api_idempotency_guard" not in await _functions(migrated_db)
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0001"]
+
+    await run_alembic(migrated_db, "downgrade", "base")
     assert await _public_tables(migrated_db) == set()
     assert FUNCTIONS.isdisjoint(await _functions(migrated_db))
 
     await run_alembic(migrated_db, "upgrade", "head")
     assert await _public_tables(migrated_db) == expected
-    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0001"]
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0002"]
 
 
 @pytest.mark.asyncio

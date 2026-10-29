@@ -8,10 +8,12 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "alembic>=1.14,<2", # міграції схеми БД (migrations/, T0.4)
     "asyncpg>=0.30,<1", # async-драйвер PostgreSQL для SQLAlchemy (T0.4)
+    "fastapi>=0.160,<1", # локальний API (app/api, T0.7); тягне starlette і opentelemetry-api (лише API, без SDK)
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3", # конфіг з .env (core/config.py, T0.1/T0.3)
     "sqlalchemy[asyncio]>=2.0.36,<2.1", # моделі БД і async-сесії (app/core/db.py, T0.4)
     "structlog>=25.1,<26", # JSON-логи з маскуванням секретів (core/logging.py, T0.3)
+    "uvicorn>=0.50,<1", # ASGI-сервер API у торговому процесі (app/api/server.py, T0.7); без extras
 ]
 
 [dependency-groups]
@@ -24,6 +26,7 @@ dev = [
     "pyyaml>=6.0", # scripts/sync_ai_rules.py у pre-commit
     "types-pyyaml>=6.0",
     "pytest-asyncio>=0.24", # async integration-тести з БД (tests/db, T0.4)
+    "httpx>=0.28,<1", # TestClient / ASGITransport для тестів API (tests/api, T0.7)
 ]
 
 [tool.uv]
@@ -96,10 +99,11 @@ disallow_incomplete_defs = true
 no_implicit_optional = true
 strict_equality = true
 
-# Строгий режим для торгового ядра (ТЗ §14, AGENTS.md). `strict` не можна задати per-module,
-# тому перелічено всі прапорці, які він вмикає.
+# Строгий режим для торгового ядра (ТЗ §14, AGENTS.md) і межі безпеки — локального API (T0.7). `strict` не можна
+# задати per-module, тому перелічено всі прапорці, які він вмикає.
 [[tool.mypy.overrides]]
 module = [
+    "app.api.*",
     "app.exchange.*",
     "app.trading.*",
     "app.risk.*",

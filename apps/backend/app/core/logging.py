@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from enum import Enum
@@ -160,6 +161,14 @@ class SecretMasker:
         # 4. І ще раз відомі значення: жодна попередня заміна не повинна лишити їх у тексті.
         return _replace_all(text, self._text_forms)
 
+    def mask(self, value: object) -> object:
+        """Маскована копія значення поза логами (напр. `request`/`result` у `audit_log`, T0.7).
+
+        Ті самі правила, що й для записів логу: чутливі назви полів → `***`, відомі секрети в рядках, `Decimal` —
+        рядком, кортежі й множини — списками, довільні об'єкти — маскованим `repr`. Результат придатний для JSON.
+        """
+        return self._mask_value(value)
+
     def __call__(self, logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
         try:
             return self._mask_mapping(event_dict, 0)
@@ -207,6 +216,8 @@ class SecretMasker:
             return SECRET_MASK
         if isinstance(value, Decimal):
             return self.scrub_text(str(value))  # рядком — без втрати точності (інваріант 3)
+        if isinstance(value, uuid.UUID):
+            return str(value)  # ідентифікатор, а не `UUID('…')` з repr
         if isinstance(value, Enum):
             return self._mask_value(value.value, depth + 1)
         if depth > _MAX_DEPTH:

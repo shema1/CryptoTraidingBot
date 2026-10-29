@@ -6,7 +6,7 @@ paths:
 
 # Python-бекенд
 
-- Python 3.11+, повні type hints, `mypy --strict` для `exchange/ trading/ risk/ protection/ reconcile/ core/`.
+- Python 3.11+, повні type hints, `mypy --strict` для `api/ exchange/ trading/ risk/ protection/ reconcile/ core/`.
 - Конфіг — `pydantic-settings`; значення за замовчуванням консервативні; секрети лише з `.env`/сховища ОС, ніколи не хардкодяться.
 - Логування — `structlog`, JSON, з контекстом. Секрети маскуються процесором логера (тест на це обов'язковий).
 - Час: використовуй єдиний модуль `core/clock.py` (`now_ms()`, монотонний годинник) — щоб у тестах його можна було підмінити. Прямі `time.time()` / `datetime.now()` у торговій логіці заборонені.

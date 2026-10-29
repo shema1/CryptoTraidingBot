@@ -30,10 +30,16 @@ docker-compose.yml  TimescaleDB (лише 127.0.0.1:5432)
 
 ```bash
 bash ai-setup/install.sh                          # один раз: розгортає .claude/ і .mcp.json (якщо ще не зроблено)
-cp .env.example .env && chmod 600 .env            # секрети лише тут, файл не комітиться; задайте POSTGRES_PASSWORD і POSTGRES_READONLY_PASSWORD
+cp .env.example .env && chmod 600 .env            # секрети лише тут, файл не комітиться; задайте POSTGRES_PASSWORD, POSTGRES_READONLY_PASSWORD і API_TOKEN
 (cd apps/backend && uv sync)                      # Python-залежності + uv.lock
 (cd apps/web && npm install)                      # JS-залежності + package-lock.json
 uv run --project apps/backend pre-commit install  # git-хуки
+```
+
+`API_TOKEN` — bearer-токен локального API (≥ 32 символи); без нього торговий процес не стартує. Згенерувати:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 ## Щоденні команди
@@ -42,7 +48,7 @@ uv run --project apps/backend pre-commit install  # git-хуки
 # бекенд (з apps/backend)
 uv run pytest -q
 uv run ruff check . && uv run ruff format --check . && uv run mypy
-uv run python -m app                              # торговий процес (другий екземпляр на тій самій БД не стартує; коди виходу — apps/backend/README.md)
+uv run python -m app                              # торговий процес + API на 127.0.0.1:8000 (другий екземпляр на тій самій БД не стартує; коди виходу — apps/backend/README.md)
 
 # веб (з apps/web)
 npm run typecheck

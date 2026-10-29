@@ -14,7 +14,7 @@
 - ML: pandas, numpy, LightGBM (основна модель, CPU), scikit-learn, Optuna. XGBoost і PyTorch/GPU відкладено (ТЗ §5.6). Підхід — meta-labeling (ТЗ §5.1).
 - Frontend `apps/web`: React + Vite + TypeScript, Lightweight Charts. TS-типи API генеруються з OpenAPI.
 - БД: PostgreSQL + TimescaleDB (Docker Compose). Черги — таблиця `jobs`, блокування — advisory lock.
-- Якість: pytest, ruff, mypy (strict для `exchange/ trading/ risk/ protection/ reconcile/ core/`), pre-commit.
+- Якість: pytest, ruff, mypy (strict для `api/ exchange/ trading/ risk/ protection/ reconcile/ core/`), pre-commit.
 
 ## Команди
 

@@ -173,3 +173,116 @@ def test_database_url_hides_password() -> None:
 def test_database_url_requires_password() -> None:
     with pytest.raises(ValueError, match="POSTGRES_PASSWORD"):
         _settings().database_url()
+
+
+# ---------------------------------------------------------------- локальний API (T0.7)
+
+API_TOKEN = "t0k3n-for-config-tests_0123456789-ABC"  # 37 символів token68
+
+
+def test_api_defaults_are_conservative() -> None:
+    settings = _settings()
+    assert settings.api_port == 8000
+    assert settings.api_token is None  # без токена торговий процес не стартує (app/__main__.py)
+    assert settings.api_allowed_origins == ("http://127.0.0.1:5173",)
+
+
+def test_api_bind_host_is_loopback_constant() -> None:
+    from app.core.config import API_BIND_HOST
+
+    assert API_BIND_HOST == "127.0.0.1"
+    assert "api_host" not in Settings.model_fields
+
+
+@pytest.mark.parametrize("port", [0, 80, 1023, 65536])
+def test_api_port_bounds(port: int) -> None:
+    with pytest.raises(ValidationError):
+        _settings(api_port=port)
+
+
+@pytest.mark.parametrize("port", [1024, 65535])
+def test_api_port_boundaries_are_accepted(port: int) -> None:
+    assert _settings(api_port=port).api_port == port
+
+
+def test_api_token_is_secret_and_masked_in_logs() -> None:
+    settings = _settings(api_token=API_TOKEN)
+    assert isinstance(settings.api_token, SecretStr)
+    assert API_TOKEN not in repr(settings)
+    assert API_TOKEN in settings.secret_values()
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "x" * 31,  # коротший за API_TOKEN_MIN_LEN
+        "token with spaces 0123456789abcdef",
+        'token"quote0123456789abcdefghijklmn',
+        "токен-кирилицею-0123456789abcdefghij",
+        "=" + "a" * 40,  # token68: «=» лише в кінці
+        "a" * 32,  # рев'ю T0.7: довжина є, ентропії немає
+        "12" * 20,
+        "abcdefghi" * 4,  # 9 різних символів
+    ],
+)
+def test_weak_or_malformed_api_token_is_rejected_without_echo(token: str) -> None:
+    with pytest.raises(ValidationError) as exc:
+        _settings(api_token=token)
+    assert token not in str(exc.value)
+    assert "API_TOKEN" in str(exc.value)
+
+
+@pytest.mark.parametrize("token", ["Az09._~+/-" * 4 + "==", API_TOKEN])
+def test_valid_api_tokens_are_accepted(token: str) -> None:
+    settings = _settings(api_token=token)
+    assert settings.api_token is not None
+    assert settings.api_token.get_secret_value() == token
+
+
+def test_api_origins_from_environment_are_split_normalized_and_deduplicated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_ALLOWED_ORIGINS", " http://LOCALHOST:5173 ,http://127.0.0.1:4173,http://localhost:5173, ")
+    assert Settings(_env_file=None).api_allowed_origins == ("http://localhost:5173", "http://127.0.0.1:4173")
+
+
+def test_empty_api_origins_variable_means_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_ALLOWED_ORIGINS", "")
+    assert Settings(_env_file=None).api_allowed_origins == ("http://127.0.0.1:5173",)
+
+
+def test_api_origins_may_be_empty_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Порожній allowlist: браузер не може звертатися до API (лише curl/скрипти без Origin).
+    monkeypatch.setenv("API_ALLOWED_ORIGINS", " , ")
+    assert Settings(_env_file=None).api_allowed_origins == ()
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "*",
+        "null",
+        "http://evil.com:80",
+        "http://evil.com",
+        "http://192.168.1.10:5173",
+        "http://0.0.0.0:5173",
+        "http://127.0.0.1",  # без порту
+        "http://127.0.0.1:5173/",  # зі шляхом
+        "http://127.0.0.1:5173/app",
+        "http://127.0.0.1:05173",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:70000",
+        "ftp://127.0.0.1:21",
+        "http://user@127.0.0.1:5173",
+        "http://127.0.0.1.nip.io:5173",
+        "http://[::1]",
+    ],
+)
+def test_non_loopback_or_malformed_origin_is_rejected(origin: str) -> None:
+    with pytest.raises(ValidationError, match="API_ALLOWED_ORIGINS"):
+        _settings(api_allowed_origins=(origin,))
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://127.0.0.1:5173", "http://localhost:4173", "https://localhost:8443", "http://[::1]:5173"]
+)
+def test_loopback_origins_are_accepted(origin: str) -> None:
+    assert _settings(api_allowed_origins=(origin,)).api_allowed_origins == (origin,)

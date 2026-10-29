@@ -1,4 +1,4 @@
-"""Торговий процес `python -m app` (T0.6): аргументи, коди виходу, підтвердження `--force-takeover`.
+"""Торговий процес `python -m app` (T0.6, T0.7): аргументи, коди виходу, підтвердження `--force-takeover`, API.
 
 Без БД: `InstanceLock` і `run_exclusive` підмінені. Реальні процеси — `tests/db/test_instance_lock_process.py`.
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import secrets
 import sys
 from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any, ClassVar
 import pytest
 
 from app import __main__ as backend
+from app.api.server import ApiBindError
+from app.core.config import Settings
 from app.core.instance_lock import (
     InstanceLockHeld,
     InstanceLockLost,
@@ -43,6 +46,7 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("LOG_CONSOLE", "false")
     monkeypatch.setenv("POSTGRES_PASSWORD", "unit-test-only")
     monkeypatch.setenv("LOCK_WAIT_S", "7")
+    monkeypatch.setenv("API_TOKEN", secrets.token_urlsafe(32))
 
 
 class FakeLock:
@@ -127,11 +131,63 @@ def test_exit_codes_are_distinct() -> None:
         backend.EXIT_LOCK_LOST,
         backend.EXIT_TAKEOVER_REFUSED,
         backend.EXIT_STOP_TIMEOUT,
+        backend.EXIT_CONFIG_INVALID,
+        backend.EXIT_API_BIND_FAILED,
     ]
     assert len(set(codes)) == len(codes)
     assert backend.EXIT_OK == 0
     assert backend.EXIT_UNCAUGHT == 1
     assert all(2 < code < 126 for code in codes[1:])  # не 1 (необроблений виняток), не 2 (argparse), не сигнали
+
+
+# --- локальний API (T0.7) ---
+
+
+def test_missing_api_token_refuses_start_before_lock(
+    fake_lock: type[FakeLock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("API_TOKEN")
+    # Без файла змінних розробника: там токен може бути.
+    monkeypatch.setattr(backend, "Settings", lambda: Settings(_env_file=None))
+    assert backend.main([]) == backend.EXIT_CONFIG_INVALID
+    assert fake_lock.instances == []
+
+
+def test_missing_api_token_is_checked_before_takeover(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("API_TOKEN")
+    monkeypatch.setattr(backend, "Settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(backend, "_interactive_terminal", lambda: True)
+
+    def no_db(*args: object, **kwargs: object) -> None:
+        raise AssertionError("без API_TOKEN підключення до БД не повинно відбуватися")
+
+    monkeypatch.setattr(backend, "InstanceLock", no_db)
+    assert backend.main(["--force-takeover"]) == backend.EXIT_CONFIG_INVALID
+
+
+def test_api_bind_failure_maps_to_exit_code_and_releases(
+    fake_lock: type[FakeLock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend, "run_exclusive", _exclusive_raising(ApiBindError(8000, "EADDRINUSE")))
+    assert backend.main([]) == backend.EXIT_API_BIND_FAILED
+    assert fake_lock.instances[0].released is True
+
+
+def test_work_under_lock_is_the_api_server(fake_lock: type[FakeLock], monkeypatch: pytest.MonkeyPatch) -> None:
+    served: list[tuple[Settings, object]] = []
+
+    async def fake_serve_api(settings: Settings, lock: object) -> None:
+        served.append((settings, lock))
+
+    async def run_exclusive(lock: object, body: Callable[[], Coroutine[Any, Any, None]], **kwargs: object) -> None:
+        await body()
+
+    monkeypatch.setattr(backend, "serve_api", fake_serve_api)
+    monkeypatch.setattr(backend, "run_exclusive", run_exclusive)
+    assert backend.main([]) == backend.EXIT_OK
+    ((settings, lock),) = served
+    assert lock is fake_lock.instances[0]
+    assert settings.api_token is not None
 
 
 # --- підтвердження --force-takeover ---

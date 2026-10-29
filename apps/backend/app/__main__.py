@@ -1,8 +1,8 @@
-"""Торговий процес (бекенд): `python -m app` (ТЗ §6.4, T0.6).
+"""Торговий процес (бекенд): `python -m app` (ТЗ §6.4, §14, T0.6, T0.7).
 
-Порядок старту: `Settings` → `configure_logging(process="backend")` → single-instance lock
-(`app/core/instance_lock.py`) → робота під lock (`run_exclusive`) до SIGTERM/SIGINT → звільнення lock.
-Зараз «робота» — лише очікування сигналу: локальний API додає T0.7, цикли ботів — етап 5.
+Порядок старту: `Settings` → `configure_logging(process="backend")` → перевірка `API_TOKEN` → single-instance
+lock (`app/core/instance_lock.py`) → робота під lock (`run_exclusive`) до SIGTERM/SIGINT → звільнення lock.
+«Робота» — локальний API (`app/api/server.py`, T0.7) на `127.0.0.1:API_PORT`; цикли ботів — етап 5.
 
 `--force-takeover` — лише людиною з інтерактивного терміналу після перевірки, що старий процес не працює:
 без TTY процес відмовляє ще до підключення до БД (прапорець у конфігу служби launchd/systemd вбивав би робочий
@@ -24,6 +24,7 @@ from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime
 from typing import Any, Final, TextIO
 
+from app.api.server import ApiBindError, serve_api
 from app.core.config import Settings
 from app.core.instance_lock import (
     InstanceLock,
@@ -42,6 +43,8 @@ EXIT_DB_UNAVAILABLE: Final = 11  # БД недоступна весь `LOCK_WAIT
 EXIT_LOCK_LOST: Final = 12  # lock втрачено під час роботи (fail-closed: новий старт = звірка, ТЗ §11.1)
 EXIT_TAKEOVER_REFUSED: Final = 13  # перехоплення не підтверджено/змінився власник, немає TTY або не записано аудит
 EXIT_STOP_TIMEOUT: Final = 14  # після сигналу робота не зупинилась за BODY_STOP_TIMEOUT_MS — аварійне завершення
+EXIT_CONFIG_INVALID: Final = 15  # конфіг не дозволяє безпечний старт (немає API_TOKEN) — до підключення до БД
+EXIT_API_BIND_FAILED: Final = 16  # 127.0.0.1:API_PORT зайнятий або недоступний — API (і процес) не стартує
 EXIT_UNCAUGHT: Final = 1  # необроблений виняток (записується маскованим `uncaught_exception`)
 
 TAKEOVER_WORD: Final = "TAKEOVER"
@@ -56,6 +59,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = Settings()
     configure_logging(settings, process="backend")
     try:
+        if settings.api_token is None:
+            # Без токена API був би відкритий будь-якій сторінці браузера (ТЗ §14): не стартуємо взагалі.
+            _log.error("api_token_missing", hint="задайте API_TOKEN у файлі змінних оточення (див. .env.example)")
+            return EXIT_CONFIG_INVALID
         if args.force_takeover and not _interactive_terminal():
             _log.error("force_takeover_requires_tty")
             return EXIT_TAKEOVER_REFUSED
@@ -130,7 +137,7 @@ async def _run(settings: Settings, *, force_takeover: bool) -> int:
             wait_ms=settings.lock_wait_s * 1000,
             takeover=confirm_takeover_on_tty if force_takeover else None,
         )
-        await run_exclusive(lock, _serve, on_stuck=_exit_stuck)
+        await run_exclusive(lock, lambda: serve_api(settings, lock), on_stuck=_exit_stuck)
         return EXIT_OK
     except asyncio.CancelledError:
         if not stopping:
@@ -144,6 +151,9 @@ async def _run(settings: Settings, *, force_takeover: bool) -> int:
         return EXIT_LOCK_LOST
     except TakeoverRefused:
         return EXIT_TAKEOVER_REFUSED
+    except ApiBindError as exc:
+        _log.error("api_bind_failed", port=exc.port, reason=exc.reason)
+        return EXIT_API_BIND_FAILED
     except BaseExceptionGroup as errors:
         # Робота з вкладеною TaskGroup (T0.7, етап 5) може віддати втрату lock усередині групи.
         if errors.subgroup(InstanceLockLost) is not None:
@@ -154,11 +164,6 @@ async def _run(settings: Settings, *, force_takeover: bool) -> int:
         await lock.release()
         for sig in signals:
             loop.remove_signal_handler(sig)
-
-
-async def _serve() -> None:
-    """Робота торгового процесу під lock. Поки — лише очікування сигналу завершення (T0.7: API, етап 5: боти)."""
-    await asyncio.Event().wait()
 
 
 async def confirm_takeover_on_tty(

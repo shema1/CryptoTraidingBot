@@ -23,6 +23,7 @@
 | `REPO_ROOT`, `ENV_FILE` | `config.py` | корінь репозиторію і шлях до `.env` |
 | `Settings.database_url(*, test=False)` | `config.py` | `sqlalchemy.engine.URL` (`postgresql+asyncpg`) основної або тестової (`<POSTGRES_DB>_test`) БД; у `repr`/`str` пароль `***`; без `POSTGRES_PASSWORD` — `ValueError` |
 | `Settings.postgres_test_db`, `TEST_DB_SUFFIX`, `LOOPBACK_HOSTS` | `config.py` | ім'я тестової БД; суфікс `_test`; дозволені значення `POSTGRES_HOST` |
+| `API_BIND_HOST`, `API_TOKEN_MIN_LEN`, `API_TOKEN_MIN_DISTINCT` | `config.py` | адреса локального API — лише `127.0.0.1` (не налаштовується); мінімальна довжина `API_TOKEN` (32) і кількість різних символів у ньому (10) |
 | `Base`, `NAMING_CONVENTION` | `db.py` | декларативна основа всіх моделей; детерміновані назви обмежень (`pk_`, `uq_`, `ck_`, `fk_`, `ix_`) |
 | `TimeMs`, `CreatedMs`, `Money` | `db.py` | анотації колонок: `BIGINT` мс; `BIGINT` мс з default `now_ms()` при вставці; `NUMERIC` (`Decimal`) |
 | `enum_check(column, values)`, `sql_list(values)`, `MODES` | `db.py` | `CHECK (column IN (...))` для статусів; режими `demo`/`testnet`/`live` |
@@ -36,7 +37,7 @@
 | `shutdown_logging()` | `logging.py` | зняти й закрити хендлери (завершення процесу, тести) |
 | `get_logger(name=APP, **initial)` | `logging.py` | structlog-логер; канали `APP`, `TRADING`, `ORDERS` або `app.<модуль>` |
 | `bind_context(**values)`, `clear_context()` | `logging.py` | контекст запису (`bot_id`, `symbol`, `client_order_id`, `signal_id`) через contextvars |
-| `SecretMasker`, `MASK`, `SECRET_MASK`, `MIN_SECRET_LEN`, `MAX_STR_LEN` | `logging.py` | процесор маскування і його константи |
+| `SecretMasker`, `MASK`, `SECRET_MASK`, `MIN_SECRET_LEN`, `MAX_STR_LEN` | `logging.py` | процесор маскування і його константи; `SecretMasker.mask(value)` — маскована JSON-придатна копія значення поза логами (`request`/`result` в `audit_log`, T0.7) |
 | `InstanceLock(url, *, lock_id=BACKEND_LOCK_ID)` | `instance_lock.py` | advisory lock торгового процесу на окремій сесії (одноразовий): `acquire(wait_ms=, takeover=)`, `watch()`, `release()`, `held`, `session_pid`, `lost_reason`, `ensure_held()` |
 | `run_exclusive(lock, body, *, on_stuck)` | `instance_lock.py` | виконати `body` під watchdog-ом lock; втрата lock чи зовнішнє скасування → `body` скасовано й дочекано (≤ `BODY_STOP_TIMEOUT_MS`, інакше `on_stuck`), потім `InstanceLockLost` / `CancelledError` |
 | `InstanceLockHeld`, `InstanceLockUnavailable`, `InstanceLockLost`, `TakeoverRefused` | `instance_lock.py` | lock тримає інша сесія (з `holders`); БД недоступна (`last_error`); lock втрачено (`reason`); перехоплення не виконано (`not_confirmed` / `holder_changed` / `audit_failed`) |
@@ -60,6 +61,9 @@
 | `postgres_password` | `POSTGRES_PASSWORD` | — (обов'язково для compose) | `SecretStr` |
 | `postgres_readonly_password` | `POSTGRES_READONLY_PASSWORD` | — (обов'язково для compose) | `SecretStr`; пароль ролі `ctb_readonly`, застосовується лише при першій ініціалізації volume |
 | `lock_wait_s` | `LOCK_WAIT_S` | `60` | скільки секунд при старті торгового процесу повторювати спроби взяти lock; 0 … 600 (0 — одна спроба) |
+| `api_port` | `API_PORT` | `8000` | порт локального API; 1024 … 65535. Адреса не налаштовується: `API_BIND_HOST` = `127.0.0.1` |
+| `api_token` | `API_TOKEN` | — (обов'язково для торгового процесу) | `SecretStr`; bearer-токен UI, ≥ `API_TOKEN_MIN_LEN` = 32 символи token68 (`[A-Za-z0-9._~+/-]`, `=` лише в кінці), з них ≥ `API_TOKEN_MIN_DISTINCT` = 10 різних (`aaaa…` відхиляється); без нього `python -m app` завершується з кодом 15 |
+| `api_allowed_origins` | `API_ALLOWED_ORIGINS` | `http://127.0.0.1:5173` | origins UI для перевірки `Origin` і CORS; у `.env` через кому; лише `http(s)://127.0.0.1\|localhost\|[::1]:<порт>` без шляху (інше, `*`, `null` → помилка валідації); нормалізуються в нижній регістр, дублікати прибираються; порожній список — браузер не має доступу |
 
 ## Логування
 
@@ -79,7 +83,7 @@
     чужого хендлера друкує сирі `msg`/`args`). `shutdown_logging()` повертає все це як було.
 - Сторонні stdlib-логери (ccxt, sqlalchemy, asyncpg), що поширюють записи до root, проходять той самий ланцюжок.
   Логер із власними хендлерами і `propagate=False` його обходить — так робить стандартний `log_config` uvicorn,
-  тому uvicorn запускається з `log_config=None` (T0.7).
+  тому uvicorn запускається з `log_config=None` (`app/api/server.py`, T0.7); його access-лог вимкнено.
 - Спільний форматер рендерить запис один раз і повторно використовує результат для всіх наших хендлерів
   (`RotatingFileHandler` викликає `format()` двічі). Кожен рядок довший за `MAX_STR_LEN` (64 KiB) обрізається
   після заміни відомих секретів: маскування синхронне й не повинне блокувати цикл подій.
@@ -102,7 +106,7 @@
       `Authorization: Bearer value` для чутливих назв (з множиною й цифрами: `tokens=`, `password2=`, `apiKeys:`);
    4. повторно відомі значення.
 4. Числа (`int`/`float`), що містять зареєстрований секрет, → `***` до рендера (JSON лишається валідним).
-5. Довільні об'єкти перетворюються на `repr()` і маскуються **до** рендера JSON; `repr`, що падає, →
+5. `UUID` пишеться рядком; довільні об'єкти перетворюються на `repr()` і маскуються **до** рендера JSON; `repr`, що падає, →
    `<unrepresentable Тип>`; вкладеність понад 20 рівнів → `<too deep Тип>`.
 6. structlog-записи маскуються ще до передачі в stdlib (чужі хендлери бачать лише маски), а у форматері наших
    хендлерів — повторно (ідемпотентно), потім готовий JSON-рядок ще раз очищується від відомих значень
@@ -174,8 +178,8 @@
   сигнал (код 12). Збій самого watchdog-а (виняток не `InstanceLockLost`) теж позначає lock втраченим
   (`watchdog_failed:<тип>`) ще до зупинки роботи. Контракт `body` (T0.7, етап 5): скасування обробляється за ≤ 5 с, без
   необмежених `asyncio.shield` і без ковтання `CancelledError`; `body` володіє всіма своїми задачами (`TaskGroup`, без
-  відірваних `create_task`) — задач поза `body` `run_exclusive` не скасовує; відірвані обробники (напр. запити API,
-  T0.7) викликають `ensure_held()` перед будь-якою дією, що збільшує експозицію. Повторно lock у тому самому процесі не береться: новий
+  відірваних `create_task`) — задач поза `body` `run_exclusive` не скасовує; відірвані обробники (запити API —
+  залежність `require_instance_lock`, `app/api/context.py`) викликають `ensure_held()` перед будь-якою дією, що збільшує експозицію. Повторно lock у тому самому процесі не береться: новий
   старт іде через звірку (ТЗ §11.1). `held` / `ensure_held()` — перевірка перед кожною дією, що збільшує експозицію
   (T5.2); `held` враховує і закритий сокет ще до спрацювання listener-а.
 - **Перехоплення (`acquire(takeover=confirm)`):** лише якщо lock зайнятий; один раз: `confirm(holders)` → `False` =

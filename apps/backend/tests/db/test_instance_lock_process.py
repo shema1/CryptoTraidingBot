@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import signal
+import socket
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -33,6 +35,13 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 STARTUP_TIMEOUT_S = 60
 # Скільки разів опитати pg_stat_activity, чекаючи завершення серверної сесії (як у tests/db/test_concurrency.py).
 _MAX_POLLS = 2000
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port: int = probe.getsockname()[1]
+    return port
 
 
 class Backend:
@@ -87,6 +96,9 @@ async def start_backend(test_db_url: URL, tmp_path: Path) -> AsyncIterator[Any]:
                 "LOG_DIR": str(tmp_path / name),
                 "LOG_CONSOLE": "true",
                 "LOG_LEVEL": "INFO",
+                # T0.7: без токена процес не стартує; порт — вільний ефемерний, не 8000 розробника.
+                "API_TOKEN": secrets.token_urlsafe(32),
+                "API_PORT": str(_free_port()),
             }
         )
         proc = await asyncio.create_subprocess_exec(
