@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, SecretBytes, SecretStr, field_validator, 
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from app.core.db import SYMBOL_RE
 from app.exchange.rate_limit import (
     DEFAULT_SHARE_COLLECTOR_PCT,
     DEFAULT_SHARE_TRADING_PCT,
@@ -45,6 +46,28 @@ _API_TOKEN_RE: Final = re.compile(r"[A-Za-z0-9._~+/-]+=*")
 _LOOPBACK_ORIGIN_RE: Final = re.compile(r"(?:http|https)://(?:127\.0\.0\.1|localhost|\[::1\]):[1-9][0-9]{0,4}")
 
 _MIB = 1024 * 1024
+# 1 година в мс — крок свічок backfill (ТЗ §4.4). Має збігатися з `Timeframe.H1.duration_ms` (тест).
+H1_MS: Final = 3_600_000
+# ТЗ §5А.6: фіксований список за ліквідністю на початок історії, 5–8 символів. Торговий символ на старті — BTC.
+DEFAULT_TRADING_SYMBOL: Final = "BTC/USDT:USDT"
+DEFAULT_RESEARCH_SYMBOLS: Final = (
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "XRP/USDT:USDT",
+    "BNB/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ADA/USDT:USDT",
+    "LTC/USDT:USDT",
+)
+RESEARCH_SYMBOLS_MIN: Final = 5
+RESEARCH_SYMBOLS_MAX: Final = 8
+# 2020-01-01T00:00:00Z — раніше за лістинг USDT-perpetual Bybit backfill не ходить.
+DEFAULT_BACKFILL_START_MS: Final = 1_577_836_800_000
+DEFAULT_BACKFILL_INTERVAL_S: Final = 600
+BACKFILL_INTERVAL_MIN_S: Final = 60
+BACKFILL_INTERVAL_MAX_S: Final = 86_400
+_SYMBOL: Final = re.compile(SYMBOL_RE)
 
 
 class Settings(BaseSettings):
@@ -108,6 +131,18 @@ class Settings(BaseSettings):
     # Частка колектора, %: 1 … 98 (за замовчуванням 20).
     rate_limit_share_collector_pct: Annotated[int, Field(ge=1, le=98)] = DEFAULT_SHARE_COLLECTOR_PCT
 
+    # --- Backfill свічок 1h і funding (app/data/backfill.py, ТЗ §4.1, §4.4, T1.4) ---
+    # Торговий символ. Свічки качаються і для нього, навіть якщо його немає в `research_symbols`.
+    trading_symbol: str = DEFAULT_TRADING_SYMBOL
+    # 5–8 USDT-perpetual для навчання (ТЗ §5А.6). У `.env` — через кому, канонічний формат CCXT.
+    research_symbols: Annotated[tuple[str, ...], NoDecode] = DEFAULT_RESEARCH_SYMBOLS
+    # Початок історії, мс UTC, кратний 1h. Backfill не запитує дані раніше за цю мить.
+    backfill_start_ms: Annotated[int, Field(ge=0)] = DEFAULT_BACKFILL_START_MS
+    # Як часто повторювати інкрементальне докачування, секунди (60 … 86400).
+    backfill_interval_s: Annotated[int, Field(ge=BACKFILL_INTERVAL_MIN_S, le=BACKFILL_INTERVAL_MAX_S)] = (
+        DEFAULT_BACKFILL_INTERVAL_S
+    )
+
     @field_validator("log_dir")
     @classmethod
     def _resolve_log_dir(cls, value: Path) -> Path:
@@ -160,6 +195,41 @@ class Settings(BaseSettings):
             if normalized not in origins:
                 origins.append(normalized)
         return tuple(origins)
+
+    @field_validator("trading_symbol")
+    @classmethod
+    def _trading_symbol(cls, value: str) -> str:
+        if _SYMBOL.fullmatch(value) is None:
+            raise ValueError("TRADING_SYMBOL: канонічний формат CCXT, наприклад BTC/USDT:USDT")
+        return value
+
+    @field_validator("research_symbols", mode="before")
+    @classmethod
+    def _split_research_symbols(cls, value: object) -> object:
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
+
+    @field_validator("research_symbols")
+    @classmethod
+    def _research_symbols(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not RESEARCH_SYMBOLS_MIN <= len(value) <= RESEARCH_SYMBOLS_MAX:
+            raise ValueError(
+                f"RESEARCH_SYMBOLS: від {RESEARCH_SYMBOLS_MIN} до {RESEARCH_SYMBOLS_MAX} символів (зараз {len(value)})"
+            )
+        if len(set(value)) != len(value):
+            raise ValueError("RESEARCH_SYMBOLS: дублікати")
+        for symbol in value:
+            if _SYMBOL.fullmatch(symbol) is None:
+                raise ValueError("RESEARCH_SYMBOLS: канонічний формат CCXT, наприклад BTC/USDT:USDT")
+        return value
+
+    @field_validator("backfill_start_ms")
+    @classmethod
+    def _backfill_start_aligned(cls, value: int) -> int:
+        if value % H1_MS != 0:
+            raise ValueError("BACKFILL_START_MS має бути вирівняний за 1h (кратний 3600000)")
+        return value
 
     @model_validator(mode="after")
     def _rate_limit_shares_cover_the_ip(self) -> Settings:

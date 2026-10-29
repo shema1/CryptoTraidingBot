@@ -24,6 +24,8 @@
 | `Settings.database_url(*, test=False)` | `config.py` | `sqlalchemy.engine.URL` (`postgresql+asyncpg`) основної або тестової (`<POSTGRES_DB>_test`) БД; у `repr`/`str` пароль `***`; без `POSTGRES_PASSWORD` — `ValueError` |
 | `Settings.postgres_test_db`, `TEST_DB_SUFFIX`, `LOOPBACK_HOSTS` | `config.py` | ім'я тестової БД; суфікс `_test`; дозволені значення `POSTGRES_HOST` |
 | `API_BIND_HOST`, `API_TOKEN_MIN_LEN`, `API_TOKEN_MIN_DISTINCT` | `config.py` | адреса локального API — лише `127.0.0.1` (не налаштовується); мінімальна довжина `API_TOKEN` (32) і кількість різних символів у ньому (10) |
+| `H1_MS`, `DEFAULT_TRADING_SYMBOL`, `DEFAULT_RESEARCH_SYMBOLS` | `config.py` | година в мс; торговий символ і список 8 символів навчання (ТЗ §5А.6) |
+| `DEFAULT_BACKFILL_START_MS`, `DEFAULT_BACKFILL_INTERVAL_S`, `BACKFILL_INTERVAL_MIN_S`, `BACKFILL_INTERVAL_MAX_S`, `RESEARCH_SYMBOLS_MIN`, `RESEARCH_SYMBOLS_MAX` | `config.py` | початок історії, інтервал докачування (60…86400 с) і межі довжини `research_symbols` (5…8) |
 | `Base`, `NAMING_CONVENTION` | `db.py` | декларативна основа всіх моделей; детерміновані назви обмежень (`pk_`, `uq_`, `ck_`, `fk_`, `ix_`) |
 | `TimeMs`, `CreatedMs`, `Money` | `db.py` | анотації колонок: `BIGINT` мс; `BIGINT` мс з default `now_ms()` при вставці; `NUMERIC` (`Decimal`) |
 | `enum_check(column, values)`, `sql_list(values)`, `MODES` | `db.py` | `CHECK (column IN (...))` для статусів; режими `demo`/`testnet`/`live` |
@@ -67,6 +69,10 @@
 | `rate_limit_share_trading_pct` | `RATE_LIMIT_SHARE_TRADING_PCT` | `50` | частка торгового процесу в спільному IP-ліміті Bybit, %; 1 … 98; сума трьох часток — рівно 100. Роль процесу (`ProcessRole`) не налаштовується: `.env` спільний, роль передає точка входу в `RateLimiter.from_settings(settings, role=...)` |
 | `rate_limit_share_worker_pct` | `RATE_LIMIT_SHARE_WORKER_PCT` | `30` | частка воркера, %; 1 … 98 |
 | `rate_limit_share_collector_pct` | `RATE_LIMIT_SHARE_COLLECTOR_PCT` | `20` | частка колектора, %; 1 … 98 |
+| `trading_symbol` | `TRADING_SYMBOL` | `BTC/USDT:USDT` | торговий символ (канонічний CCXT). Backfill свічок іде і для нього, навіть якщо його немає в `research_symbols` |
+| `research_symbols` | `RESEARCH_SYMBOLS` | BTC, ETH, SOL, XRP, BNB, DOGE, ADA, LTC (`…/USDT:USDT`) | 5–8 USDT-perpetual для навчання (ТЗ §5А.6); у `.env` через кому; дубль або інший формат — помилка валідації |
+| `backfill_start_ms` | `BACKFILL_START_MS` | `1577836800000` | початок історії свічок і funding, мс UTC (2020-01-01T00:00:00Z); має бути кратним 1h |
+| `backfill_interval_s` | `BACKFILL_INTERVAL_S` | `600` | інтервал інкрементального докачування, секунди; 60 … 86400 |
 
 ## Логування
 

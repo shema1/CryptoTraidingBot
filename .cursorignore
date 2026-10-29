@@ -9,13 +9,14 @@ backups/
 *.dump
 *.sql.gz
 
-# Великі/згенеровані дані — шум для контексту
+# Великі/згенеровані дані — шум для контексту.
+# Лише тека даних у корені (не пакет apps/backend/app/data/ і не docs/data/).
 models/**/*.json.bak
 models/**/*.ubj
 models/**/*.txt
 models/**/*.pt
 models/**/*.bin
-data/
+/data/
 logs/
 **/node_modules/
 **/.venv/

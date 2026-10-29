@@ -318,3 +318,75 @@ def test_rate_limit_role_is_not_a_setting(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("RATE_LIMIT_ROLE", "collector")
     assert "rate_limit_role" not in Settings.model_fields
     assert not hasattr(_settings(), "rate_limit_role")
+
+
+_FIVE = (
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "XRP/USDT:USDT",
+    "BNB/USDT:USDT",
+)
+
+
+def test_market_data_defaults_match_the_spec() -> None:
+    from app.core.config import DEFAULT_BACKFILL_START_MS, DEFAULT_RESEARCH_SYMBOLS, DEFAULT_TRADING_SYMBOL
+
+    settings = _settings()
+    assert settings.trading_symbol == DEFAULT_TRADING_SYMBOL == "BTC/USDT:USDT"
+    assert settings.research_symbols == DEFAULT_RESEARCH_SYMBOLS
+    assert len(settings.research_symbols) == 8
+    assert settings.backfill_start_ms == DEFAULT_BACKFILL_START_MS == 1_577_836_800_000
+    assert settings.backfill_interval_s == 600
+
+
+def test_research_symbols_are_read_from_a_comma_separated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESEARCH_SYMBOLS", "BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT, XRP/USDT:USDT, BNB/USDT:USDT")
+    monkeypatch.setenv("TRADING_SYMBOL", "ETH/USDT:USDT")
+    settings = _settings()
+    assert settings.research_symbols == _FIVE
+    assert settings.trading_symbol == "ETH/USDT:USDT"
+
+
+def test_empty_research_symbols_variable_means_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESEARCH_SYMBOLS", "")
+    monkeypatch.setenv("BACKFILL_START_MS", "")
+    assert _settings().research_symbols[0] == "BTC/USDT:USDT"
+    assert _settings().backfill_start_ms == 1_577_836_800_000
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        _FIVE[:4],
+        (*_FIVE, "DOGE/USDT:USDT", "ADA/USDT:USDT", "LTC/USDT:USDT", "LINK/USDT:USDT"),
+        ("BTC/USDT:USDT", "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT"),
+        ("btc/usdt:usdt", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT"),
+        ("BTCUSDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT"),
+    ],
+)
+def test_research_symbols_outside_the_fixed_list_rules_are_rejected(value: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError, match="RESEARCH_SYMBOLS"):
+        _settings(research_symbols=value)
+
+
+@pytest.mark.parametrize("symbol", ["btc/usdt:usdt", "BTCUSDT", "BTC/USDT", ""])
+def test_trading_symbol_must_be_canonical(symbol: str) -> None:
+    with pytest.raises(ValidationError, match="TRADING_SYMBOL"):
+        _settings(trading_symbol=symbol)
+
+
+def test_backfill_start_must_be_aligned_to_one_hour() -> None:
+    with pytest.raises(ValidationError, match="BACKFILL_START_MS"):
+        _settings(backfill_start_ms=1_577_836_800_000 + 1)
+
+
+@pytest.mark.parametrize("seconds", [59, 86_401])
+def test_backfill_interval_bounds(seconds: int) -> None:
+    with pytest.raises(ValidationError):
+        _settings(backfill_interval_s=seconds)
+
+
+@pytest.mark.parametrize("seconds", [60, 86_400])
+def test_backfill_interval_boundaries_are_accepted(seconds: int) -> None:
+    assert _settings(backfill_interval_s=seconds).backfill_interval_s == seconds

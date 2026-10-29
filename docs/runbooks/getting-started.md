@@ -62,6 +62,10 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 | `RATE_LIMIT_SHARE_TRADING_PCT` | `50` | частка IP-ліміту Bybit торгового процесу, %; сума трьох часток — рівно 100 (роль процесу в `.env` не задається — її визначає команда запуску) |
 | `RATE_LIMIT_SHARE_WORKER_PCT` | `30` | частка воркера, % |
 | `RATE_LIMIT_SHARE_COLLECTOR_PCT` | `20` | частка колектора, % |
+| `TRADING_SYMBOL` | `BTC/USDT:USDT` | символ, яким торгує бот; свічки качаються і для нього |
+| `RESEARCH_SYMBOLS` | 8 пар `…/USDT:USDT` (BTC, ETH, SOL, XRP, BNB, DOGE, ADA, LTC) | список для навчання, 5–8 символів через кому; міняти після старту історії не варто (survivorship bias, ТЗ §5А.6) |
+| `BACKFILL_START_MS` | `1577836800000` | з якої мілісекунди UTC качати історію свічок і funding (кратно 1 годині) |
+| `BACKFILL_INTERVAL_S` | `600` | як часто повторювати докачування, секунди |
 
 Межі й точні формулювання — коментарі в `.env.example`, опис полів — `apps/backend/app/core/README.md`.
 

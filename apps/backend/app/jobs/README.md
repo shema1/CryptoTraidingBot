@@ -19,7 +19,10 @@
 
 ## Таблиці БД
 
-- `jobs` — `kind` (`^[a-z][a-z0-9_]*$`, набір видів визначає T1.8), `status`, `priority` (менше — раніше),
+- `jobs` — `kind` (`^[a-z][a-z0-9_]*$`). Уже визначений вид: `backfill_candles` (T1.4, `app/data/backfill.py`;
+  виконати має воркер T1.8 через `run_backfill_job`, статус рядка змінює воркер; `BackfillIncomplete` — задачу
+  позначити `FAILED`, решту символів уже докачано). Решту видів визначає T1.8.
+  `status`, `priority` (менше — раніше),
   `params`, `progress` ∈ [0, 1], `progress_message`, `result`, `error`, `attempt`, `created_at_ms`, `started_at_ms`,
   `heartbeat_at_ms`, `finished_at_ms`. `RUNNING` має `started_at_ms` і `heartbeat_at_ms`; `finished_at_ms` заданий
   ⇔ термінальний статус. `dedup_key` — частковий `UNIQUE` серед `QUEUED`/`RUNNING` (друга така сама задача не
