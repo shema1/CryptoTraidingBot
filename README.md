@@ -42,6 +42,7 @@ uv run --project apps/backend pre-commit install  # git-хуки
 # бекенд (з apps/backend)
 uv run pytest -q
 uv run ruff check . && uv run ruff format --check . && uv run mypy
+uv run python -m app                              # торговий процес (другий екземпляр на тій самій БД не стартує; коди виходу — apps/backend/README.md)
 
 # веб (з apps/web)
 npm run typecheck

@@ -116,6 +116,12 @@ warn_unused_ignores = true
 no_implicit_reexport = true
 extra_checks = true
 
+# asyncpg не має вбудованих типів (py.typed): з'єднання lock (core/instance_lock.py) типізоване протоколом
+# `LockConnection`, тому окремі стаби не додаються.
+[[tool.mypy.overrides]]
+module = "asyncpg"
+ignore_missing_imports = true
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true

@@ -3,11 +3,13 @@
 ## Призначення
 
 Спільна інфраструктура всіх трьох процесів (торговий, воркер, колектор): конфігурація з `.env`,
-структуроване логування з маскуванням секретів, єдиний годинник `clock`, основа БД (`db.py`), Telegram-сповіщення.
+структуроване логування з маскуванням секретів, єдиний годинник `clock`, основа БД (`db.py`), single-instance lock
+торгового процесу (`instance_lock.py`), Telegram-сповіщення.
 
 ## Розділи ТЗ
 
 - ТЗ §4.3 — час (UTC, мілісекунди)
+- ТЗ §6.4 — конкурентність: advisory lock торгового процесу
 - ТЗ §12 — моніторинг, сповіщення, логи
 - ТЗ §14 — безпека, ключі в `.env`
 - ТЗ §15 — модель даних (спільна основа моделей і міграцій)
@@ -35,6 +37,12 @@
 | `get_logger(name=APP, **initial)` | `logging.py` | structlog-логер; канали `APP`, `TRADING`, `ORDERS` або `app.<модуль>` |
 | `bind_context(**values)`, `clear_context()` | `logging.py` | контекст запису (`bot_id`, `symbol`, `client_order_id`, `signal_id`) через contextvars |
 | `SecretMasker`, `MASK`, `SECRET_MASK`, `MIN_SECRET_LEN`, `MAX_STR_LEN` | `logging.py` | процесор маскування і його константи |
+| `InstanceLock(url, *, lock_id=BACKEND_LOCK_ID)` | `instance_lock.py` | advisory lock торгового процесу на окремій сесії (одноразовий): `acquire(wait_ms=, takeover=)`, `watch()`, `release()`, `held`, `session_pid`, `lost_reason`, `ensure_held()` |
+| `run_exclusive(lock, body, *, on_stuck)` | `instance_lock.py` | виконати `body` під watchdog-ом lock; втрата lock чи зовнішнє скасування → `body` скасовано й дочекано (≤ `BODY_STOP_TIMEOUT_MS`, інакше `on_stuck`), потім `InstanceLockLost` / `CancelledError` |
+| `InstanceLockHeld`, `InstanceLockUnavailable`, `InstanceLockLost`, `TakeoverRefused` | `instance_lock.py` | lock тримає інша сесія (з `holders`); БД недоступна (`last_error`); lock втрачено (`reason`); перехоплення не виконано (`not_confirmed` / `holder_changed` / `audit_failed`) |
+| `LockHolder` | `instance_lock.py` | власник lock з `pg_locks` + `pg_stat_activity`: pid сесії, pid процесу ОС з `application_name`, адреса, користувач, стан, час у мс |
+| `connect_lock_session(url, *, server_settings)`, `lock_server_settings()` | `instance_lock.py` | окреме raw-з'єднання asyncpg (поза пулом) і параметри сесії lock (`application_name`, серверні keepalive) |
+| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
 
 Поля `Settings` (межі й defaults визначені в `config.py`):
 
@@ -51,6 +59,7 @@
 | `postgres_user` | `POSTGRES_USER` | `ctb` | власник БД (superuser контейнера, лише локально) |
 | `postgres_password` | `POSTGRES_PASSWORD` | — (обов'язково для compose) | `SecretStr` |
 | `postgres_readonly_password` | `POSTGRES_READONLY_PASSWORD` | — (обов'язково для compose) | `SecretStr`; пароль ролі `ctb_readonly`, застосовується лише при першій ініціалізації volume |
+| `lock_wait_s` | `LOCK_WAIT_S` | `60` | скільки секунд при старті торгового процесу повторювати спроби взяти lock; 0 … 600 (0 — одна спроба) |
 
 ## Логування
 
@@ -132,6 +141,60 @@
   інваріанти — обмеженнями БД (`UNIQUE`, `CHECK`, FK, часткові індекси), а не лише в коді.
 - Міграції — `apps/backend/migrations/` (Alembic, async). DSN береться з `Settings.database_url()`, не з `alembic.ini`.
 
+## Single-instance lock (`instance_lock.py`)
+
+Не дає запустити другий екземпляр торгового процесу (`python -m app`) на тій самій БД (ТЗ §6.4, рішення
+`docs/decisions/0006-instance-lock.md`).
+
+- **Ключ:** `pg_try_advisory_lock(LOCK_NAMESPACE, BACKEND_LOCK_ID)` = `(0x63746200 "ctb\0", 1)`; у `pg_locks` —
+  `locktype = 'advisory'`, `classid`/`objid`, `objsubid = 2`. Lock діє в межах **однієї БД** (`POSTGRES_DB`): другий
+  процес з іншою БД на тому самому комп'ютері (напр. відновлена копія) його не бачить, і `allowed_host_id` від цього
+  **не** захищає (`HOST_ID` той самий) — залишковий ризик, рішення 0006; між комп'ютерами захищає `allowed_host_id` (T5.1).
+- **Окреме з'єднання:** raw asyncpg поза пулом SQLAlchemy (пул/автореконект мовчки підмінили б сесію на нову, без
+  lock). Параметри сесії (`server_settings`): `application_name = "ctb-backend pid=<pid ОС>"`,
+  `tcp_keepalives_idle = 10`, `tcp_keepalives_interval = 5`, `tcp_keepalives_count = 3` — PostgreSQL виявляє мертвого
+  TCP-співрозмовника не пізніше `KEEPALIVE_TIMEOUT_S` = 25 с і звільняє lock; `idle_session_timeout = 0`.
+  Після `kill -9` ОС закриває сокет одразу, і lock звільняється за мілісекунди. За Docker Desktop / WSL2 співрозмовник
+  сервера — проксі портів (`client_addr` у `pg_stat_activity` — адреса шлюзу): звільнення тримається на тому, що
+  проксі передає закриття з'єднання, а keepalive перевіряє проксі, не процес. Тому процес-власника видно лише з
+  `application_name`.
+- **Старт (`acquire`):** спроби кожні `RETRY_INTERVAL_MS` = 1000 мс до `LOCK_WAIT_S`; помилки з'єднання до кінця
+  очікування не фатальні (БД може ще стартувати після перезавантаження). Наприкінці: lock зайнятий →
+  `instance_lock_held_by_other` (ERROR, з `holders`) і `InstanceLockHeld`; БД недоступна →
+  `instance_lock_db_unavailable` і `InstanceLockUnavailable`. Невдача чи скасування спроби закриває з'єднання — lock,
+  який сервер міг видати в останню мить, не лишається. `acquire()` викликається один раз на екземпляр (повторно —
+  `RuntimeError`): після невдачі, звільнення чи втрати lock береться лише новим процесом.
+- **Робота (`run_exclusive` / `watch`):** listener закриття з'єднання asyncpg (миттєво) і heartbeat кожні
+  `HEARTBEAT_INTERVAL_MS` = 5 с — запит «чи моя сесія тримає lock» з таймаутом `HEARTBEAT_TIMEOUT_MS` = 5 с.
+  Закриття, помилка, таймаут або `false` → `instance_lock_lost` (CRITICAL), `held = False` (нові входи заборонені), але
+  з'єднання **ще відкрите**: робота скасовується й дочікується до `BODY_STOP_TIMEOUT_MS` = 5 с, лише потім
+  `InstanceLockLost` і `release()` — при таймауті heartbeat lock на сервері може бути ще нашим, і віддавати його до
+  зупинки роботи не можна. Робота не зупинилась вчасно → `instance_lock_body_stuck` і `on_stuck` (у процесі —
+  `os._exit`, код 12; після сигналу — код 14). Сигнал посеред зупинки дедлайн не скорочує, а втрата lock важливіша за
+  сигнал (код 12). Збій самого watchdog-а (виняток не `InstanceLockLost`) теж позначає lock втраченим
+  (`watchdog_failed:<тип>`) ще до зупинки роботи. Контракт `body` (T0.7, етап 5): скасування обробляється за ≤ 5 с, без
+  необмежених `asyncio.shield` і без ковтання `CancelledError`; `body` володіє всіма своїми задачами (`TaskGroup`, без
+  відірваних `create_task`) — задач поза `body` `run_exclusive` не скасовує; відірвані обробники (напр. запити API,
+  T0.7) викликають `ensure_held()` перед будь-якою дією, що збільшує експозицію. Повторно lock у тому самому процесі не береться: новий
+  старт іде через звірку (ТЗ §11.1). `held` / `ensure_held()` — перевірка перед кожною дією, що збільшує експозицію
+  (T5.2); `held` враховує і закритий сокет ще до спрацювання listener-а.
+- **Перехоплення (`acquire(takeover=confirm)`):** лише якщо lock зайнятий; один раз: `confirm(holders)` → `False` =
+  `TakeoverRefused("not_confirmed")`; `True` → власники читаються знову (людина могла думати хвилини): власника вже
+  немає → без перехоплення, звичайна спроба; власник інший (`session_pid` + `backend_start_ms`) →
+  `TakeoverRefused("holder_changed")`; той самий → запис `audit_log` (`instance.force_takeover`, `actor = cli`,
+  `target = backend`, `confirmed = true`, `request` — власники і pid ОС) **до** `pg_terminate_backend(pid, 5000)`, який
+  виконується одним запитом лише для сесії, що досі тримає lock і має той самий `backend_start` (pid міг бути
+  перевикористаний). Аудит не записано → `TakeoverRefused("audit_failed")`, нікого не завершено. Після підтвердження
+  `LOCK_WAIT_S` відраховується заново. Процес, у якого перехопили lock, отримує `InstanceLockLost` і завершується.
+- **Події логу** (`app.core.instance_lock`, контекст `lock = [namespace, id]`): `instance_lock_acquired`,
+  `instance_lock_busy`, `instance_lock_db_error`, `instance_lock_held_by_other`, `instance_lock_db_unavailable`,
+  `instance_lock_takeover_refused`, `instance_lock_holder_gone`, `instance_lock_holder_changed`,
+  `instance_lock_takeover_audit_failed`, `instance_lock_force_takeover`, `instance_lock_holder_terminated`,
+  `instance_lock_lost`, `instance_lock_watchdog_failed`, `instance_lock_cancel_during_stop`, `instance_lock_body_stuck`,
+  `instance_lock_body_failed`, `instance_lock_close_failed`, `instance_lock_released`.
+- Обмеження: завислий процес (SIGSTOP, deadlock) тримає lock далі — це правильно, бо він «живий»; його ловить
+  dead-man's switch (T5.7), а людина може перехопити lock вручну.
+
 ## Інваріанти
 
 - Кожне поле `Settings` є в `.env.example` без значення, і навпаки; значення за замовчуванням у `.env.example` і в
@@ -147,4 +210,5 @@
 | T0.2 | `[x]` | поля `postgres_*` для docker-compose; повний DSN — T0.4 |
 | T0.3 | `[x]` | повний `Settings` (`frozen`, межі, `LOG_*`, `hide_input_in_errors`), `logging.py` з каналами, ротацією, маскуванням і хуками винятків, `clock.py` з `FakeClock`, заборона прямого доступу до часу (`TID251`) |
 | T0.4 | `[x]` | `POSTGRES_HOST` (лише loopback), `POSTGRES_PORT`, `database_url()`; `db.py` — `Base`, naming convention, типи колонок, engine/сесії |
+| T0.6 | `[x]` | `instance_lock.py` — advisory lock торгового процесу (окрема сесія з серверними keepalive, повтори `LOCK_WAIT_S`, власник у лог, watchdog втрати, ручне перехоплення з аудитом); `LOCK_WAIT_S` |
 | T5.6 | `[ ]` | Telegram-сповіщення |

@@ -5,7 +5,8 @@
 `ctb_require_confirmed_audit()` (міграція 0001) перевіряє, що запис має `confirmed = true` і саме потрібну дію
 (`AUDIT_ACTION_*` нижче) для того самого акаунта (`risk_config`, `emergency_runs`) або моделі (`models`: `target` =
 `model_version`); один запис підтверджує лише одну дію (частковий `UNIQUE (confirmed_audit_id)` у кожній таблиці).
-`confirmed = true` ставить лише API після явного підтвердження людини в UI (T0.7, T6.2).
+`confirmed = true` ставить лише API після явного підтвердження людини в UI (T0.7, T6.2) і торговий процес при ручному
+перехопленні lock після введення підтвердження в терміналі (`AUDIT_ACTION_FORCE_TAKEOVER`, T0.6).
 Секрети в `request`/`result` не пишуться (ТЗ §14).
 """
 
@@ -23,6 +24,9 @@ from app.core.db import Base, CreatedMs
 AUDIT_ACTION_RISK_LOOSEN = "risk.config.loosen"
 AUDIT_ACTION_EMERGENCY_RELEASE = "emergency.release"
 AUDIT_ACTION_MODEL_APPROVE = "model.approve"
+# Ручне перехоплення single-instance lock (`python -m app` з прапорцем перехоплення, ТЗ §6.4, T0.6). Пишеться
+# до завершення сесії-власника; ні на що не посилається (не підтверджує зміну стану в інших таблицях).
+AUDIT_ACTION_FORCE_TAKEOVER = "instance.force_takeover"
 
 
 class AuditLog(Base):

@@ -26,6 +26,7 @@ def test_defaults() -> None:
     assert settings.log_backup_count == 10
     assert settings.log_console is True
     assert settings.postgres_password is None
+    assert settings.lock_wait_s == 60
 
 
 @pytest.mark.parametrize(
@@ -37,6 +38,8 @@ def test_defaults() -> None:
         ("log_backup_count", 0),
         ("log_backup_count", 101),
         ("log_level", "TRACE"),
+        ("lock_wait_s", -1),
+        ("lock_wait_s", 601),
     ],
 )
 def test_out_of_range_values_are_rejected(field: str, value: object) -> None:
@@ -51,6 +54,8 @@ def test_out_of_range_values_are_rejected(field: str, value: object) -> None:
         ("log_max_bytes", 1024 * 1024 * 1024),
         ("log_backup_count", 1),
         ("log_backup_count", 100),
+        ("lock_wait_s", 0),
+        ("lock_wait_s", 600),
     ],
 )
 def test_boundary_values_are_accepted(field: str, value: int) -> None:

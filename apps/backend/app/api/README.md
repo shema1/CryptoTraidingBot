@@ -17,6 +17,7 @@
 | --- | --- | --- |
 | `AuditLog` | `models.py` | таблиця `audit_log` (ТЗ §14, §15) |
 | `AUDIT_ACTION_RISK_LOOSEN`, `AUDIT_ACTION_EMERGENCY_RELEASE`, `AUDIT_ACTION_MODEL_APPROVE` | `models.py` | дії, що підтверджують небезпечні зміни (`risk.config.loosen`, `emergency.release`, `model.approve`) |
+| `AUDIT_ACTION_FORCE_TAKEOVER` | `models.py` | `instance.force_takeover` — ручне перехоплення single-instance lock торгового процесу (пише `app/core/instance_lock.py` до завершення сесії-власника, `actor = cli`, `confirmed = true` після введення `TAKEOVER` у терміналі; ні на що не посилається) |
 
 ## Таблиці БД
 
@@ -28,7 +29,8 @@
   (`APPROVED`, `model.approve`). Тригер `ctb_require_confirmed_audit()` пропускає лише запис із
   `confirmed = true`, саме цією дією і тією самою ціллю: `account_id` акаунта (`risk_config`, `emergency_runs`)
   або `target = model_version` (`models`). Один запис підтверджує лише одну дію (частковий
-  `UNIQUE (confirmed_audit_id)` у кожній із трьох таблиць). `confirmed = true` пише лише API після підтвердження в UI (T0.7, T6.2).
+  `UNIQUE (confirmed_audit_id)` у кожній із трьох таблиць). `confirmed = true` пише лише API після підтвердження в UI (T0.7, T6.2)
+  і торговий процес при ручному перехопленні lock після введення `TAKEOVER` у терміналі (`instance.force_takeover`, T0.6).
 
 Схема створюється міграцією `migrations/versions/0001_initial_schema.py`; обмеження й тригери перевіряють `tests/db/test_constraints.py`, `tests/db/test_guards.py` і `tests/db/test_migrations.py`.
 

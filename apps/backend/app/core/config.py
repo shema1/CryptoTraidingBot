@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     # Пароль read-only ролі ctb_readonly (MCP `postgres-readonly`); застосовується лише при першій ініціалізації volume.
     postgres_readonly_password: SecretStr | None = None
 
+    # --- Single-instance lock торгового процесу (core/instance_lock.py, ТЗ §6.4, T0.6) ---
+    # Скільки секунд при старті повторювати спроби взяти lock (0 … 600; 0 — одна спроба), потім — вихід.
+    lock_wait_s: Annotated[int, Field(ge=0, le=600)] = 60
+
     @field_validator("log_dir")
     @classmethod
     def _resolve_log_dir(cls, value: Path) -> Path:
