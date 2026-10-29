@@ -18,6 +18,12 @@ asyncpg не приймає більше 32767 параметрів.
 Збій біржі на одному символі не зупиняє решту: прохід розкладу повертає його в `SyncResult.failed_symbols`, задача
 воркера докачує інші символи і наприкінці кидає `BackfillIncomplete`. Розклад іде за монотонним годинником;
 невдалий прохід повторюється через паузу `SYNC_RETRY_BASE_MS`, що подвоюється до інтервалу розкладу (з jitter).
+
+Прогалини не інтерполюються. Після проходу свічок (і для символу, який цей прохід не качав) викликається
+`detect_candle_gaps` по сітці до `settled_end_ms(now)`: дірка пишеться в `data_gaps`, а щойно закрита свічка в межах
+`CANDLE_SETTLE_MS` ще не вважається діркою. Курсор `max(час)` за діркою позаду не повертається — закрити її повторним
+проходом цей модуль не може, рядок лишається відкритим (T1.5). Зіткнення з іншим процесом на тому самому ряді
+прогалин повторюється один раз, далі ряд пропускається до наступного проходу — решта символів докачується.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from app.core.clock import monotonic_ms, now_ms
 from app.core.config import H1_MS, Settings
 from app.core.db import SYMBOL_RE, Base
 from app.core.logging import get_logger
+from app.data.gaps import detect_candle_gaps, is_open_gap_conflict, settled_end_ms
 from app.data.models import Candle as StoredCandle
 from app.data.models import FundingRate as StoredFunding
 from app.exchange.errors import ExchangeError
@@ -65,6 +72,8 @@ BACKFILL_DEDUP_KEY: Final = "backfill_candles"
 # Більше число — пізніше в черзі воркера (модель `Job.priority`).
 BACKFILL_JOB_PRIORITY: Final = 200
 _ACTIVE_JOB_STATUSES: Final = ("QUEUED", "RUNNING")
+# Спроб звести ряд прогалин, коли інший процес (воркер і торговий процес) зводить його одночасно.
+GAP_SYNC_ATTEMPTS: Final = 2
 _SYMBOL: Final = re.compile(SYMBOL_RE)
 _LOG = get_logger("app.data")
 
@@ -230,9 +239,15 @@ async def backfill_symbol(
     inserted_candles = 0
     inserted_funding = 0
     if candles:
-        inserted_candles = await _backfill_candles(
-            sessions, source, symbol=symbol, floor_ms=start_ms, now=current, fetch_limit=fetch_limit
-        )
+        try:
+            inserted_candles = await _backfill_candles(
+                sessions, source, symbol=symbol, floor_ms=start_ms, now=current, fetch_limit=fetch_limit
+            )
+        except ExchangeError:
+            # Сторінки до збою вже в БД: дірка до курсора має бути видна live, навіть якщо хвіст не докачано.
+            await _record_candle_gaps(sessions, symbol=symbol, floor_ms=start_ms, now=current)
+            raise
+        await _record_candle_gaps(sessions, symbol=symbol, floor_ms=start_ms, now=current)
     if funding:
         inserted_funding = await _backfill_funding(
             sessions, source, symbol=symbol, floor_ms=start_ms, now=current, window_ms=funding_window_ms
@@ -345,6 +360,12 @@ async def sync_market_data(
     if job_id is not None:
         _LOG.info("backfill_enqueued", job_id=str(job_id), symbols=queued, start_ms=start_ms)
     total, failed = await _backfill_each(sessions, source, inline, start_ms=start_ms, fetch_limit=fetch_limit)
+    # Символ, чиї свічки цей прохід качав, уже звірений у `backfill_symbol`. Решта (черга воркера, лише funding,
+    # ряд що наздогнав) теж звіряється: інакше дірка позаду курсора лишилась би невидимою.
+    recorded = {item.symbol for item in inline if item.candles}
+    for symbol in symbols:
+        if symbol not in recorded:
+            await _record_candle_gaps(sessions, symbol=symbol, floor_ms=start_ms, now=current)
     return SyncResult(inline=total, job_id=job_id, job_symbols=tuple(queued), failed_symbols=failed)
 
 
@@ -499,6 +520,37 @@ async def _backfill_each(
 async def _transaction(sessions: SessionFactory) -> AsyncIterator[AsyncSession]:
     async with sessions() as session, session.begin():
         yield session
+
+
+async def _record_candle_gaps(sessions: SessionFactory, *, symbol: str, floor_ms: int, now: int) -> None:
+    """Записати дірки свічок `[перша сітка ≥ floor, settled_end_ms(now))`. Ряд свічок не змінюється.
+
+    Зіткнення з іншим процесом на `uq_data_gaps_open` повторюється (`GAP_SYNC_ATTEMPTS`). Якщо й повтор зіткнувся,
+    ряд щойно звів той процес: цей прохід іде далі, наступний зведе ряд знову. Інакше гонка зупиняла б backfill
+    решти символів. Інші помилки летять далі.
+    """
+    step = BACKFILL_TIMEFRAME.duration_ms
+    start = _align_forward(floor_ms, step)
+    end = settled_end_ms(now, BACKFILL_TIMEFRAME)
+    if start >= end:
+        return
+    for attempt in range(1, GAP_SYNC_ATTEMPTS + 1):
+        try:
+            async with _transaction(sessions) as session:
+                await detect_candle_gaps(
+                    session,
+                    exchange=EXCHANGE,
+                    symbol=symbol,
+                    timeframe=BACKFILL_TIMEFRAME,
+                    start_ms=start,
+                    end_ms=end,
+                )
+        except IntegrityError as exc:
+            if not is_open_gap_conflict(exc):
+                raise
+            _LOG.warning("data_gap_sync_conflict", symbol=symbol, attempt=attempt, attempts=GAP_SYNC_ATTEMPTS)
+            continue
+        return
 
 
 async def _active_job_id(session: AsyncSession) -> uuid.UUID | None:

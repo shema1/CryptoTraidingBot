@@ -25,15 +25,20 @@ GAP_SOURCES: tuple[str, ...] = (
     "liquidations",
 )
 
+# Частковий UNIQUE відкритих прогалин ряду. `gaps.is_open_gap_conflict` за цим іменем відрізняє гонку двох процесів,
+# що зводять один ряд, від інших порушень цілісності.
+OPEN_GAP_INDEX = "uq_data_gaps_open"
+
 # Ряди `mark_index_candles`: mark-ціна (тригер SL, симулятор угоди) та index-ціна — окремі ендпоінти Bybit.
 PRICE_TYPES: tuple[str, ...] = ("mark", "index")
 
 # Таймфрейм/інтервал: число + одиниця (`1h`, `4h`, `1d`, `5min` для long/short ratio).
-_INTERVAL_RE = "^[0-9]+(m|min|h|d|w)$"
+# Той самий вираз, що в CHECK схеми; `gaps.py` звіряє рядок із ним до запису.
+INTERVAL_RE = "^[0-9]+(m|min|h|d|w)$"
 
 
 def _interval_check(column: str) -> CheckConstraint:
-    return CheckConstraint(f"{column} ~ '{_INTERVAL_RE}'", name=f"{column}_format")
+    return CheckConstraint(f"{column} ~ '{INTERVAL_RE}'", name=f"{column}_format")
 
 
 def _ohlc_checks(positive: bool) -> tuple[CheckConstraint, ...]:
@@ -78,8 +83,9 @@ class DataGap(Base):
     """Прогалина в даних (ТЗ §4.2). Інтервал напіввідкритий: `[from_ms, to_ms)`.
 
     Повторне виявлення тієї самої **відкритої** прогалини не створює дубля (частковий `UNIQUE ... WHERE
-    resolved_at_ms IS NULL`, AGENTS.md інваріант 11): прогалина, що росте, продовжується upsert-ом `to_ms`;
-    закрита прогалина не заважає зареєструвати нову з тим самим `from_ms`.
+    resolved_at_ms IS NULL`, AGENTS.md інваріант 11): відкритий рядок зберігає id і `detected_at_ms`, а його межі
+    оновлюються, коли дірка росте чи скорочується (`gaps.sync_open_gaps`); закрита прогалина не заважає
+    зареєструвати нову з тим самим `from_ms`.
     `resolved_at_ms` — коли дані докачано й перевірено; прогалина, якої на біржі немає, лишається відкритою.
     """
 
@@ -92,7 +98,7 @@ class DataGap(Base):
         CheckConstraint("from_ms >= 0 AND to_ms > from_ms", name="range_valid"),
         CheckConstraint("resolved_at_ms IS NULL OR resolved_at_ms >= detected_at_ms", name="resolved_after_detected"),
         Index(
-            "uq_data_gaps_open",
+            OPEN_GAP_INDEX,
             "source",
             "exchange",
             "symbol",
