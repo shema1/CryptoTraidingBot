@@ -23,7 +23,7 @@ Python 3.11+ (керується `uv`). Три процеси з одного к
 uv sync                                           # залежності (створює/оновлює uv.lock — комітиться)
 uv run pytest -q                                  # тести без мережевих (testnet/demo вимкнені за замовчуванням)
 uv run pytest -q -m "not slow"                    # швидкі тести
-uv run pytest -q -m testnet                       # лише Testnet (потрібні тестові ключі в .env)
+uv run pytest -q -m testnet                       # лише Testnet; публічні дані T1.3 ключів не потребують (приватні виклики — T3.x, ключі в .env); тест остаточності kline — ще й slow (до ~85 с), без нього: -m "testnet and not slow"
 uv run pytest -q -m integration                   # схема БД, міграції, lock на ctb_test (потрібна docker compose БД)
 uv run python -m app                              # торговий процес: lock + локальний API на 127.0.0.1:API_PORT
 uv run alembic upgrade head                       # міграції основної dev-БД (`-x db=test` — тестової)
