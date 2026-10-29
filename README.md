@@ -7,6 +7,7 @@
 - Інструкції для AI-агентів та інваріанти: [`AGENTS.md`](AGENTS.md)
 - План робіт: [`docs/ai/TASKS.md`](docs/ai/TASKS.md), налаштування AI-інструментів: [`docs/ai/AI_SETUP.md`](docs/ai/AI_SETUP.md)
 - Рішення та відхилення від ТЗ: [`docs/decisions/`](docs/decisions/)
+- Перший запуск: [`docs/runbooks/getting-started.md`](docs/runbooks/getting-started.md)
 
 ## Структура
 
@@ -14,33 +15,17 @@
 apps/backend/   Python-бекенд (FastAPI, воркер, колектор) — див. apps/backend/README.md
 apps/web/       React + Vite + TypeScript — див. apps/web/README.md
 models/         артефакти моделей (у git не потрапляють)
-docs/           план, рішення, шаблони
+docs/           план, рішення, інструкції запуску (runbooks), шаблони
 scripts/        службові скрипти (синхронізація правил AI, перевірка секретів, перевірка БД)
 infra/db/init/  init-скрипти TimescaleDB (read-only роль, тестова БД)
 docker-compose.yml  TimescaleDB (лише 127.0.0.1:5432)
 ```
 
-## Потрібно встановити
+## Перший запуск
 
-- [`uv`](https://docs.astral.sh/uv/) (сам встановить Python 3.11 за `apps/backend/.python-version`)
-- Node.js ≥ 20.19 і npm
-- Docker (Docker Desktop або OrbStack) — для TimescaleDB
-
-## Перше налаштування
-
-```bash
-bash ai-setup/install.sh                          # один раз: розгортає .claude/ і .mcp.json (якщо ще не зроблено)
-cp .env.example .env && chmod 600 .env            # секрети лише тут, файл не комітиться; задайте POSTGRES_PASSWORD, POSTGRES_READONLY_PASSWORD і API_TOKEN
-(cd apps/backend && uv sync)                      # Python-залежності + uv.lock
-(cd apps/web && npm install)                      # JS-залежності + package-lock.json
-uv run --project apps/backend pre-commit install  # git-хуки
-```
-
-`API_TOKEN` — bearer-токен локального API (≥ 32 символи); без нього торговий процес не стартує. Згенерувати:
-
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-```
+Покроково — **[`docs/runbooks/getting-started.md`](docs/runbooks/getting-started.md)**: що встановити, які змінні
+`.env` заповнити (обов'язкові: `POSTGRES_PASSWORD`, `POSTGRES_READONLY_PASSWORD`, `API_TOKEN`), запуск БД, міграцій,
+торгового процесу й перевірка API, типові помилки.
 
 ## Щоденні команди
 

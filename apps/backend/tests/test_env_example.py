@@ -124,3 +124,22 @@ def test_bounded_fields_exist() -> None:
 def test_env_example_states_code_bounds(field: str, bounds: tuple[int, int]) -> None:
     ge, le = bounds
     assert f"{ge} … {le}" in _env_comment(field.upper()), f"{field.upper()}: у .env.example мають бути межі {ge} … {le}"
+
+
+# --- Інструкція першого запуску описує кожну змінну (documentation.md) ---
+
+GETTING_STARTED = REPO_ROOT / "docs" / "runbooks" / "getting-started.md"
+
+
+@pytest.mark.parametrize("name", sorted(_parse_env_example()))
+def test_getting_started_describes_every_variable(name: str) -> None:
+    assert f"`{name}`" in GETTING_STARTED.read_text(encoding="utf-8"), (
+        f"{name}: опишіть змінну в docs/runbooks/getting-started.md (що це і чи обов'язкова)"
+    )
+
+
+def test_getting_started_lists_required_variables_as_required() -> None:
+    text = GETTING_STARTED.read_text(encoding="utf-8")
+    required = text.split("### Обов'язкові", 1)[1].split("###", 1)[0]
+    for name in ("POSTGRES_PASSWORD", "POSTGRES_READONLY_PASSWORD", "API_TOKEN"):
+        assert f"`{name}`" in required, f"{name} має бути в розділі обов'язкових змінних"
