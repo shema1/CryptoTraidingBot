@@ -59,6 +59,9 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 | `LOCK_WAIT_S` | `60` | скільки секунд при старті чекати, поки звільниться lock іншого екземпляра |
 | `API_PORT` | `8000` | порт 8000 зайнятий іншою програмою (код виходу 16) |
 | `API_ALLOWED_ORIGINS` | `http://127.0.0.1:5173` | UI відкривається з іншої адреси (лише `127.0.0.1` / `localhost` / `[::1]` з портом) |
+| `RATE_LIMIT_SHARE_TRADING_PCT` | `50` | частка IP-ліміту Bybit торгового процесу, %; сума трьох часток — рівно 100 (роль процесу в `.env` не задається — її визначає команда запуску) |
+| `RATE_LIMIT_SHARE_WORKER_PCT` | `30` | частка воркера, % |
+| `RATE_LIMIT_SHARE_COLLECTOR_PCT` | `20` | частка колектора, % |
 
 Межі й точні формулювання — коментарі в `.env.example`, опис полів — `apps/backend/app/core/README.md`.
 

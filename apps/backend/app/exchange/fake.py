@@ -34,7 +34,8 @@
 - WS: `ws_drop_next(n)`, `ws_duplicate_next(n)`, `ws_disconnect()` — події без підписника губляться, як у житті;
 - зовнішні дії: `place_external_order()`, `open_external_position()`, `close_position_externally()`,
   `clear_position_protection()`; зсув часу біржі — `server_time_offset_ms`.
-Журнал `calls` фіксує кожен виклик методу адаптера (включно з невдалими) — для перевірок «ордерів не відправлено».
+Журнал `calls` фіксує кожен виклик методу адаптера (включно з невдалими) і його `priority` — для перевірок
+«ордерів не відправлено» і того, що викликач передав клас rate limiter. Сам лімітер фейк не викликає.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ from app.exchange.errors import (
     RateLimited,
     RequestRejected,
 )
+from app.exchange.rate_limit import FIXED_METHOD_PRIORITY, RequestPriority
 from app.exchange.types import (
     Balance,
     BalanceUpdate,
@@ -188,11 +190,15 @@ class Fault:
 
 @dataclass(frozen=True)
 class FakeCall:
-    """Один виклик методу адаптера: назва, аргументи, локальний час виклику (мс)."""
+    """Один виклик методу адаптера: назва, аргументи, локальний час виклику (мс), пріоритет черги.
+
+    `priority` є `None` лише в `subscribe_private_stream` (не REST). В `args` пріоритет не дублюється.
+    """
 
     method: FakeMethod
     args: Mapping[str, object] = field(default_factory=dict)
     ts_ms: int = 0
+    priority: RequestPriority | None = None
 
 
 @dataclass
@@ -570,7 +576,7 @@ class FakeExchangeAdapter:
 
     # ------------------------------------------------------------------ ExchangeAdapter
     async def fetch_time(self) -> int:
-        return self._run("fetch_time", {}, self._exchange_now)
+        return self._run("fetch_time", {}, self._exchange_now, priority=FIXED_METHOD_PRIORITY["fetch_time"])
 
     async def fetch_instruments(self, *, symbols: Collection[str] | None = None) -> list[Instrument]:
         def action() -> list[Instrument]:
@@ -579,7 +585,9 @@ class FakeExchangeAdapter:
                 self._instruments[symbol] for symbol in sorted(self._instruments) if wanted is None or symbol in wanted
             ]
 
-        return self._run("fetch_instruments", {"symbols": symbols}, action)
+        return self._run(
+            "fetch_instruments", {"symbols": symbols}, action, priority=FIXED_METHOD_PRIORITY["fetch_instruments"]
+        )
 
     async def fetch_candles(
         self,
@@ -609,7 +617,7 @@ class FakeExchangeAdapter:
             return result if limit is None else result[:limit]
 
         args = {"symbol": symbol, "timeframe": timeframe, "start_ms": start_ms, "end_ms": end_ms, "limit": limit}
-        return self._run("fetch_candles", args, action)
+        return self._run("fetch_candles", args, action, priority=FIXED_METHOD_PRIORITY["fetch_candles"])
 
     async def fetch_funding_history(
         self, *, symbol: str, start_ms: int, end_ms: int | None = None
@@ -621,13 +629,23 @@ class FakeExchangeAdapter:
             series = self._funding.get(symbol, {})
             return [series[ts] for ts in sorted(series) if ts >= start_ms and (end_ms is None or ts < end_ms)]
 
-        return self._run("fetch_funding_history", {"symbol": symbol, "start_ms": start_ms, "end_ms": end_ms}, action)
+        return self._run(
+            "fetch_funding_history",
+            {"symbol": symbol, "start_ms": start_ms, "end_ms": end_ms},
+            action,
+            priority=FIXED_METHOD_PRIORITY["fetch_funding_history"],
+        )
 
-    async def place_order(self, request: PlaceOrderRequest) -> OrderAck:
-        return self._run("place_order", {"request": request}, lambda: self._accept_order(request))
+    async def place_order(self, request: PlaceOrderRequest, *, priority: RequestPriority) -> OrderAck:
+        return self._run("place_order", {"request": request}, lambda: self._accept_order(request), priority=priority)
 
     async def cancel_order(
-        self, *, symbol: str, client_order_id: str | None = None, exchange_order_id: str | None = None
+        self,
+        *,
+        priority: RequestPriority,
+        symbol: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
     ) -> None:
         if (client_order_id is None) == (exchange_order_id is None):
             raise ValueError("потрібен рівно один з client_order_id / exchange_order_id")
@@ -639,16 +657,23 @@ class FakeExchangeAdapter:
             self._finish(order, ExchangeOrderStatus.CANCELED)
 
         args = {"symbol": symbol, "client_order_id": client_order_id, "exchange_order_id": exchange_order_id}
-        self._run("cancel_order", args, action)
+        self._run("cancel_order", args, action, priority=priority)
 
-    async def fetch_order_by_client_id(self, *, symbol: str, client_order_id: str) -> Order | None:
+    async def fetch_order_by_client_id(
+        self, *, priority: RequestPriority, symbol: str, client_order_id: str
+    ) -> Order | None:
         def action() -> Order | None:
             order = self._find_order(client_order_id=client_order_id, exchange_order_id=None)
             return order.snapshot() if order is not None and order.symbol == symbol else None
 
-        return self._run("fetch_order_by_client_id", {"symbol": symbol, "client_order_id": client_order_id}, action)
+        return self._run(
+            "fetch_order_by_client_id",
+            {"symbol": symbol, "client_order_id": client_order_id},
+            action,
+            priority=priority,
+        )
 
-    async def fetch_open_orders(self, *, symbol: str | None = None) -> list[Order]:
+    async def fetch_open_orders(self, *, priority: RequestPriority, symbol: str | None = None) -> list[Order]:
         def action() -> list[Order]:
             return [
                 order.snapshot()
@@ -656,9 +681,11 @@ class FakeExchangeAdapter:
                 if order.is_active and (symbol is None or order.symbol == symbol)
             ]
 
-        return self._run("fetch_open_orders", {"symbol": symbol}, action)
+        return self._run("fetch_open_orders", {"symbol": symbol}, action, priority=priority)
 
-    async def fetch_positions(self, *, symbols: Collection[str] | None = None) -> list[Position]:
+    async def fetch_positions(
+        self, *, priority: RequestPriority, symbols: Collection[str] | None = None
+    ) -> list[Position]:
         def action() -> list[Position]:
             wanted = None if symbols is None else set(symbols)
             return [
@@ -667,12 +694,17 @@ class FakeExchangeAdapter:
                 if wanted is None or symbol in wanted
             ]
 
-        return self._run("fetch_positions", {"symbols": symbols}, action)
+        return self._run("fetch_positions", {"symbols": symbols}, action, priority=priority)
 
     async def set_position_protection(self, request: PositionProtection) -> None:
-        self._run("set_position_protection", {"request": request}, lambda: self._protect(request))
+        self._run(
+            "set_position_protection",
+            {"request": request},
+            lambda: self._protect(request),
+            priority=FIXED_METHOD_PRIORITY["set_position_protection"],
+        )
 
-    async def set_leverage(self, *, symbol: str, leverage: Decimal) -> None:
+    async def set_leverage(self, *, priority: RequestPriority, symbol: str, leverage: Decimal) -> None:
         def action() -> None:
             instrument = self._known_symbol(symbol)
             if not isinstance(leverage, Decimal) or not leverage.is_finite():
@@ -689,9 +721,9 @@ class FakeExchangeAdapter:
                 position.updated_at_ms = self._exchange_now()
                 self._emit_position(symbol)
 
-        self._run("set_leverage", {"symbol": symbol, "leverage": leverage}, action)
+        self._run("set_leverage", {"symbol": symbol, "leverage": leverage}, action, priority=priority)
 
-    async def set_margin_mode(self, *, symbol: str, mode: MarginMode) -> None:
+    async def set_margin_mode(self, *, priority: RequestPriority, symbol: str, mode: MarginMode) -> None:
         def action() -> None:
             self._known_symbol(symbol)
             if self._margin_mode[symbol] is mode:
@@ -700,13 +732,13 @@ class FakeExchangeAdapter:
                 raise RequestRejected("POSITION_EXISTS", "режим маржі не змінюється з відкритою позицією")
             self._margin_mode[symbol] = mode
 
-        self._run("set_margin_mode", {"symbol": symbol, "mode": mode}, action)
+        self._run("set_margin_mode", {"symbol": symbol, "mode": mode}, action, priority=priority)
 
-    async def fetch_balance(self) -> Balance:
-        return self._run("fetch_balance", {}, self._balance_snapshot)
+    async def fetch_balance(self, *, priority: RequestPriority) -> Balance:
+        return self._run("fetch_balance", {}, self._balance_snapshot, priority=priority)
 
     async def fetch_executions(
-        self, *, start_ms: int, end_ms: int | None = None, symbol: str | None = None
+        self, *, priority: RequestPriority, start_ms: int, end_ms: int | None = None, symbol: str | None = None
     ) -> list[Fill]:
         _check_range(start_ms, end_ms)
 
@@ -720,10 +752,15 @@ class FakeExchangeAdapter:
             ]
             return sorted(fills, key=lambda fill: (fill.ts_ms, fill.exec_id))
 
-        return self._run("fetch_executions", {"start_ms": start_ms, "end_ms": end_ms, "symbol": symbol}, action)
+        return self._run(
+            "fetch_executions",
+            {"start_ms": start_ms, "end_ms": end_ms, "symbol": symbol},
+            action,
+            priority=priority,
+        )
 
     async def subscribe_private_stream(self) -> AsyncGenerator[PrivateStreamEvent, None]:
-        connected_at_ms = self._run("subscribe_private_stream", {}, self._exchange_now)
+        connected_at_ms = self._run("subscribe_private_stream", {}, self._exchange_now, priority=None)
         queue: asyncio.Queue[PrivateStreamEvent | _Disconnect] = asyncio.Queue()
         self._subscribers.append(queue)
         try:
@@ -738,9 +775,16 @@ class FakeExchangeAdapter:
                 self._subscribers.remove(queue)
 
     # ------------------------------------------------------------------ внутрішнє: виклики і збої
-    def _run(self, method: FakeMethod, args: Mapping[str, object], action: Callable[[], _T]) -> _T:
+    def _run(
+        self,
+        method: FakeMethod,
+        args: Mapping[str, object],
+        action: Callable[[], _T],
+        *,
+        priority: RequestPriority | None,
+    ) -> _T:
         """Виклик методу: журнал → збій до дії → дія → збій після дії (`applied`: відповідь втрачено)."""
-        self._calls.append(FakeCall(method=method, args=dict(args), ts_ms=now_ms()))
+        self._calls.append(FakeCall(method=method, args=dict(args), ts_ms=now_ms(), priority=priority))
         queue = self._faults.get(method)
         fault = queue.popleft() if queue else None
         if fault is not None and not fault.applied:

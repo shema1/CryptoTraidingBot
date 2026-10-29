@@ -21,7 +21,13 @@
 іншою (`AdapterConfigError`, ТЗ §3, §9.1, §11.1 п. 3) — окремого методу протоколу для цього немає (T1.3/T3.2).
 Адаптер не вирішує, чи можна збільшувати експозицію: вхід — лише після `RiskGate` (AGENTS.md інваріант 5, T4.1).
 
-Пріоритети rate limiter (ТЗ §6.5) у сигнатури поки не входять — їх додає T1.2.
+Пріоритет rate limiter (ТЗ §6.5) задає викликач там, де той самий метод буває і захистом, і звіркою, і даними
+(`place_order`, `cancel_order`, `fetch_order_by_client_id`, `fetch_open_orders`, `fetch_positions`, `fetch_balance`,
+`fetch_executions`, `set_leverage`, `set_margin_mode`) — аргумент `priority` обов'язковий. Решта REST-методів має
+фіксований клас у `FIXED_METHOD_PRIORITY` (`set_position_protection` — завжди `PROTECTION`, свічки й funding —
+`DATA`, `fetch_time` — `RECONCILE`). Приватний потік — не REST, пріоритету немає. Рекомендація для торгового циклу:
+закриття й SL — `PROTECTION`; звірка й розв'язання `SUBMISSION_UNKNOWN` — `RECONCILE`; нові входи, свічки й історія —
+`DATA` (вхід може зачекати, захист — ні; великий backfill іде іншим процесом зі своєю часткою ліміту).
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from collections.abc import AsyncGenerator, Collection
 from decimal import Decimal
 from typing import Protocol
 
+from app.exchange.rate_limit import RequestPriority
 from app.exchange.types import (
     Balance,
     Candle,
@@ -51,13 +58,17 @@ class ExchangeAdapter(Protocol):
     """Контракт біржі. Методи перелічено в ТЗ §3; docstring кожного методу — частина контракту."""
 
     async def fetch_time(self) -> int:
-        """Час біржі, мс UTC (ТЗ §4.3: розбіжність > 1 с з локальним годинником блокує нові входи)."""
+        """Час біржі, мс UTC (ТЗ §4.3: розбіжність > 1 с з локальним годинником блокує нові входи).
+
+        Пріоритет фіксований: `RECONCILE` (`FIXED_METHOD_PRIORITY`).
+        """
         ...
 
     async def fetch_instruments(self, *, symbols: Collection[str] | None = None) -> list[Instrument]:
         """Правила інструментів (tick, крок і межі кількості, мін. номінал, макс. плече, статус).
 
         `symbols=None` — усі інструменти категорії; невідомі символи в результаті просто відсутні.
+        Пріоритет фіксований: `DATA`.
         """
         ...
 
@@ -78,16 +89,20 @@ class ExchangeAdapter(Protocol):
         пропуск на біржі — пропуск у результаті (ТЗ §4.2). `limit` — не більше стількох найраніших свічок діапазону;
         `None` — усі (адаптер пагінує сам).
         TODO(verify-bybit): чи остаточна kline одразу після межі інтервалу, чи потрібен запас (T1.3).
+        Пріоритет фіксований: `DATA`.
         """
         ...
 
     async def fetch_funding_history(
         self, *, symbol: str, start_ms: int, end_ms: int | None = None
     ) -> list[FundingRate]:
-        """Історія funding rate з `funding_time_ms` у `[start_ms, end_ms)`, за зростанням (ТЗ §4.1)."""
+        """Історія funding rate з `funding_time_ms` у `[start_ms, end_ms)`, за зростанням (ТЗ §4.1).
+
+        Пріоритет фіксований: `DATA`.
+        """
         ...
 
-    async def place_order(self, request: PlaceOrderRequest) -> OrderAck:
+    async def place_order(self, request: PlaceOrderRequest, *, priority: RequestPriority) -> OrderAck:
         """Відправити ордер. Викликається лише після коміту `SUBMITTING` (write-ahead, ТЗ §7.2).
 
         Успіх (`OrderAck`) — біржа **прийняла** ордер; статус і fills приходять окремо (WS або REST) і можуть прийти
@@ -98,38 +113,54 @@ class ExchangeAdapter(Protocol):
 
         TODO(verify-bybit): чи відхиляє Bybit повторний `orderLinkId` назавжди чи лише серед активних (ТЗ §19, T3.7);
         як біржа обробляє reduceOnly-ордер, більший за позицію; чи діє `minNotional` на reduceOnly-ордери.
+
+        `priority`: закриття й аварійний вихід — `PROTECTION`; новий вхід — `DATA` (може зачекати за захистом і
+        звіркою). Адаптер цей виклик не повторює після ліміту (`NON_RETRYABLE_METHODS`).
         """
         ...
 
     async def cancel_order(
-        self, *, symbol: str, client_order_id: str | None = None, exchange_order_id: str | None = None
+        self,
+        *,
+        priority: RequestPriority,
+        symbol: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
     ) -> None:
         """Скасувати ордер за **одним** з ідентифікаторів (обидва або жоден — `ValueError` без мережевого виклику).
 
         Успіх — біржа прийняла скасування; підтвердження стану (`CANCELED` або встиг `FILLED`) — з WS/REST.
         `OrderNotActive` — ордера немає серед активних (виконаний, скасований або не існує): скасування не відбулося.
+        `priority`: аварійне скасування — `PROTECTION`, інакше `RECONCILE`. Після ліміту не повторюється.
         """
         ...
 
-    async def fetch_order_by_client_id(self, *, symbol: str, client_order_id: str) -> Order | None:
+    async def fetch_order_by_client_id(
+        self, *, priority: RequestPriority, symbol: str, client_order_id: str
+    ) -> Order | None:
         """Ордер за `clientOrderId` у будь-якому статусі, включно з виконаними й скасованими.
 
         `None` — лише коли біржа підтвердила, що такого ордера немає (з урахуванням історії ордерів, а не лише
         активних). Помилка мережі/біржі — виняток, ніколи не `None` (на цьому тримається розв'язання
         `SUBMISSION_UNKNOWN`, ТЗ §7.2). TODO(verify-bybit): Demo зберігає ордери 7 днів (ТЗ §13).
+        `priority`: розв'язання невідомого й звірка — `RECONCILE`; читання заради рішення про закриття — `PROTECTION`.
         """
         ...
 
-    async def fetch_open_orders(self, *, symbol: str | None = None) -> list[Order]:
+    async def fetch_open_orders(self, *, priority: RequestPriority, symbol: str | None = None) -> list[Order]:
         """Активні ордери (`NEW`, `PARTIALLY_FILLED`, `UNTRIGGERED`; також `TRIGGERED` і `UNKNOWN`, якщо біржа їх
         повертає), включно з умовними (TP/SL) і ручними. `symbol=None` — по всіх символах категорії (адаптер пагінує
-        сам). Захист і Emergency Stop запитують точково за символом (див. docstring модуля)."""
+        сам). Захист і Emergency Stop запитують точково за символом (див. docstring модуля). `priority` — як у
+        `fetch_order_by_client_id`."""
         ...
 
-    async def fetch_positions(self, *, symbols: Collection[str] | None = None) -> list[Position]:
+    async def fetch_positions(
+        self, *, priority: RequestPriority, symbols: Collection[str] | None = None
+    ) -> list[Position]:
         """Ненульові позиції (one-way). `symbols=None` — по всіх символах категорії.
 
         Позиція в hedge mode → `AdapterConfigError`, а не пропуск: невидима позиція не може бути «безпечною».
+        `priority`: перевірка «чи є SL / чи закривати» — `PROTECTION`; звірка — `RECONCILE`.
         """
         ...
 
@@ -143,26 +174,27 @@ class ExchangeAdapter(Protocol):
         застосовано (попередній SL міг лишитися), `ExchangeOutcomeUnknown` — невідомо. Рух SL лише в бік зменшення
         ризику перевіряє Position Protection Manager, а не адаптер.
         TODO(verify-bybit): код «not modified» для `trading-stop` (T3.2).
+        Пріоритет фіксований: `PROTECTION` — зняти його аргументом неможливо.
         """
         ...
 
-    async def set_leverage(self, *, symbol: str, leverage: Decimal) -> None:
+    async def set_leverage(self, *, priority: RequestPriority, symbol: str, leverage: Decimal) -> None:
         """Встановити плече символу. Ідемпотентно: те саме значення — успіх (Bybit «not modified» — не помилка)."""
         ...
 
-    async def set_margin_mode(self, *, symbol: str, mode: MarginMode) -> None:
+    async def set_margin_mode(self, *, priority: RequestPriority, symbol: str, mode: MarginMode) -> None:
         """Встановити режим маржі. Ідемпотентно: той самий режим — успіх.
 
         TODO(verify-bybit): в Unified Trading Account режим маржі задається на рівні акаунта, а не символу (T3.2/T3.7).
         """
         ...
 
-    async def fetch_balance(self) -> Balance:
+    async def fetch_balance(self, *, priority: RequestPriority) -> Balance:
         """Баланс у валюті розрахунку (USDT): wallet balance, equity, доступна маржа, нереалізований PnL."""
         ...
 
     async def fetch_executions(
-        self, *, start_ms: int, end_ms: int | None = None, symbol: str | None = None
+        self, *, priority: RequestPriority, start_ms: int, end_ms: int | None = None, symbol: str | None = None
     ) -> list[Fill]:
         """Торгові виконання з `ts_ms` у `[start_ms, end_ms)`, за зростанням часу (дозавантаження пропущених fills,
         ТЗ §11.2). Без funding (він — у `ledger`, T3.4). Адаптер сам ділить діапазон і пагінує."""

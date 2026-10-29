@@ -12,9 +12,10 @@ import pytest
 from app.core.clock import FakeClock
 from app.exchange.adapter import ExchangeAdapter
 from app.exchange.fake import FakeExchangeAdapter
-from app.exchange.types import Candle, FundingRate, PositionSide, Timeframe
+from app.exchange.rate_limit import FIXED_METHOD_PRIORITY, RequestPriority
+from app.exchange.types import Candle, FundingRate, PositionSide, Side, Timeframe
 from tests.exchange.contract import ContractMarket, ExchangeAdapterContract
-from tests.exchange.factories import FAKE_NOW_MS, H1_MS, INSTRUMENT, SYMBOL, hourly_candle
+from tests.exchange.factories import FAKE_NOW_MS, H1_MS, INSTRUMENT, SYMBOL, hourly_candle, market
 
 HISTORY_HOURS = 6
 EIGHT_HOURS_MS = 8 * H1_MS
@@ -78,7 +79,7 @@ async def test_round_trip_never_touches_existing_position(
     orders_before = len(fake.all_orders())
     with pytest.raises(AssertionError, match="передумова"):
         await ExchangeAdapterContract().test_position_round_trip_with_protection(_as_adapter(fake), contract_market)
-    [position] = await fake.fetch_positions()
+    [position] = await fake.fetch_positions(priority=RequestPriority.RECONCILE)
     assert (position.side, position.qty) == (PositionSide.SHORT, Decimal("0.05"))
     assert len(fake.all_orders()) == orders_before
     assert fake.calls_to("place_order") == []
@@ -161,3 +162,31 @@ async def test_fake_funding_history_range(fake: FakeExchangeAdapter) -> None:
         symbol=SYMBOL, start_ms=funding[1].funding_time_ms, end_ms=funding[2].funding_time_ms
     )
     assert middle == [funding[1]]
+
+
+@pytest.mark.asyncio
+async def test_fake_records_the_priority_of_each_call(fake: FakeExchangeAdapter) -> None:
+    await fake.fetch_time()
+    await fake.fetch_instruments()
+    await fake.fetch_candles(symbol=SYMBOL, timeframe=Timeframe.H1, start_ms=0)
+    await fake.fetch_funding_history(symbol=SYMBOL, start_ms=0)
+    for method in ("fetch_time", "fetch_instruments", "fetch_candles", "fetch_funding_history"):
+        assert fake.calls_to(method)[-1].priority is FIXED_METHOD_PRIORITY[method]
+
+    request = market(Side.BUY, "0.001")
+    await fake.place_order(request, priority=RequestPriority.PROTECTION)
+    recorded = fake.calls_to("place_order")[-1]
+    assert recorded.priority is RequestPriority.PROTECTION
+    assert request in recorded.args.values()
+    assert "priority" not in recorded.args
+
+    await fake.fetch_balance(priority=RequestPriority.DATA)
+    assert fake.calls_to("fetch_balance")[-1].priority is RequestPriority.DATA
+
+    stream = fake.subscribe_private_stream()
+    await anext(stream)
+    await stream.aclose()
+    assert fake.calls_to("subscribe_private_stream")[-1].priority is None
+
+    with pytest.raises(TypeError):
+        await fake.place_order(request)  # type: ignore[call-arg]

@@ -15,9 +15,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, Field, SecretBytes, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretBytes, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy.engine import URL
+
+from app.exchange.rate_limit import (
+    DEFAULT_SHARE_COLLECTOR_PCT,
+    DEFAULT_SHARE_TRADING_PCT,
+    DEFAULT_SHARE_WORKER_PCT,
+)
 
 # app/core/config.py -> core -> app -> backend -> apps -> корінь репозиторію
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -93,6 +99,15 @@ class Settings(BaseSettings):
     # Origins UI, яким дозволено звертатися до API (перевірка `Origin` і CORS); у `.env` — через кому.
     api_allowed_origins: Annotated[tuple[str, ...], NoDecode] = ("http://127.0.0.1:5173",)
 
+    # --- Частки спільного IP-ліміту Bybit (app/exchange/rate_limit.py, ТЗ §6.5). Сума трьох — рівно 100. ---
+    # Роль процесу тут не задається: `.env` спільний, роль передає точка входу (`RateLimiter.from_settings`).
+    # Частка торгового процесу, %: 1 … 98 (за замовчуванням 50).
+    rate_limit_share_trading_pct: Annotated[int, Field(ge=1, le=98)] = DEFAULT_SHARE_TRADING_PCT
+    # Частка воркера, %: 1 … 98 (за замовчуванням 30).
+    rate_limit_share_worker_pct: Annotated[int, Field(ge=1, le=98)] = DEFAULT_SHARE_WORKER_PCT
+    # Частка колектора, %: 1 … 98 (за замовчуванням 20).
+    rate_limit_share_collector_pct: Annotated[int, Field(ge=1, le=98)] = DEFAULT_SHARE_COLLECTOR_PCT
+
     @field_validator("log_dir")
     @classmethod
     def _resolve_log_dir(cls, value: Path) -> Path:
@@ -145,6 +160,18 @@ class Settings(BaseSettings):
             if normalized not in origins:
                 origins.append(normalized)
         return tuple(origins)
+
+    @model_validator(mode="after")
+    def _rate_limit_shares_cover_the_ip(self) -> Settings:
+        total = (
+            self.rate_limit_share_trading_pct + self.rate_limit_share_worker_pct + self.rate_limit_share_collector_pct
+        )
+        if total != 100:
+            raise ValueError(
+                "RATE_LIMIT_SHARE_TRADING_PCT, RATE_LIMIT_SHARE_WORKER_PCT і "
+                f"RATE_LIMIT_SHARE_COLLECTOR_PCT мають давати в сумі 100 (зараз {total})"
+            )
+        return self
 
     @property
     def postgres_test_db(self) -> str:

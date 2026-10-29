@@ -101,12 +101,24 @@ def test_duplicate_client_order_id_keeps_id() -> None:
 def test_rate_limited_accepts_none_or_non_negative_int_ms(value: int | None) -> None:
     exc = RateLimited(retry_after_ms=value)
     assert exc.retry_after_ms == value
+    assert exc.ip_ban is False
+
+
+def test_rate_limited_ip_ban_flag() -> None:
+    exc = RateLimited("ip banned", ip_ban=True)
+    assert exc.ip_ban is True
 
 
 @pytest.mark.parametrize("bad", [-1, True, False, 1.5, 1000.0, "1000"])
 def test_rate_limited_rejects_bad_retry_after(bad: object) -> None:
     with pytest.raises(ValueError, match="retry_after_ms"):
         RateLimited(retry_after_ms=bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bad", [0, 1, "yes", None])
+def test_rate_limited_rejects_non_bool_ip_ban(bad: object) -> None:
+    with pytest.raises(ValueError, match="ip_ban"):
+        RateLimited(ip_ban=bad)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------- is_definite_rejection

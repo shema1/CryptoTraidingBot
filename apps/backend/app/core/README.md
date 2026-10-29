@@ -64,6 +64,9 @@
 | `api_port` | `API_PORT` | `8000` | порт локального API; 1024 … 65535. Адреса не налаштовується: `API_BIND_HOST` = `127.0.0.1` |
 | `api_token` | `API_TOKEN` | — (обов'язково для торгового процесу) | `SecretStr`; bearer-токен UI, ≥ `API_TOKEN_MIN_LEN` = 32 символи token68 (`[A-Za-z0-9._~+/-]`, `=` лише в кінці), з них ≥ `API_TOKEN_MIN_DISTINCT` = 10 різних (`aaaa…` відхиляється); без нього `python -m app` завершується з кодом 15 |
 | `api_allowed_origins` | `API_ALLOWED_ORIGINS` | `http://127.0.0.1:5173` | origins UI для перевірки `Origin` і CORS; у `.env` через кому; лише `http(s)://127.0.0.1\|localhost\|[::1]:<порт>` без шляху (інше, `*`, `null` → помилка валідації); нормалізуються в нижній регістр, дублікати прибираються; порожній список — браузер не має доступу |
+| `rate_limit_share_trading_pct` | `RATE_LIMIT_SHARE_TRADING_PCT` | `50` | частка торгового процесу в спільному IP-ліміті Bybit, %; 1 … 98; сума трьох часток — рівно 100. Роль процесу (`ProcessRole`) не налаштовується: `.env` спільний, роль передає точка входу в `RateLimiter.from_settings(settings, role=...)` |
+| `rate_limit_share_worker_pct` | `RATE_LIMIT_SHARE_WORKER_PCT` | `30` | частка воркера, %; 1 … 98 |
+| `rate_limit_share_collector_pct` | `RATE_LIMIT_SHARE_COLLECTOR_PCT` | `20` | частка колектора, %; 1 … 98 |
 
 ## Логування
 

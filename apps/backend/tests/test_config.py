@@ -286,3 +286,35 @@ def test_non_loopback_or_malformed_origin_is_rejected(origin: str) -> None:
 )
 def test_loopback_origins_are_accepted(origin: str) -> None:
     assert _settings(api_allowed_origins=(origin,)).api_allowed_origins == (origin,)
+
+
+def test_rate_limit_shares_default_to_the_spec() -> None:
+    settings = _settings()
+    assert (
+        settings.rate_limit_share_trading_pct,
+        settings.rate_limit_share_worker_pct,
+        settings.rate_limit_share_collector_pct,
+    ) == (50, 30, 20)
+
+
+def test_rate_limit_shares_must_sum_to_100() -> None:
+    with pytest.raises(ValidationError, match="100"):
+        _settings(
+            rate_limit_share_trading_pct=40,
+            rate_limit_share_worker_pct=40,
+            rate_limit_share_collector_pct=40,
+        )
+
+
+def test_rate_limit_shares_are_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RATE_LIMIT_SHARE_TRADING_PCT", "40")
+    monkeypatch.setenv("RATE_LIMIT_SHARE_WORKER_PCT", "40")
+    monkeypatch.setenv("RATE_LIMIT_SHARE_COLLECTOR_PCT", "20")
+    assert _settings().rate_limit_share_trading_pct == 40
+
+
+def test_rate_limit_role_is_not_a_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `.env` спільний для торгового процесу, воркера й колектора — роль задає точка входу процесу.
+    monkeypatch.setenv("RATE_LIMIT_ROLE", "collector")
+    assert "rate_limit_role" not in Settings.model_fields
+    assert not hasattr(_settings(), "rate_limit_role")

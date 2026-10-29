@@ -6,9 +6,10 @@
 (live / demo / testnet — один код), `FakeExchangeAdapter` з ін'єкцією збоїв для тестів, централізований rate limiter.
 Прямі виклики CCXT поза цим пакетом заборонені (AGENTS.md інваріант 4).
 
-> Заплановано: T1.2 (rate limiter), T1.3 (Bybit: публічні дані, `fetch_time`), T1.7 (кеш `instruments`, округлення),
+> Заплановано: T1.3 (Bybit: публічні дані, `fetch_time`), T1.7 (кеш `instruments`, округлення),
 > T3.2 (Bybit: торгові методи, мапінг кодів помилок), T3.5 (приватний WebSocket). Зараз є контракт, доменні типи,
-> винятки, `FakeExchangeAdapter` (T1.1) і моделі БД (T0.4).
+> винятки, `FakeExchangeAdapter` (T1.1), rate limiter (T1.2) і моделі БД (T0.4). Адаптер Bybit ще не надсилає
+> REST через лімітер — це T1.3/T3.2.
 
 ## Розділи ТЗ
 
@@ -31,7 +32,8 @@
 | `CLIENT_ORDER_ID_RE`, `HOST_ID_RE`, `new_client_order_id(host_id)`, `client_order_host_id(id)` | `types.py` | формат `clientOrderId` = `tb` + `HOST_ID` + uuid4 hex (36 символів, ТЗ §7.2) — єдине джерело, з нього ж CHECK у `orders` |
 | `ClientOrderIdOrigin`, `client_order_id_origin(id)` | `types.py` | класифікація для звірки (ТЗ §11.4): `BOT` / `BOT_PREFIX_MALFORMED` (префікс `tb`, формат не наш — трактується як чужий комп'ютер) / `NOT_BOT` (ручний, біржовий) |
 | `ExchangeError` і підкласи, `is_definite_rejection(exc)` | `errors.py` | ієрархія винятків (нижче) |
-| `FakeExchangeAdapter`, `Fault`, `FaultKind`, `FakeCall` | `fake.py` | in-memory біржа для тестів (нижче); **імпортується лише з `tests/`** |
+| `FakeExchangeAdapter`, `Fault`, `FaultKind`, `FakeCall` | `fake.py` | in-memory біржа для тестів (нижче); **імпортується лише з `tests/`**; `FakeCall.priority` |
+| `RateLimiter`, `RequestPriority`, `ProcessRole`, `EndpointGroup` | `rate_limit.py` | черга REST одного процесу (нижче); числа лімітів — константи модуля |
 | `ExchangeAccount`, `Instrument` (ORM) | `models.py` | таблиці `exchange_accounts`, `instruments` (ТЗ §6.4, §15) |
 | `EXCHANGES`, `KEY_CHECK_RESULTS` | `models.py` | допустимі біржі (`bybit`); результати перевірки ключа |
 
@@ -64,7 +66,7 @@ ExchangeError
 │   ├── ExchangeUnavailable       5xx, обрив з'єднання
 │   │   └── PrivateStreamLost     приватний WS втрачено
 │   └── MalformedResponse         відповідь не вдалося нормалізувати
-├── RateLimited(retry_after_ms)
+├── RateLimited(retry_after_ms, ip_ban)
 ├── DuplicateClientOrderId        ордер з цим clientOrderId УЖЕ є на біржі — НЕ відмова
 ├── RequestRejected(code, reason) біржа точно не виконала запит
 │   └── OrderRejected
@@ -103,12 +105,65 @@ ExchangeError
 - Конфігурацію (linear, one-way, isolated) реальний адаптер перевіряє на старті (`AdapterConfigError`), окремого
   методу немає. Адаптер не вирішує, чи можна збільшувати експозицію (це `RiskGate`, T4.1), і не перевіряє напрям руху
   SL (Position Protection Manager, T4.3).
-- Пріоритети rate limiter у сигнатурах з'являться в T1.2.
+- Пріоритет черги: методи з фіксованим класом параметра не мають (`FIXED_METHOD_PRIORITY` у `rate_limit.py`:
+  `fetch_time` — `RECONCILE`, `fetch_instruments` / `fetch_candles` / `fetch_funding_history` — `DATA`,
+  `set_position_protection` — `PROTECTION` і знизити його не можна). Решта REST-методів вимагають keyword
+  `priority: RequestPriority`. `subscribe_private_stream` — не REST. Новий вхід рекомендовано як `DATA`
+  (може почекати); закриття і SL — `PROTECTION`; звірка і розв'язання `SUBMISSION_UNKNOWN` — `RECONCILE`.
 
 **TODO(verify-bybit)** (T1.3/T3.2/T3.7): вікно унікальності `orderLinkId`; reduceOnly-ордер більший за позицію; чи діє
 `minNotional` на reduceOnly; яку `qty` мають TP/SL позиції в режимі `Full` і чи видно їх у списку відкритих ордерів;
 режим маржі в UTA — на рівні акаунта; Demo зберігає ордери 7 днів; код «not modified» для `trading-stop`;
 остаточність kline одразу після межі інтервалу; чи MARKET уже `Filled` одразу після відповіді на Testnet.
+
+## Rate limiter (`rate_limit.py`, ТЗ §6.5)
+
+Один `RateLimiter` на процес. Адаптер Bybit (T1.3/T3.2) відправляє REST через `call` або `acquire`.
+`RateLimiter.from_settings(settings, role=...)` бере частку з `Settings`, а роль — від точки входу процесу
+(`python -m app` — `TRADING`, воркер — `WORKER`, колектор — `COLLECTOR`). З `.env` роль не читається: файл спільний
+для трьох процесів, і роль звідти дала б воркеру частку торгового (сума часток понад 100% — бан IP).
+
+- **Віконний token bucket.** Витрачена вага зайнята до `ts + window_ms`, тож у будь-якому вікні місткість не
+  перевищується. Так реалізовано token bucket ТЗ §6.5 під ковзне вікно Bybit: плавне поповнення дало б майже
+  подвійний сплеск на межі вікна.
+- **IP спільний.** Місткість процесу — `IP_REQUESTS * share_pct // 100` (за замовчуванням 50/30/20). Сума
+  часток у `Settings` — рівно 100, тож сума `floor` не перевищує ліміт IP. Приватні UID-групи на частку не
+  діляться і доступні лише ролі `trading` (ключі є лише в торговому процесі). `MARKET` для воркера і колектора
+  дозволений.
+- **Пріоритети** `PROTECTION` > `RECONCILE` > `DATA` (ранг — `_PRIORITY_RANK`). Захист забирає наступний вільний
+  слот попереду вже поставлених даних і звірки. Якщо не-захисний запит чекає довше за `STARVATION_MS`, найстаріший
+  такий отримує слот попереду вищого не-захисного. `DATA` захист не обганяє. Однаковий пріоритет — FIFO.
+- **Заголовки** `X-Bapi-Limit`, `X-Bapi-Limit-Status`, `X-Bapi-Limit-Reset-Timestamp` лише стискають групу
+  (`observe`). Публічні market-ендпоінти в таблиці UID відсутні: `MARKET` спершу лише IP, окремий bucket
+  з'являється ліниво після перших заголовків. При нульовому залишку група чекає reset, але не довше за своє вікно
+  (UID — 1 с): reset — час біржі, і зсув годинника чи сміття в заголовку інакше заморозили б SL у `TRADING_STOP`.
+  Reset далі за вікно пишеться в лог як `rate_limit_reset_beyond_window`.
+- **429, retCode `10006`, HTTP 403 «access too frequent»** (`limit_breach_from_response`) ставлять на паузу всю
+  чергу цього процесу, включно із захистом. Backoff експоненційний із jitter; підлога — `retry_after_ms`, для
+  IP-бану ще `IP_BAN_MS`. І підлога, і сходинка не довші за `BACKOFF_CAP_MS`. Сходинка росте раз на епізод паузи:
+  пачка 429, що прийшла, поки черга вже стоїть, її не розганяє. `call(..., retry=True)` повторює до `MAX_ATTEMPTS`.
+  `place_order` і `cancel_order`
+  (`NON_RETRYABLE_METHODS`) передають `retry=False`: одна спроба, пауза черги, `RateLimited` не є відмовою.
+  Інші винятки backoff не чіпають. Якщо лімітер закрили, поки запит був у мережі, викликач отримує саме
+  `RateLimited` без повтору (`penalize` на закритому лімітері нічого не робить). `RateLimiterError` означає лише
+  «запит не відправлявся».
+- Вага HTTP для IP завжди 1. `weight` (1…`MAX_WEIGHT`) списується лише з UID-групи (batch Bybit — кількість
+  ордерів). Якщо IP-вікно процесу не менше за `IP_RESERVE_MIN_CAPACITY`, не-захисні запити лишають
+  `ceiling // IP_RESERVE_DIVISOR` слотів (щонайменше один) під `PROTECTION`. Заголовок, що знизив стелю групи,
+  не піднімає її назад до рестарту процесу. Час вікон і пауз — `monotonic_ms()` (`app.core.clock`).
+- Одна черга на процес, не на акаунт. Поки торговий процес не веде Demo і Live одночасно, це збігається з ТЗ §6.5.
+  Якщо обидва режими опиняться в одному процесі, пауза одного UID зупинить SL іншого — це треба розвести до T3.2
+  (ТЗ §8.1).
+
+Числа лімітів, вікон, backoff і часток — константи `rate_limit.py` (єдине джерело; тест
+`test_documented_bybit_limits_are_the_single_source` фіксує їх). Звірені з документацією Bybit v5 2026-10-29.
+
+Групи для майбутнього адаптера: `place_order` → `ORDER_CREATE` (`retry=False`); `cancel_order` → `ORDER_CANCEL`
+(`retry=False`); `fetch_open_orders` → `ORDER_REALTIME`; `fetch_order_by_client_id` може потребувати і realtime,
+і history (два `acquire`, T3.2); `fetch_executions` → `EXECUTION_LIST`; `fetch_positions` → `POSITION_LIST`;
+`set_position_protection` → `TRADING_STOP` (`retry=True`, ідемпотентний); `set_leverage` → `SET_LEVERAGE`;
+`fetch_balance` → `WALLET_BALANCE`; `set_margin_mode` → `SET_MARGIN_MODE`; `fetch_time`, `fetch_instruments`,
+`fetch_candles`, `fetch_funding_history` → `MARKET`.
 
 ## `FakeExchangeAdapter` (лише тести)
 
@@ -130,8 +185,9 @@ ExchangeError
   `UNKNOWN` (`place_external_order(..., status=...)`); `partial_fill_next(*chunks)`; WS — `ws_drop_next`, `ws_duplicate_next`, `ws_disconnect`;
   зовнішні дії — `place_external_order`, `open_external_position`, `close_position_externally`,
   `clear_position_protection`.
-- Огляд: `calls` / `calls_to(method)` (включно з невдалими викликами), `all_orders()`, `stream_subscribers`,
-  `pending_stream_events()`.
+- Огляд: `calls` / `calls_to(method)` (включно з невдалими викликами) зберігають `priority` (`None` лише в
+  `subscribe_private_stream`; в `args` пріоритет не дублюється), `all_orders()`, `stream_subscribers`,
+  `pending_stream_events()`. Фейк лімітер не викликає.
 
 ## Таблиці БД
 
@@ -156,7 +212,7 @@ hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `cont
 виходом; T1.3/T3.2 підключать його до Testnet/Demo маркерами — модулю для мережі треба перевизначити autouse-фікстуру
 `fake_clock` на `SystemClock`; `ContractMarket.mode` — лише `fake`/`testnet`/`demo`, а наявну позицію за символом набір
 не чіпає), `test_fake_faults.py` (кожен тип збою, часткові fills, гонка cancel/fill, SL/TP, WS),
-`test_no_fake_in_production.py`.
+`test_no_fake_in_production.py`, `test_rate_limit.py` (пріоритети, частка IP, 429, заголовки, backoff).
 
 ## Стан реалізації
 
@@ -164,7 +220,7 @@ hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `cont
 | --- | --- | --- |
 | T0.4 | `[x]` | таблиці `exchange_accounts`, `instruments` |
 | T1.1 | `[x]` | доменні типи, `ExchangeAdapter`, ієрархія винятків, `FakeExchangeAdapter` з ін'єкцією збоїв |
-| T1.2 | `[ ]` | Rate limiter з пріоритетами |
+| T1.2 | `[x]` | `rate_limit.py`: черга з пріоритетами, частка IP, backoff, заголовки Bybit |
 | T1.3 | `[ ]` | Bybit: публічні дані та `fetch_time` |
 | T1.7 | `[ ]` | Кеш `instruments` і округлення |
 | T3.2 | `[ ]` | Bybit: торгові методи та мапінг помилок |

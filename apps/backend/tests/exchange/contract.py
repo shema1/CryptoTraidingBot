@@ -31,6 +31,7 @@ import pytest
 from app.core.clock import now_ms
 from app.exchange.adapter import ExchangeAdapter
 from app.exchange.errors import DuplicateClientOrderId, ExchangeError, OrderNotActive
+from app.exchange.rate_limit import RequestPriority
 from app.exchange.types import (
     Balance,
     ExchangeOrderStatus,
@@ -102,7 +103,7 @@ async def _far_limit_buy(adapter: ExchangeAdapter, market: ContractMarket) -> Pl
 
 async def _cancel_quietly(adapter: ExchangeAdapter, symbol: str, client_order_id: str) -> None:
     with contextlib.suppress(OrderNotActive):
-        await adapter.cancel_order(symbol=symbol, client_order_id=client_order_id)
+        await adapter.cancel_order(symbol=symbol, client_order_id=client_order_id, priority=RequestPriority.RECONCILE)
 
 
 async def _last_close(adapter: ExchangeAdapter, market: ContractMarket) -> Decimal:
@@ -118,7 +119,7 @@ async def _close_own_long_quietly(adapter: ExchangeAdapter, market: ContractMark
     """Прибирання після входу тесту: закрити LONG не більше за власний вхід `qty` (до входу позиції не було —
     передумова), reduceOnly. Чужу позицію чи інший бік не чіпає; помилки біржі не маскують падіння тесту."""
     with contextlib.suppress(ExchangeError):
-        for position in await adapter.fetch_positions(symbols=[market.symbol]):
+        for position in await adapter.fetch_positions(symbols=[market.symbol], priority=RequestPriority.RECONCILE):
             if position.side is not PositionSide.LONG:
                 continue
             await adapter.place_order(
@@ -129,7 +130,8 @@ async def _close_own_long_quietly(adapter: ExchangeAdapter, market: ContractMark
                     order_type=OrderType.MARKET,
                     qty=min(position.qty, qty),
                     reduce_only=True,
-                )
+                ),
+                priority=RequestPriority.RECONCILE,
             )
 
 
@@ -225,7 +227,7 @@ class ExchangeAdapterContract:
 
     @pytest.mark.asyncio
     async def test_fetch_balance_returns_decimal_fields(self, adapter: ExchangeAdapter) -> None:
-        balance = await adapter.fetch_balance()
+        balance = await adapter.fetch_balance(priority=RequestPriority.RECONCILE)
         assert type(balance) is Balance
         assert balance.coin == "USDT"
         for value in (balance.wallet_balance, balance.equity, balance.available_balance, balance.unrealized_pnl):
@@ -237,8 +239,12 @@ class ExchangeAdapterContract:
         self, adapter: ExchangeAdapter, contract_market: ContractMarket
     ) -> None:
         # Підтримується лише isolated (ТЗ §9.1); повтор того самого режиму — успіх, а не відмова.
-        await adapter.set_margin_mode(symbol=contract_market.symbol, mode=MarginMode.ISOLATED)
-        await adapter.set_margin_mode(symbol=contract_market.symbol, mode=MarginMode.ISOLATED)
+        await adapter.set_margin_mode(
+            symbol=contract_market.symbol, mode=MarginMode.ISOLATED, priority=RequestPriority.RECONCILE
+        )
+        await adapter.set_margin_mode(
+            symbol=contract_market.symbol, mode=MarginMode.ISOLATED, priority=RequestPriority.RECONCILE
+        )
 
     @pytest.mark.asyncio
     async def test_private_stream_starts_with_stream_connected(self, adapter: ExchangeAdapter) -> None:
@@ -283,17 +289,21 @@ class ExchangeAdapterContract:
         )
         started_ms = await adapter.fetch_time() - 60_000
         # Передумова — до try: якщо позиція вже є, тест падає, не відправивши жодного ордера.
-        assert await adapter.fetch_positions(symbols=[symbol]) == [], "передумова: позиції за символом немає"
+        assert await adapter.fetch_positions(symbols=[symbol], priority=RequestPriority.RECONCILE) == [], (
+            "передумова: позиції за символом немає"
+        )
         entered = False
         try:
             entered = True  # до виклику: вхід міг виконатися, навіть якщо відповідь втрачено
-            await adapter.place_order(entry)
+            await adapter.place_order(entry, priority=RequestPriority.RECONCILE)
             # TODO(verify-bybit): на Testnet MARKET може бути ще не FILLED одразу після відповіді (T3.2).
-            filled = await adapter.fetch_order_by_client_id(symbol=symbol, client_order_id=entry.client_order_id)
+            filled = await adapter.fetch_order_by_client_id(
+                symbol=symbol, client_order_id=entry.client_order_id, priority=RequestPriority.RECONCILE
+            )
             assert filled is not None
             assert (filled.status, filled.filled_qty) == (ExchangeOrderStatus.FILLED, qty)
 
-            [position] = await adapter.fetch_positions(symbols=[symbol])
+            [position] = await adapter.fetch_positions(symbols=[symbol], priority=RequestPriority.RECONCILE)
             assert type(position) is Position
             assert (position.symbol, position.side, position.qty) == (symbol, PositionSide.LONG, qty)
             assert (position.stop_loss, position.take_profit) == (stop_loss, take_profit)
@@ -305,15 +315,19 @@ class ExchangeAdapterContract:
             )
             await adapter.set_position_protection(tighter)
             await adapter.set_position_protection(tighter)  # той самий SL — успіх (повтор після втраченої відповіді)
-            [protected] = await adapter.fetch_positions(symbols=[symbol])
+            [protected] = await adapter.fetch_positions(symbols=[symbol], priority=RequestPriority.RECONCILE)
             assert (protected.stop_loss, protected.take_profit) == (tighter.stop_loss, take_profit)
 
-            await adapter.set_leverage(symbol=symbol, leverage=protected.leverage)  # те саме значення — успіх
+            await adapter.set_leverage(
+                symbol=symbol, leverage=protected.leverage, priority=RequestPriority.RECONCILE
+            )  # те саме значення — успіх
 
-            await adapter.place_order(exit_)
-            assert await adapter.fetch_positions(symbols=[symbol]) == []
+            await adapter.place_order(exit_, priority=RequestPriority.RECONCILE)
+            assert await adapter.fetch_positions(symbols=[symbol], priority=RequestPriority.RECONCILE) == []
 
-            executions = await adapter.fetch_executions(start_ms=started_ms, symbol=symbol)
+            executions = await adapter.fetch_executions(
+                start_ms=started_ms, symbol=symbol, priority=RequestPriority.RECONCILE
+            )
             ours = [f for f in executions if f.client_order_id in (entry.client_order_id, exit_.client_order_id)]
             assert len({f.exec_id for f in ours}) == len(ours)
             by_order = {
@@ -333,11 +347,13 @@ class ExchangeAdapterContract:
         request = await _far_limit_buy(adapter, contract_market)
         symbol = contract_market.symbol
         try:
-            ack = await adapter.place_order(request)
+            ack = await adapter.place_order(request, priority=RequestPriority.RECONCILE)
             assert ack.client_order_id == request.client_order_id
             assert ack.exchange_order_id != ""
 
-            found = await adapter.fetch_order_by_client_id(symbol=symbol, client_order_id=request.client_order_id)
+            found = await adapter.fetch_order_by_client_id(
+                symbol=symbol, client_order_id=request.client_order_id, priority=RequestPriority.RECONCILE
+            )
             assert found is not None
             assert found.status is ExchangeOrderStatus.NEW
             assert found.client_order_id == request.client_order_id
@@ -351,26 +367,32 @@ class ExchangeAdapterContract:
             assert found.avg_fill_price is None
             assert found.reduce_only is False
 
-            open_by_symbol = await adapter.fetch_open_orders(symbol=symbol)
+            open_by_symbol = await adapter.fetch_open_orders(symbol=symbol, priority=RequestPriority.RECONCILE)
             assert [o.exchange_order_id for o in open_by_symbol if o.client_order_id == request.client_order_id] == [
                 ack.exchange_order_id
             ]
-            open_all = await adapter.fetch_open_orders()
+            open_all = await adapter.fetch_open_orders(priority=RequestPriority.RECONCILE)
             assert [o.exchange_order_id for o in open_all if o.client_order_id == request.client_order_id] == [
                 ack.exchange_order_id
             ]
 
-            await adapter.cancel_order(symbol=symbol, client_order_id=request.client_order_id)
+            await adapter.cancel_order(
+                symbol=symbol, client_order_id=request.client_order_id, priority=RequestPriority.RECONCILE
+            )
 
-            canceled = await adapter.fetch_order_by_client_id(symbol=symbol, client_order_id=request.client_order_id)
+            canceled = await adapter.fetch_order_by_client_id(
+                symbol=symbol, client_order_id=request.client_order_id, priority=RequestPriority.RECONCILE
+            )
             assert canceled is not None
             assert canceled.status is ExchangeOrderStatus.CANCELED
             assert canceled.filled_qty == Decimal("0")
-            open_after = await adapter.fetch_open_orders(symbol=symbol)
+            open_after = await adapter.fetch_open_orders(symbol=symbol, priority=RequestPriority.RECONCILE)
             assert [o for o in open_after if o.client_order_id == request.client_order_id] == []
 
             with pytest.raises(OrderNotActive):
-                await adapter.cancel_order(symbol=symbol, client_order_id=request.client_order_id)
+                await adapter.cancel_order(
+                    symbol=symbol, client_order_id=request.client_order_id, priority=RequestPriority.RECONCILE
+                )
         finally:
             await _cancel_quietly(adapter, symbol, request.client_order_id)
 
@@ -379,9 +401,13 @@ class ExchangeAdapterContract:
         request = await _far_limit_buy(adapter, contract_market)
         symbol = contract_market.symbol
         try:
-            ack = await adapter.place_order(request)
-            await adapter.cancel_order(symbol=symbol, exchange_order_id=ack.exchange_order_id)
-            canceled = await adapter.fetch_order_by_client_id(symbol=symbol, client_order_id=request.client_order_id)
+            ack = await adapter.place_order(request, priority=RequestPriority.RECONCILE)
+            await adapter.cancel_order(
+                symbol=symbol, exchange_order_id=ack.exchange_order_id, priority=RequestPriority.RECONCILE
+            )
+            canceled = await adapter.fetch_order_by_client_id(
+                symbol=symbol, client_order_id=request.client_order_id, priority=RequestPriority.RECONCILE
+            )
             assert canceled is not None
             assert canceled.status is ExchangeOrderStatus.CANCELED
         finally:
@@ -392,7 +418,9 @@ class ExchangeAdapterContract:
         self, adapter: ExchangeAdapter, contract_market: ContractMarket
     ) -> None:
         unknown = new_client_order_id(contract_market.host_id)
-        result = await adapter.fetch_order_by_client_id(symbol=contract_market.symbol, client_order_id=unknown)
+        result = await adapter.fetch_order_by_client_id(
+            symbol=contract_market.symbol, client_order_id=unknown, priority=RequestPriority.RECONCILE
+        )
         assert result is None
 
     @pytest.mark.asyncio
@@ -402,12 +430,12 @@ class ExchangeAdapterContract:
         request = await _far_limit_buy(adapter, contract_market)
         symbol = contract_market.symbol
         try:
-            first = await adapter.place_order(request)
+            first = await adapter.place_order(request, priority=RequestPriority.RECONCILE)
             with pytest.raises(DuplicateClientOrderId) as exc:
-                await adapter.place_order(request)
+                await adapter.place_order(request, priority=RequestPriority.RECONCILE)
             assert exc.value.client_order_id == request.client_order_id
             # Другий ордер не створено: за id — той самий, перший.
-            open_orders = await adapter.fetch_open_orders(symbol=symbol)
+            open_orders = await adapter.fetch_open_orders(symbol=symbol, priority=RequestPriority.RECONCILE)
             assert [o.exchange_order_id for o in open_orders if o.client_order_id == request.client_order_id] == [
                 first.exchange_order_id
             ]
@@ -421,15 +449,20 @@ class ExchangeAdapterContract:
         request = await _far_limit_buy(adapter, contract_market)
         symbol = contract_market.symbol
         try:
-            ack = await adapter.place_order(request)
+            ack = await adapter.place_order(request, priority=RequestPriority.RECONCILE)
             with pytest.raises(ValueError, match=r".+"):
-                await adapter.cancel_order(symbol=symbol)
+                await adapter.cancel_order(symbol=symbol, priority=RequestPriority.RECONCILE)
             with pytest.raises(ValueError, match=r".+"):
                 await adapter.cancel_order(
-                    symbol=symbol, client_order_id=request.client_order_id, exchange_order_id=ack.exchange_order_id
+                    symbol=symbol,
+                    client_order_id=request.client_order_id,
+                    exchange_order_id=ack.exchange_order_id,
+                    priority=RequestPriority.RECONCILE,
                 )
             # Жодне з невалідних скасувань не зачепило ордер.
-            still = await adapter.fetch_order_by_client_id(symbol=symbol, client_order_id=request.client_order_id)
+            still = await adapter.fetch_order_by_client_id(
+                symbol=symbol, client_order_id=request.client_order_id, priority=RequestPriority.RECONCILE
+            )
             assert still is not None
             assert still.status is ExchangeOrderStatus.NEW
         finally:

@@ -10,7 +10,7 @@ ExchangeError
 │   ├── ExchangeUnavailable       5xx, обрив з'єднання
 │   │   └── PrivateStreamLost     приватний WS втрачено (ping/pong, `ws_stale_s`, обрив)
 │   └── MalformedResponse         відповідь не вдалося розібрати
-├── RateLimited                   ліміт запитів (429 / 10006)
+├── RateLimited(retry_after_ms, ip_ban)   429 / retCode 10006; ip_ban — HTTP 403 «access too frequent»
 ├── DuplicateClientOrderId        ордер з цим clientOrderId УЖЕ є на біржі — це НЕ відмова
 ├── RequestRejected               біржа точно не виконала запит (код і причина)
 │   └── OrderRejected
@@ -62,13 +62,27 @@ class MalformedResponse(ExchangeOutcomeUnknown):
 
 
 class RateLimited(ExchangeError):
-    """Перевищено ліміт запитів. `retry_after_ms` — через скільки мс можна повторити (якщо біржа повідомила)."""
+    """Перевищено ліміт запитів.
 
-    def __init__(self, message: str = "rate limited", *, retry_after_ms: int | None = None) -> None:
+    `retry_after_ms` — через скільки мс можна повторити (якщо біржа повідомила). `ip_ban=True` — бан IP
+    Bybit (HTTP 403 «access too frequent»): черга процесу стоїть щонайменше 10 хв (`rate_limit.IP_BAN_MS`).
+    Для `place_order` це не відмова: ордер міг бути створений, розв'язання — `SUBMISSION_UNKNOWN`.
+    """
+
+    def __init__(
+        self,
+        message: str = "rate limited",
+        *,
+        retry_after_ms: int | None = None,
+        ip_ban: bool = False,
+    ) -> None:
         if retry_after_ms is not None and (type(retry_after_ms) is not int or retry_after_ms < 0):
             raise ValueError("retry_after_ms має бути int мс ≥ 0")
+        if type(ip_ban) is not bool:
+            raise ValueError("ip_ban має бути bool")
         super().__init__(message)
         self.retry_after_ms = retry_after_ms
+        self.ip_ban = ip_ban
 
 
 class DuplicateClientOrderId(ExchangeError):
