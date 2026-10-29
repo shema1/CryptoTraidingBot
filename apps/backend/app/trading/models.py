@@ -37,6 +37,7 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import MODES, Base, CreatedMs, Money, TimeMs, enum_check, sql_list, symbol_check
+from app.exchange.types import CLIENT_ORDER_ID_RE
 
 # --- Бот (ТЗ §6.1) ---
 BOT_STATUSES: tuple[str, ...] = (
@@ -91,8 +92,8 @@ EVENT_SOURCES: tuple[str, ...] = ("WS", "REST", "LOCAL")
 # Demo/Testnet (ТЗ §16); ORPHAN — ордер з нашим `HOST_ID`, знайдений при звірці (ТЗ §11.4); EXCHANGE — створений
 # біржею (спрацювання TP/SL позиції, ліквідація, ADL) і відомий лише з WS/REST.
 ORDER_ORIGINS: tuple[str, ...] = ("BOT", "MANUAL_TEST", "ORPHAN", "EXCHANGE")
-# `tb` + HOST_ID (2 × [a-z0-9]) + uuid4().hex (32 × [0-9a-f]) = 36 символів (ТЗ §7.2).
-CLIENT_ORDER_ID_RE = "^tb[a-z0-9]{2}[0-9a-f]{32}$"
+# Формат `clientOrderId` (`tb` + HOST_ID + uuid4 hex, 36 символів, ТЗ §7.2) — `CLIENT_ORDER_ID_RE` з
+# `app/exchange/types.py` (єдине джерело для CHECK і для `PlaceOrderRequest`).
 
 # --- Позиція (ТЗ §9, §11.4) ---
 POSITION_STATUSES: tuple[str, ...] = ("OPEN", "CLOSED", "CLOSED_EXTERNALLY")

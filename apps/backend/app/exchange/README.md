@@ -2,23 +2,136 @@
 
 ## Призначення
 
-Єдина точка доступу до біржі: інтерфейс `ExchangeAdapter`, адаптер Bybit (live / demo / testnet — один код), `FakeExchangeAdapter` з ін'єкцією збоїв для тестів, централізований rate limiter. Прямі виклики CCXT поза цим пакетом заборонені.
+Єдина точка доступу до біржі: інтерфейс `ExchangeAdapter`, доменні типи й винятки на його межі, адаптер Bybit
+(live / demo / testnet — один код), `FakeExchangeAdapter` з ін'єкцією збоїв для тестів, централізований rate limiter.
+Прямі виклики CCXT поза цим пакетом заборонені (AGENTS.md інваріант 4).
 
-> Заплановано: T1.1, T1.2, T1.3, T1.7, T3.2, T3.5. Зараз є лише моделі БД (T0.4).
+> Заплановано: T1.2 (rate limiter), T1.3 (Bybit: публічні дані, `fetch_time`), T1.7 (кеш `instruments`, округлення),
+> T3.2 (Bybit: торгові методи, мапінг кодів помилок), T3.5 (приватний WebSocket). Зараз є контракт, доменні типи,
+> винятки, `FakeExchangeAdapter` (T1.1) і моделі БД (T0.4).
 
 ## Розділи ТЗ
 
-- ТЗ §3 — інтерфейс `ExchangeAdapter`, інкапсуляція `category=linear`
+- ТЗ §3 — інтерфейс `ExchangeAdapter`, інкапсуляція `category=linear`, `FakeExchangeAdapter` лише для тестів
 - ТЗ §6.5 — централізований rate limiter і пріоритети
-- ТЗ §9.1 — нативні TP/SL
+- ТЗ §7.1, §7.2 — стани ордера, `SUBMISSION_UNKNOWN`, формат `clientOrderId`, дедуплікація fills
+- ТЗ §9.1 — нативні TP/SL на рівні позиції (режим `Full`), тригери SL — mark, TP — last
+- ТЗ §11.2, §11.4 — приватний потік, розрив WS, класифікація чужих ордерів
 - ТЗ §19 — припущення про Bybit, що перевіряються на Testnet
 
 ## Публічний інтерфейс
 
 | Що | Де | Опис |
 | --- | --- | --- |
-| `ExchangeAccount`, `Instrument` | `models.py` | таблиці `exchange_accounts`, `instruments` (ТЗ §6.4, §15) |
+| `ExchangeAdapter` | `adapter.py` | `Protocol` з 15 методами ТЗ §3; docstring кожного методу — контракт (див. нижче) |
+| `Candle`, `Instrument`, `Order`, `Fill`, `Position`, `Balance`, `FundingRate` | `types.py` | факти біржі: `Decimal`, час — `int` мс UTC, символ — канонічний CCXT (`BTC/USDT:USDT`) |
+| `PlaceOrderRequest`, `PositionProtection`, `OrderAck` | `types.py` | запити й підтвердження |
+| `StreamConnected`, `OrderUpdate`, `FillUpdate`, `PositionUpdate`, `BalanceUpdate` (`PrivateStreamEvent`) | `types.py` | події приватного потоку |
+| `Side`, `PositionSide`, `OrderType`, `TimeInForce`, `TriggerBy`, `ExchangeOrderStatus`, `StopOrderType`, `ExecType`, `MarginMode`, `Timeframe` | `types.py` | enum-и; `Timeframe.duration_ms`, `ExchangeOrderStatus.is_terminal` (`TRIGGERED` і `UNKNOWN` — не термінальні) |
+| `CLIENT_ORDER_ID_RE`, `HOST_ID_RE`, `new_client_order_id(host_id)`, `client_order_host_id(id)` | `types.py` | формат `clientOrderId` = `tb` + `HOST_ID` + uuid4 hex (36 символів, ТЗ §7.2) — єдине джерело, з нього ж CHECK у `orders` |
+| `ClientOrderIdOrigin`, `client_order_id_origin(id)` | `types.py` | класифікація для звірки (ТЗ §11.4): `BOT` / `BOT_PREFIX_MALFORMED` (префікс `tb`, формат не наш — трактується як чужий комп'ютер) / `NOT_BOT` (ручний, біржовий) |
+| `ExchangeError` і підкласи, `is_definite_rejection(exc)` | `errors.py` | ієрархія винятків (нижче) |
+| `FakeExchangeAdapter`, `Fault`, `FaultKind`, `FakeCall` | `fake.py` | in-memory біржа для тестів (нижче); **імпортується лише з `tests/`** |
+| `ExchangeAccount`, `Instrument` (ORM) | `models.py` | таблиці `exchange_accounts`, `instruments` (ТЗ §6.4, §15) |
 | `EXCHANGES`, `KEY_CHECK_RESULTS` | `models.py` | допустимі біржі (`bybit`); результати перевірки ключа |
+
+Назви `Candle`/`Order`/`Fill`/`Position`/`Instrument` у `types.py` збігаються з ORM-моделями інших модулів: це факти
+біржі на межі адаптера, а не рядки БД. Імпортуйте модулем: `from app.exchange import types`.
+
+## Доменні типи
+
+- Усі моделі — pydantic v2 `strict`, `frozen`, `extra="forbid"`: `float`/`int`/`str` у `Decimal`-полях, `bool`/`float`
+  у мс, «сирі» рядки замість enum, NaN/Infinity — відхиляються. Адаптер конвертує значення біржі явно.
+- **Факти біржі** перевіряються лише на внутрішню узгодженість (`Order`: `0 ≤ filled_qty ≤ qty`, `FILLED` ⇒
+  `filled_qty = qty`, `PARTIALLY_FILLED` ⇒ `0 < filled_qty < qty`, `NEW`/`UNTRIGGERED` ⇒ `filled_qty = 0`,
+  `avg_fill_price` ⇔ `filled_qty > 0`, `qty = 0` лише в умовного ордера; `Candle`: OHLC як CHECK у БД і вирівнювання
+  `open_time_ms` за таймфреймом). `Order.client_order_id` — будь-який рядок або `None` (ручні ордери, ордери біржі).
+  `CANCELED` з `filled_qty > 0` — частковий fill і скасування залишку (ТЗ §7.1). Невідомий статус → `UNKNOWN`
+  (не термінальний; один такий ордер не робить увесь список нерозбірним). `time_in_force=None` — TIF поза доменом
+  (напр. PostOnly ручного ордера).
+- **Запити** суворіші: `PlaceOrderRequest.client_order_id` — лише наш формат; `reduce_only` задається явно; LIMIT ⇔
+  `price`; MARKET — без `price` і `time_in_force`; reduceOnly-ордер без SL/TP; SL/TP з правильного боку (BUY:
+  SL < TP, для LIMIT ще SL < price < TP; SELL — навпаки). `PositionProtection.stop_loss` обов'язковий і > 0 — зняти SL
+  доменним запитом неможливо; `take_profit=None` — TP не змінюється; `position_side` перевіряє орієнтацію.
+- `Position` — лише ненульова one-way позиція; `stop_loss`/`take_profit` = `None`, коли не задано.
+
+## Винятки (`errors.py`)
+
+```
+ExchangeError
+├── ExchangeOutcomeUnknown        результат невідомий: запит міг виконатися
+│   ├── ExchangeTimeout
+│   ├── ExchangeUnavailable       5xx, обрив з'єднання
+│   │   └── PrivateStreamLost     приватний WS втрачено
+│   └── MalformedResponse         відповідь не вдалося нормалізувати
+├── RateLimited(retry_after_ms)
+├── DuplicateClientOrderId        ордер з цим clientOrderId УЖЕ є на біржі — НЕ відмова
+├── RequestRejected(code, reason) біржа точно не виконала запит
+│   └── OrderRejected
+│       └── InsufficientMargin
+├── OrderNotActive                cancel: ордера немає серед активних
+├── ExchangeAuthError
+└── AdapterConfigError            category ≠ linear, hedge mode, не isolated — адаптер не стартує
+```
+
+**Правило `place_order`:** ордер точно не створено лише коли `is_definite_rejection(exc)` → `True`
+(`RequestRejected` і підкласи). Усе інше — таймаут, 5xx, `RateLimited`, `DuplicateClientOrderId`, помилка авторизації,
+будь-який не-`ExchangeError` — це `SUBMISSION_UNKNOWN` і розв'язання за ТЗ §7.2. Машина станів (T3.1) використовує саме
+цю функцію, а не власні `except`.
+
+**Правило мапінгу кодів біржі (T3.2):** у `RequestRejected` потрапляють лише коди з явного переліку відмов; невідомий
+код — `ExchangeOutcomeUnknown` («біржа відповіла» ≠ «точно не виконала»).
+
+## Контракт `ExchangeAdapter` (коротко)
+
+- Аргументи keyword-only або модель запиту; мережева помилка ніколи не повертається як «порожньо»/`None`.
+- `place_order` / `cancel_order` / `set_*` адаптер не повторює; ідемпотентні читання — може (backoff, ліміт спроб).
+- `fetch_candles` — лише закриті **за часом біржі** (`close_time_ms ≤` час сервера, не локальний годинник), за
+  зростанням, `[start_ms, end_ms)`.
+- `fetch_order_by_client_id` — будь-який статус, з історією; `None` лише при підтвердженій відсутності.
+- `cancel_order` — рівно один з ідентифікаторів; `OrderNotActive`, якщо ордер уже не активний.
+- `fetch_open_orders` — включно з умовними (TP/SL) і ручними; `fetch_positions` — лише ненульові, hedge mode →
+  `AdapterConfigError`. Нерозбірний елемент → `MalformedResponse` для всієї відповіді, тому захист і Emergency Stop
+  запитують точково за символом.
+- `set_position_protection` — ідемпотентний (ті самі SL/TP — успіх); успіх означає «прийнято», а висновок «SL є» —
+  лише з `fetch_positions`/WS (ТЗ §9.2), не з типу винятку.
+- `set_leverage`, `set_margin_mode` — ідемпотентні.
+- `fetch_executions` — лише торгові виконання, адаптер пагінує сам.
+- `subscribe_private_stream` — async-генератор (закривається `aclose()`); перша подія `StreamConnected`; події можуть
+  дублюватися, губитися й іти не по порядку; втрата → `PrivateStreamLost`, реконект — новий виклик, пропущене — через
+  REST.
+- Конфігурацію (linear, one-way, isolated) реальний адаптер перевіряє на старті (`AdapterConfigError`), окремого
+  методу немає. Адаптер не вирішує, чи можна збільшувати експозицію (це `RiskGate`, T4.1), і не перевіряє напрям руху
+  SL (Position Protection Manager, T4.3).
+- Пріоритети rate limiter у сигнатурах з'являться в T1.2.
+
+**TODO(verify-bybit)** (T1.3/T3.2/T3.7): вікно унікальності `orderLinkId`; reduceOnly-ордер більший за позицію; чи діє
+`minNotional` на reduceOnly; яку `qty` мають TP/SL позиції в режимі `Full` і чи видно їх у списку відкритих ордерів;
+режим маржі в UTA — на рівні акаунта; Demo зберігає ордери 7 днів; код «not modified» для `trading-stop`;
+остаточність kline одразу після межі інтервалу; чи MARKET уже `Filled` одразу після відповіді на Testnet.
+
+## `FakeExchangeAdapter` (лише тести)
+
+Детермінований in-memory симулятор, без мережі й `sleep`; час — `app.core.clock` (у тестах `FakeClock`) плюс
+`server_time_offset_ms`. Тест `tests/exchange/test_no_fake_in_production.py` гарантує, що жоден модуль `app/**` його
+не імпортує.
+
+- Ринок: `add_instrument(instrument, last_price=..., mark_price=...)`, `update_instrument`, `add_candles`,
+  `add_funding_rates`, `set_price(symbol, last=..., mark=...)` (перевіряє тригери SL/TP).
+- Виконання: MARKET і маркетабельний LIMIT — одразу за last (тейкер); немаркетабельний LIMIT GTC стоїть до
+  `fill_order(...)` (мейкер) або скасування, немаркетабельний IOC/FOK — `CANCELED`. Свічки — лише закриті за часом
+  біржі (`now_ms() + server_time_offset_ms`). Фільтри інструмента, SL/TP відносно ціни, спрощена маржа → `OrderRejected`/`InsufficientMargin`;
+  дубль id → `DuplicateClientOrderId`; reduceOnly без позиції → відмова, більший за позицію — обрізається.
+  One-way неттінг: середня ціна, реалізований PnL і комісії в wallet balance.
+- Нативні SL/TP вхідного ордера переходять на позицію; спрацювання SL/TP закриває позицію біржовим ордером
+  (`client_order_id=None`, `StopOrderType`), обидва одразу — SL.
+- Збої: `fail_next(method, Fault.timeout(applied=True), times=n)` тощо — `applied=True` означає «виконано, але
+  відповідь втрачено»; `Fault.config_error()` — `AdapterConfigError`; зовнішній ордер можна створити й зі статусом
+  `UNKNOWN` (`place_external_order(..., status=...)`); `partial_fill_next(*chunks)`; WS — `ws_drop_next`, `ws_duplicate_next`, `ws_disconnect`;
+  зовнішні дії — `place_external_order`, `open_external_position`, `close_position_externally`,
+  `clear_position_protection`.
+- Огляд: `calls` / `calls_to(method)` (включно з невдалими викликами), `all_orders()`, `stream_subscribers`,
+  `pending_stream_events()`.
 
 ## Таблиці БД
 
@@ -35,13 +148,22 @@
 
 Схема створюється міграцією `migrations/versions/0001_initial_schema.py`; обмеження й тригери перевіряють `tests/db/test_constraints.py`, `tests/db/test_guards.py` і `tests/db/test_migrations.py`.
 
+## Тести
+
+`tests/exchange/`: `test_types.py` (strict, інваріанти, орієнтація SL/TP і класифікація `clientOrderId` — у т.ч.
+hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `contract.py` + `test_contract_fake.py`
+(contract-набір лише через методи протоколу, включно з циклом позиції з нативним SL, підтягуванням SL і reduceOnly-
+виходом; T1.3/T3.2 підключать його до Testnet/Demo маркерами — модулю для мережі треба перевизначити autouse-фікстуру
+`fake_clock` на `SystemClock`; `ContractMarket.mode` — лише `fake`/`testnet`/`demo`, а наявну позицію за символом набір
+не чіпає), `test_fake_faults.py` (кожен тип збою, часткові fills, гонка cancel/fill, SL/TP, WS),
+`test_no_fake_in_production.py`.
 
 ## Стан реалізації
 
 | Задача | Статус | Що зроблено |
 | --- | --- | --- |
 | T0.4 | `[x]` | таблиці `exchange_accounts`, `instruments` |
-| T1.1 | `[ ]` | Доменні типи, `ExchangeAdapter`, `FakeExchangeAdapter` |
+| T1.1 | `[x]` | доменні типи, `ExchangeAdapter`, ієрархія винятків, `FakeExchangeAdapter` з ін'єкцією збоїв |
 | T1.2 | `[ ]` | Rate limiter з пріоритетами |
 | T1.3 | `[ ]` | Bybit: публічні дані та `fetch_time` |
 | T1.7 | `[ ]` | Кеш `instruments` і округлення |
