@@ -75,11 +75,17 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
     assert await _public_tables(migrated_db) == expected
     assert await _functions(migrated_db) >= FUNCTIONS
 
-    # 0002 (T0.7): лише таблиця ключів ідемпотентності API.
+    # 0003 (T1.7): колонка `instruments.launch_time_ms`. Таблиці ті самі.
     await run_alembic(migrated_db, "downgrade", "-1")
-    assert await _public_tables(migrated_db) == expected - {"api_idempotency_keys"}
-    assert "ctb_api_idempotency_guard" not in await _functions(migrated_db)
-    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0001"]
+    assert await _public_tables(migrated_db) == expected
+    assert "ctb_api_idempotency_guard" in await _functions(migrated_db)
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0002"]
+    launch = await _scalars(
+        migrated_db,
+        "SELECT column_name FROM information_schema.columns"
+        " WHERE table_name = 'instruments' AND column_name = 'launch_time_ms'",
+    )
+    assert launch == []
 
     await run_alembic(migrated_db, "downgrade", "base")
     assert await _public_tables(migrated_db) == set()
@@ -87,7 +93,7 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
 
     await run_alembic(migrated_db, "upgrade", "head")
     assert await _public_tables(migrated_db) == expected
-    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0002"]
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0003"]
 
 
 @pytest.mark.asyncio

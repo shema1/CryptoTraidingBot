@@ -174,11 +174,13 @@ def _perp(
     tick: str = "0.10",
     max_order: str = "1190.000",
     max_market: str = "500.000",
+    status: str = "Trading",
+    launch: str | None = "1585123200000",
 ) -> dict[str, object]:
-    return {
+    row: dict[str, object] = {
         "symbol": symbol,
         "contractType": contract_type,
-        "status": "Trading",
+        "status": status,
         "baseCoin": base,
         "quoteCoin": quote,
         "settleCoin": settle,
@@ -192,6 +194,9 @@ def _perp(
         },
         "leverageFilter": {"minLeverage": "1", "maxLeverage": "150.00", "leverageStep": "0.01"},
     }
+    if launch is not None:
+        row["launchTime"] = launch
+    return row
 
 
 def _instruments(rows: list[dict[str, object]], *, cursor: str = "") -> dict[str, object]:
@@ -560,6 +565,7 @@ async def test_instruments_keep_usdt_perpetuals_and_skip_the_rest(fake_clock: Fa
     assert btc.min_notional == Decimal("5")
     assert btc.max_qty == Decimal("500")
     assert btc.max_leverage == Decimal("150.00")
+    assert btc.launch_time_ms == 1_585_123_200_000
     assert btc.status == "Trading"
     assert [item.symbol for item in one] == [SYMBOL]
     assert client.calls[-1] == (PATH_INSTRUMENTS, {}) or client.calls[0][0] == PATH_INSTRUMENTS
@@ -591,6 +597,20 @@ async def test_broken_perpetual_filter_fails_the_whole_instruments_response(fake
         with pytest.raises(MalformedResponse):
             await adapter.fetch_instruments(symbols=[SYMBOL])
     assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_instrument_without_launch_time_fails_the_response(fake_clock: FakeClock) -> None:
+    async with _open(fake_clock, _only(_instruments([_perp(launch=None)]))) as (adapter, _, _client):
+        with pytest.raises(MalformedResponse):
+            await adapter.fetch_instruments()
+
+
+@pytest.mark.asyncio
+async def test_instrument_status_is_kept_even_when_not_trading(fake_clock: FakeClock) -> None:
+    async with _open(fake_clock, _only(_instruments([_perp(status="PreLaunch")]))) as (adapter, _, _client):
+        instruments = await adapter.fetch_instruments()
+    assert [item.status for item in instruments] == ["PreLaunch"]
 
 
 @pytest.mark.asyncio

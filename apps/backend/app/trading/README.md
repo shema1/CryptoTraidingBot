@@ -2,9 +2,9 @@
 
 ## Призначення
 
-Статуси бота, цикл на закритті свічки, машина станів ордера (граф ТЗ §7.1, write-ahead `SUBMITTING`), розв'язання `SUBMISSION_UNKNOWN`, fills і облік капіталу, входи/виходи, перемикання моделі.
+Статуси бота, цикл на закритті свічки, машина станів ордера (граф ТЗ §7.1, write-ahead `SUBMITTING`), розв'язання `SUBMISSION_UNKNOWN`, fills і облік капіталу, входи/виходи, перемикання моделі. Пауза, коли інструмент не торгується, — `instrument_status.py` (T1.7).
 
-> Заплановано: T3.1, T3.3, T3.4, T5.1, T5.2, T5.3, T5.4. Зараз є лише моделі БД (T0.4).
+> Заплановано: T3.1, T3.3, T3.4, T5.1, T5.2, T5.3, T5.4. Зараз є моделі БД (T0.4) і пауза `INSTRUMENT_NOT_TRADING` (T1.7).
 
 ## Розділи ТЗ
 
@@ -17,6 +17,7 @@
 | --- | --- | --- |
 | `Bot`, `Signal`, `Order`, `OrderEvent`, `Fill`, `Position`, `DecisionLog` | `models.py` | таблиці торгового ядра |
 | `BOT_STATUSES`, `PAUSE_REASONS`, `SIGNAL_STATUSES`, `ORDER_STATES`, `ORDER_TERMINAL_STATES`, `ORDER_ORIGINS`, `POSITION_STATUSES`, `PROTECTION_STATUSES`, `CLOCK_TOLERANCE_MS` | `models.py` | набори значень як у ТЗ §6.1, §6.3, §7.1, §9, §11.4; допуск годинника `CLOCK_TOLERANCE_MS` = `CLOCK_DRIFT_LIMIT_MS` (1000 мс, `app/core/clock.py`, §4.3; міграція 0001 має його літералом — зміна ліміту потребує нової міграції). Формат `clientOrderId` для CHECK — `CLIENT_ORDER_ID_RE` з `app/exchange/types.py` (T1.1) |
+| `instrument_pause_transition`, `apply_instrument_pauses`, `INSTRUMENT_NOT_TRADING` | `instrument_status.py` | додати/зняти причину `INSTRUMENT_NOT_TRADING`; `RUNNING` ↔ `PAUSED` лише через неї; OCC за `bots.version` |
 
 ## Таблиці БД
 
@@ -30,6 +31,12 @@
   бота: паралельна зупинка чекає на коміт вставки й бачить її (тест `tests/db/test_concurrency.py`). Вхідний ордер
   для `STOPPED` бота відхиляється; виходи (`reduce_only`) і позиції — ні.
   Попередній статус після `RECONCILING` не зберігається окремо (визначає T5.1).
+  Пауза інструмента (T1.7, `instrument_status.py`): неторговий статус додає `INSTRUMENT_NOT_TRADING` і з `RUNNING`
+  переводить у `PAUSED`; інші статуси (`EMERGENCY_STOP`, `ERROR`, `STOPPED`, `STARTING`, `RECONCILING`, уже `PAUSED`)
+  лишаються, причина лише дописується. Повернення в `Trading` знімає лише цю причину; `PAUSED` без причин, що
+  лишились, стає `RUNNING`. SL не знімається. T5.1 не має виходити в `RUNNING`, поки причина стоїть
+  (CHECK `running_has_no_reason`), а стартовий `refresh` має йти лише після переведення ботів у `STARTING`:
+  інакше модуль поверне `PAUSED` лише з цією причиною в `RUNNING` до стартової звірки (ТЗ §11.1). Лог `instrument_not_trading` / `instrument_trading_resumed`; Telegram — T5.6.
 - `signals` — **`UNIQUE (bot_id, entry_candle_open_time_ms)`**; `features_candle_open_time_ms <
   entry_candle_open_time_ms` (look-ahead), `computed_at_ms ≥ entry_candle_open_time_ms − 1000` (допуск годинника); `primary_signal`
   `LONG`/`SHORT`, `prediction` `LONG`/`SHORT`/`NONE`, `probability` ∈ [0, 1], `expected_edge_atr`, `decision`
@@ -76,6 +83,7 @@
 | Задача | Статус | Що зроблено |
 | --- | --- | --- |
 | T0.4 | `[x]` | таблиці `bots`, `signals`, `orders`, `order_events`, `fills`, `positions`, `decision_log` |
+| T1.7 | `[x]` | пауза `INSTRUMENT_NOT_TRADING`: `RUNNING` ↔ `PAUSED`, інші статуси не знімаються |
 | T3.1 | `[ ]` | Машина станів ордера |
 | T3.3 | `[ ]` | Розв'язання `SUBMISSION_UNKNOWN` |
 | T3.4 | `[ ]` | Fills, `ledger`, `equity_snapshots` |

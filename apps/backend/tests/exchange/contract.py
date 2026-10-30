@@ -159,6 +159,7 @@ class ExchangeAdapterContract:
         assert instrument.min_qty > 0
         assert instrument.min_notional >= 0
         assert instrument.max_leverage >= 1
+        assert instrument.launch_time_ms >= 0
         # min_qty кратний кроку — інакше округлення вниз до кроку дало б кількість, меншу за мінімум.
         assert instrument.min_qty % instrument.qty_step == 0
 

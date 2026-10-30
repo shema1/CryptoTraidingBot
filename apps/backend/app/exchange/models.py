@@ -74,6 +74,7 @@ class Instrument(Base):
         CheckConstraint("min_notional >= 0", name="min_notional_non_negative"),
         CheckConstraint("max_qty IS NULL OR max_qty >= min_qty", name="max_qty_ge_min_qty"),
         CheckConstraint("max_leverage >= 1", name="max_leverage_ge_1"),
+        CheckConstraint("launch_time_ms >= 0", name="launch_time_ms_non_negative"),
         CheckConstraint("char_length(status) > 0", name="status_not_empty"),
     )
 
@@ -86,6 +87,9 @@ class Instrument(Base):
     min_notional: Mapped[Money]
     max_qty: Mapped[Decimal | None]
     max_leverage: Mapped[Money]
-    # Статус інструмента так, як його повертає біржа; «торгується чи ні» визначає адаптер (T1.7).
+    # Час лістингу, мс UTC (Bybit `launchTime`). Скан прогалин свічок починається не раніше за нього (T1.7).
+    launch_time_ms: Mapped[TimeMs]
+    # Статус так, як його повертає біржа, або локальний `Absent`, якщо символ зник зі знімка.
+    # Торгується лише `Trading` (`instruments.is_tradable`).
     status: Mapped[str] = mapped_column(Text)
     updated_at_ms: Mapped[TimeMs]

@@ -77,6 +77,7 @@ def _instrument_kwargs(**over: Any) -> dict[str, Any]:
         "min_notional": D("5"),
         "max_qty": D("100"),
         "max_leverage": D("100"),
+        "launch_time_ms": 1_585_123_200_000,
         "status": "Trading",
     }
     return {**base, **over}

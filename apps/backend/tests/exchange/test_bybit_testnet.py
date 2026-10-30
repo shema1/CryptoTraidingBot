@@ -67,6 +67,7 @@ async def test_public_market_data_on_testnet(testnet_adapter: BybitAdapter) -> N
     assert instrument.max_qty is not None
     assert instrument.max_qty >= instrument.min_qty
     assert instrument.max_leverage >= 1
+    assert instrument.launch_time_ms >= 0
     assert instrument.status != ""
 
     all_usdt = await adapter.fetch_instruments()

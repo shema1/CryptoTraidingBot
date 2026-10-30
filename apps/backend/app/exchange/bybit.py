@@ -17,7 +17,9 @@ demo і live — публічний mainnet (ТЗ §13: у demo ринкові �
 - `GET /v5/market/kline`: список від новіших до старіших, `start`/`end` включні по `startTime`,
   незакрита свічка входить у список (`close` — остання ціна);
 - `GET /v5/market/instruments-info`: `contractType=LinearPerpetual` (приклад у доках ще каже `Perpetual`),
-  `priceFilter` / `lotSizeFilter` / `leverageFilter`, курсор `nextPageCursor`;
+  `priceFilter` / `lotSizeFilter` / `leverageFilter`, `launchTime` (мс, рядок), `status`
+  (`Trading` / `PreLaunch` / `PendingOpen` / `Delivering` / `Closed` / `Settling`; без фільтра `status`
+  біржа віддає й неторговані), курсор `nextPageCursor`;
 - `GET /v5/market/funding/history`: `startTime`/`endTime` включні, список від новіших до старіших, сторінка ≤ 200.
 Свічка віддається з запасом остаточності `KLINE_FINALITY_MARGIN_MS` після закриття за часом біржі.
 TODO(verify-bybit): чи вистачає цього запасу на mainnet (Testnet: остаточна вже через 0,22–0,69 с).
@@ -223,7 +225,8 @@ class BybitAdapter:
 
         USDC-контракти `*PERP`, dated futures і символи поза `SYMBOL_RE` відсутні в результаті, а не помилка.
         `symbols=None` — усі такі інструменти категорії; невідомий символ відсутній. Статус — як у біржі
-        (без фільтра `status` Bybit віддає `Trading` і `PendingOpen`). `max_qty` — менший із `maxOrderQty`
+        (без фільтра `status` Bybit віддає і `Trading`, і ще не відкриті). `launch_time_ms` — `launchTime`.
+        `max_qty` — менший із `maxOrderQty`
         і `maxMktOrderQty`, щоб ринковий ордер не перевищив біржовий максимум.
         Пріоритет `DATA`.
         """
@@ -826,6 +829,7 @@ def _instrument_or_skip(row: object) -> Instrument | None:
             min_notional=_decimal(lot.get("minNotionalValue"), what="minNotionalValue"),
             max_qty=min(max_order, max_market),
             max_leverage=_decimal(leverage.get("maxLeverage"), what="maxLeverage"),
+            launch_time_ms=_ms(row.get("launchTime"), what="launchTime"),
             status=_text(row, "status"),
         )
     )

@@ -236,7 +236,12 @@ class Candle(_Model):
 
 
 class Instrument(_Model):
-    """Правила інструмента (ТЗ §8.3, §15). `status` — як повертає біржа; «торгується чи ні» визначає T1.7."""
+    """Правила інструмента (ТЗ §8.3, §15).
+
+    `status` — як повертає біржа. Торгується лише `Trading` (`app.exchange.instruments.is_tradable`): інший
+    статус, включно з невідомим, нові входи не дозволяє. `launch_time_ms` — час лістингу, мс UTC (Bybit
+    `launchTime`); початок скану прогалин свічок — не раніше за нього (T1.7).
+    """
 
     symbol: Symbol
     tick_size: Price
@@ -245,6 +250,7 @@ class Instrument(_Model):
     min_notional: NonNegativeDecimal
     max_qty: Qty | None
     max_leverage: Annotated[Decimal, Field(ge=1)]
+    launch_time_ms: TimestampMs
     status: NonEmptyStr
 
     @model_validator(mode="after")

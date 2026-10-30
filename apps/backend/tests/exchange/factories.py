@@ -29,6 +29,8 @@ SYMBOL = "BTC/USDT:USDT"
 OTHER_SYMBOL = "ETH/USDT:USDT"
 HOST_ID = "aa"
 LAST_PRICE = Decimal("60000")
+# Довільний час лістингу, кратний 1h (2020-03-25T08:00:00Z). Не звірене з біржею значення — лише для тестів.
+LAUNCH_MS = 1_585_123_200_000
 
 # Валідний id нашого формату (36 символів) для тестів типів, де генератор не потрібен.
 VALID_CLIENT_ORDER_ID = "tbaa" + "0123456789abcdef" * 2
@@ -41,6 +43,7 @@ INSTRUMENT = Instrument(
     min_notional=Decimal("5"),
     max_qty=Decimal("100"),
     max_leverage=Decimal("100"),
+    launch_time_ms=LAUNCH_MS,
     status="Trading",
 )
 
@@ -52,6 +55,7 @@ OTHER_INSTRUMENT = Instrument(
     min_notional=Decimal("5"),
     max_qty=Decimal("1000"),
     max_leverage=Decimal("50"),
+    launch_time_ms=LAUNCH_MS,
     status="Trading",
 )
 

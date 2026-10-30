@@ -276,10 +276,28 @@ async def test_symbol_must_be_canonical(conn: AsyncConnection, symbol: str) -> N
         "min_qty": Decimal("0.001"),
         "min_notional": Decimal(5),
         "max_leverage": Decimal(100),
+        "launch_time_ms": T0,
         "status": "Trading",
         "updated_at_ms": T0,
     }
     await expect_violation(conn, insert(Instrument).values(instrument), "ck_instruments_symbol_format")
+
+
+async def test_instrument_launch_time_cannot_be_negative(conn: AsyncConnection) -> None:
+    instrument = {
+        "exchange": "bybit",
+        "mode": "demo",
+        "symbol": SYMBOL,
+        "tick_size": Decimal("0.1"),
+        "qty_step": Decimal("0.001"),
+        "min_qty": Decimal("0.001"),
+        "min_notional": Decimal(5),
+        "max_leverage": Decimal(100),
+        "launch_time_ms": -1,
+        "status": "Trading",
+        "updated_at_ms": T0,
+    }
+    await expect_violation(conn, insert(Instrument).values(instrument), "ck_instruments_launch_time_ms_non_negative")
 
 
 async def test_numeric_prefixed_symbol_is_valid(conn: AsyncConnection) -> None:

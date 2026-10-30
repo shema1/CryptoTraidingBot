@@ -6,9 +6,10 @@
 (live / demo / testnet — один код), `FakeExchangeAdapter` з ін'єкцією збоїв для тестів, централізований rate limiter.
 Прямі виклики CCXT поза цим пакетом заборонені (AGENTS.md інваріант 4).
 
-> Заплановано: T1.7 (кеш `instruments`, округлення), T3.2 (Bybit: торгові методи, мапінг кодів помилок),
-> T3.5 (приватний WebSocket). Зараз є контракт, доменні типи, винятки, `FakeExchangeAdapter` (T1.1),
-> rate limiter (T1.2), публічні REST-методи Bybit і `fetch_time` (`bybit.py`, T1.3) і моделі БД (T0.4).
+> Заплановано: T3.2 (Bybit: торгові методи, мапінг кодів помилок), T3.5 (приватний WebSocket).
+> Зараз є контракт, доменні типи, винятки, `FakeExchangeAdapter` (T1.1), rate limiter (T1.2),
+> публічні REST-методи Bybit і `fetch_time` (`bybit.py`, T1.3), моделі БД (T0.4), кеш `instruments`
+> і округлення (T1.7).
 > `BybitAdapter` навмисно не є повним `ExchangeAdapter`: ордери, позиції й приватний WS — T3.2/T3.5.
 > T3.2 (з T1.6): приватний клієнт підписує запити локальним часом (без `adjustForTimeDifference`) з
 > `options.recvWindow` = `Settings.recv_window_ms` (`RECV_WINDOW_MS`, 5000 мс; CCXT шле його в `X-BAPI-RECV-WINDOW`);
@@ -43,8 +44,13 @@
 | `FakeExchangeAdapter`, `Fault`, `FaultKind`, `FakeCall` | `fake.py` | in-memory біржа для тестів (нижче); **імпортується лише з `tests/`**; `FakeCall.priority` |
 | `RateLimiter`, `RequestPriority`, `ProcessRole`, `EndpointGroup` | `rate_limit.py` | черга REST одного процесу (нижче); числа лімітів — константи модуля |
 | `BybitAdapter`, `ExchangeMode`, `BybitPublicClient` | `bybit.py` | публічні REST і `fetch_time` (нижче); імпорт `from app.exchange.bybit import …` (пакет `app.exchange` CCXT не тягне) |
-| `ExchangeAccount`, `Instrument` (ORM) | `models.py` | таблиці `exchange_accounts`, `instruments` (ТЗ §6.4, §15) |
+| `ExchangeAccount`, `Instrument` (ORM) | `models.py` | таблиці `exchange_accounts`, `instruments` (ТЗ §6.4, §15); у кеші ще `launch_time_ms` (T1.7) |
 | `EXCHANGES`, `KEY_CHECK_RESULTS` | `models.py` | допустимі біржі (`bybit`); результати перевірки ключа |
+| `PriceRole`, `round_price`, `floor_to_step`, `ceil_to_step` | `rounding.py` | ціна кратна `tickSize`; напрям — той, що не збільшує ризик (нижче) |
+| `round_entry_qty`, `EntryQty`, `QtyRejectReason` | `rounding.py` | кількість вниз до `qtyStep`; `qty = 0` і причина — не входити, лот не піднімається |
+| `InstrumentCache`, `entry_block`, `candle_scan_start_ms` | `instruments.py` | знімок правил, блок входу за рядком, початок сітки свічок від лістингу |
+| `TRADING_STATUS`, `ABSENT_STATUS`, `INSTRUMENT_MAX_AGE_MS`, `INSTRUMENT_REFRESH_REJECTION_CODES` | `instruments.py` | торгується лише `Trading`; зниклий символ — `Absent`; 24 год; коди відхилення, після яких кеш перечитується |
+| `is_tradable`, `is_instrument_refresh_rejection`, `RefreshReason`, `InstrumentSyncResult`, `EmptyInstrumentSnapshot` | `instruments.py` | чи статус торговий; чи код вимагає оновлення; результат знімка; порожній повний знімок кеш не стирає |
 
 Назви `Candle`/`Order`/`Fill`/`Position`/`Instrument` у `types.py` збігаються з ORM-моделями інших модулів: це факти
 біржі на межі адаптера, а не рядки БД. Імпортуйте модулем: `from app.exchange import types`.
@@ -168,7 +174,9 @@ ExchangeError
   далі фільтр за `symbols`. Лишаються безстрокові з `contractType` `LinearPerpetual` або `Perpetual` (приклад у доках
   ще каже `Perpetual`; Testnet — `LinearPerpetual`), у яких `symbol == base+quote` і `quote == settle` — канонічний
   `BASE/QUOTE:SETTLE`. Датовані ф'ючерси й USDC-perp (`BTCPERP`) пропускаються. `max_qty` — менше з `maxOrderQty` і
-  `maxMktOrderQty`, щоб ринковий ордер вміщався в ліміт. Бракований фільтр у інструмента, який мав би увійти у
+  `maxMktOrderQty`, щоб ринковий ордер вміщався в ліміт. `launchTime` (мс, рядок v5) обов'язковий: немає поля —
+  `MalformedResponse`. `status` зберігається як віддала біржа (`Trading`, `PreLaunch`, `PendingOpen`, `Delivering`,
+  `Closed`, `Settling`; changelog v5 2026-09-01: ордер до `Trading` не ставиться). Бракований фільтр у інструмента, який мав би увійти у
   відповідь, валить усю відповідь (`MalformedResponse`). Курсор Bybit приходить percent-encoded: адаптер декодує
   його один раз (`unquote`) у логічне значення, а клієнт кодує для URL. Розкодований курсор у URL розпадається на
   два параметри — Testnet відповідає retCode `10001` (перевірено 2026-10-29; на Testnet уже 911 linear-інструментів
@@ -257,6 +265,48 @@ ExchangeError
   `subscribe_private_stream`; в `args` пріоритет не дублюється), `all_orders()`, `stream_subscribers`,
   `pending_stream_events()`. Фейк лімітер не викликає.
 
+## Кеш інструментів і округлення (T1.7, ТЗ §8.3, §15)
+
+`InstrumentCache.refresh(reason=)` пише знімок `fetch_instruments` у `instruments`. Мережа — поза транзакцією.
+Один `(exchange, mode)` оновлюється по черзі сесійним `pg_advisory_lock` (не lock торгового процесу). Транзакція
+lock-а комітиться до мережі, а з'єднання лишається відкритим на час читання — інакше пул закрив би його і відпустив
+lock раніше за запис. Знімок, що почав читання раніше, не комітиться після новішого і не повертає бота в `RUNNING`. Лог паузи пишеться після
+коміту. `reason`: `startup`, `scheduled` (`refresh_if_due`, коли будь-який відстежуваний символ відсутній, старший за
+рівно 24 год або з міткою з майбутнього), `filter_rejection` (`refresh_after_rejection` лише для кодів
+`110003`, `110017`, `110094`, `30208`, `30209`, `30228`; `10001` кеш не чіпає). Повний знімок (`symbols=None`),
+у якому немає жодного інструмента, кидає `EmptyInstrumentSnapshot` і нічого не пише. Символ, якого в повному
+знімку вже немає, лишається в таблиці зі статусом `Absent` (крок, час лістингу зберігаються) і не торгується.
+Частковий знімок позначає `Absent` лише запитані символи, у яких уже є рядок.
+
+Торгується лише `Trading`. Неторговий статус додає ботам цього режиму й символу причину `INSTRUMENT_NOT_TRADING`
+(`app/trading/instrument_status.py`): `RUNNING` стає `PAUSED`, інші статуси не змінюються. Коли інструмент знову
+торгується, знімається лише ця причина; `PAUSED` без причин, що лишились, повертається в `RUNNING`. SL не знімається.
+Запис — OCC за `bots.version` (дві спроби, далі `InstrumentPauseConflict` відкочує транзакцію знімка). Лог
+`instrument_not_trading` / `instrument_trading_resumed`. Telegram — T5.6.
+
+`entry_block` для нового входу: немає рядка — `INSTRUMENT_UNKNOWN`; не `Trading` — `INSTRUMENT_NOT_TRADING`;
+`Trading` старший за 24 год або з майбутньою міткою — `INSTRUMENT_RULES_STALE`. Застарілість вхід блокує, але
+паузу не ставить (такої причини в ТЗ §6.1 немає). Захист і закриття цей код не читають.
+
+`round_entry_qty` округлює кількість вниз до `qtyStep`, за потреби ще вниз до `maxQty`, і повертає `0` з
+причиною `ZERO_AFTER_ROUND` / `BELOW_MIN_QTY` / `BELOW_MIN_NOTIONAL`, якщо лот або номінал не дотягують.
+Розмір до мінімуму не піднімається. `round_price`: `LIMIT_BUY`, `STOP_SHORT`, `TAKE_PROFIT_LONG` — вниз;
+`LIMIT_SELL`, `STOP_LONG`, `TAKE_PROFIT_SHORT` — вгору (стоп ближче до входу, ціль не далі за розрахунок).
+Ціна, що після округлення вниз стала б 0, — `ValueError`. Округлення до кроку точне для входу з будь-якою
+кількістю цифр (`divmod` у контексті з пасткою `Inexact`, а не `value / step` з 28 знаками); неточний результат —
+`ValueError`.
+
+`candle_scan_start_ms` — початок сітки свічок: `max(backfill_start, перша точка кроку ≥ launchTime)`.
+Backfill бере найраніший `launch_time_ms` серед режимів одного символу (demo і live ділять таблицю свічок);
+немає рядка — лишається `BACKFILL_START_MS`. Funding цей зсув не чіпає.
+
+> Заплановано: T5 — `refresh` при старті процесу і `refresh_if_due` у циклі (окремого entrypoint немає, як у
+> `ClockGuard`); T3.2 — після відхилення ордера викликати `refresh_after_rejection`; T4.1/T5.2 — `entry_block`
+> перед входом; T5.1 — не виходити в `RUNNING`, поки в `pause_reasons` стоїть `INSTRUMENT_NOT_TRADING`, і
+> стартовий `refresh` — лише після переведення ботів у `STARTING` (інакше `PAUSED` лише з цією причиною стане
+> `RUNNING` до стартової звірки); T2.2 — плече в розмірі = менше з конфігу та `max_leverage` кешу (ТЗ §15),
+> T3.2/T4.4 — те саме значення в `set_leverage` і звірці; T5.6 — Telegram для `instrument_not_trading`.
+
 ## Таблиці БД
 
 - `exchange_accounts` — акаунт біржі: `name` (UNIQUE), `exchange`, `mode` (`demo`/`testnet`/`live`), `env_key_set`
@@ -267,10 +317,11 @@ ExchangeError
   (T3.6 може уточнити набір). `UNIQUE (id, mode)` — ціль складених FK: режим бота, ордера, позиції, fill дорівнює
   режиму акаунта.
 - `instruments` — кеш правил, PK `(exchange, mode, symbol)` (символ — канонічний CCXT) (на Testnet правила можуть відрізнятися): `tick_size`,
-  `qty_step`, `min_qty` (> 0), `min_notional` (≥ 0), `max_qty`, `max_leverage` (≥ 1), `status` (як повертає біржа;
-  «торгується чи ні» визначає T1.7), `updated_at_ms`.
+  `qty_step`, `min_qty` (> 0), `min_notional` (≥ 0), `max_qty`, `max_leverage` (≥ 1), `launch_time_ms` (≥ 0, мс UTC;
+  міграція `0003` додає колонку і стирає старі рядки кешу — час лістингу вигадати не можна), `status` (як повертає
+  біржа, або локальний `Absent`, якщо символ зник із повного знімка; торгується лише `Trading`), `updated_at_ms`.
 
-Схема створюється міграцією `migrations/versions/0001_initial_schema.py`; обмеження й тригери перевіряють `tests/db/test_constraints.py`, `tests/db/test_guards.py` і `tests/db/test_migrations.py`.
+Схема створюється міграцією `migrations/versions/0001_initial_schema.py`; `launch_time_ms` додає `0003_instrument_launch_time.py`. Обмеження й тригери перевіряють `tests/db/test_constraints.py`, `tests/db/test_guards.py` і `tests/db/test_migrations.py`.
 
 ## Тести
 
@@ -281,6 +332,10 @@ hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `cont
 `fake_clock` на `SystemClock`; `ContractMarket.mode` — лише `fake`/`testnet`/`demo`, а наявну позицію за символом набір
 не чіпає), `test_fake_faults.py` (кожен тип збою, часткові fills, гонка cancel/fill, SL/TP, WS),
 `test_no_fake_in_production.py`, `test_rate_limit.py` (пріоритети, частка IP, 429, заголовки, backoff),
+`test_rounding.py` (приклади й hypothesis: кількість кратна кроку, не більша за вхід, додатна лише якщо ≥ `minQty`;
+точність для входу з 28+ цифрами біля кратного кроку),
+`test_instrument_rules.py` (статус, `entry_block`, початок сітки, коди відхилення), `tests/trading/test_instrument_status.py`
+(матриця паузи), `tests/data/test_instrument_cache.py` (знімок, `Absent`, пауза, 24 год, код фільтра, OCC-конфлікт паузи),
 `test_bybit_public.py` (записані відповіді v5: закриті свічки, запас остаточності, невирівняний `end_ms`, пагінація,
 курсор, `max_qty`, невідомий `retCode`), `test_bybit_ccxt_client.py` (справжній CCXT з підміненою сесією aiohttp: URL
 і кодування курсора, паралельні запити без черги, мапінг транспортних збоїв і лог, закриття),
@@ -295,6 +350,6 @@ hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `cont
 | T1.1 | `[x]` | доменні типи, `ExchangeAdapter`, ієрархія винятків, `FakeExchangeAdapter` з ін'єкцією збоїв |
 | T1.2 | `[x]` | `rate_limit.py`: черга з пріоритетами, частка IP, backoff, заголовки Bybit |
 | T1.3 | `[x]` | `bybit.py`: `fetch_time`, свічки, інструменти, funding; `category=linear`; група `MARKET` |
-| T1.7 | `[ ]` | Кеш `instruments` і округлення |
+| T1.7 | `[x]` | кеш `instruments`, округлення qty/ціни, пауза `INSTRUMENT_NOT_TRADING`, початок скану свічок від `launchTime` |
 | T3.2 | `[ ]` | Bybit: торгові методи та мапінг помилок |
 | T3.5 | `[ ]` | Приватний WebSocket і реконект |

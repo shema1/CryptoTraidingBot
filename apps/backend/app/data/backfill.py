@@ -21,7 +21,12 @@ asyncpg не приймає більше 32767 параметрів.
 
 Прогалини не інтерполюються. Після проходу свічок (і для символу, який цей прохід не качав) викликається
 `detect_candle_gaps` по сітці до `settled_end_ms(now)`: дірка пишеться в `data_gaps`, а щойно закрита свічка в межах
-`CANDLE_SETTLE_MS` ще не вважається діркою. Курсор `max(час)` за діркою позаду не повертається — закрити її повторним
+`CANDLE_SETTLE_MS` ще не вважається діркою. Початок сітки — не раніше за `start_ms` і не раніше за першу годину
+≥ `launch_time_ms` з кешу `instruments` (T1.7): період до лістингу діркою не є. Якщо такий рядок уже відкритий
+(скан раніше йшов з `BACKFILL_START_MS`), наступний прохід закриває або обрізає його: авторитетне вікно
+починається з конфігу, а пропущені свічки шукаються лише від лістингу. Якщо в кеші кілька режимів,
+береться найраніший лістинг, щоб пізніший Testnet не відрізав історію mainnet (demo і live ділять одні свічки).
+Немає рядка — сітка лишається з `start_ms`. Курсор `max(час)` за діркою позаду не повертається — закрити її повторним
 проходом цей модуль не може, рядок лишається відкритим (T1.5). Зіткнення з іншим процесом на тому самому ряді
 прогалин повторюється один раз, далі ряд пропускається до наступного проходу — решта символів докачується.
 """
@@ -50,6 +55,8 @@ from app.data.gaps import detect_candle_gaps, is_open_gap_conflict, settled_end_
 from app.data.models import Candle as StoredCandle
 from app.data.models import FundingRate as StoredFunding
 from app.exchange.errors import ExchangeError
+from app.exchange.instruments import candle_scan_start_ms
+from app.exchange.models import Instrument as StoredInstrument
 from app.exchange.rate_limit import Jitter
 from app.exchange.types import Candle, FundingRate, Timeframe
 from app.jobs.models import Job
@@ -239,9 +246,11 @@ async def backfill_symbol(
     inserted_candles = 0
     inserted_funding = 0
     if candles:
+        async with _transaction(sessions) as session:
+            candle_floor = await _candle_floor(session, symbol=symbol, floor_ms=start_ms)
         try:
             inserted_candles = await _backfill_candles(
-                sessions, source, symbol=symbol, floor_ms=start_ms, now=current, fetch_limit=fetch_limit
+                sessions, source, symbol=symbol, floor_ms=candle_floor, now=current, fetch_limit=fetch_limit
             )
         except ExchangeError:
             # Сторінки до збою вже в БД: дірка до курсора має бути видна live, навіть якщо хвіст не докачано.
@@ -341,7 +350,8 @@ async def sync_market_data(
     queued: list[str] = []
     async with _transaction(sessions) as session:
         for symbol in symbols:
-            candle_at = await _candle_resume_ms(session, symbol, floor_ms=start_ms, step=step)
+            candle_floor = await _candle_floor(session, symbol=symbol, floor_ms=start_ms)
+            candle_at = await _candle_resume_ms(session, symbol, floor_ms=candle_floor, step=step)
             funding_at = await _funding_resume_ms(session, symbol, floor_ms=start_ms)
             series = _Series(
                 symbol=symbol,
@@ -475,6 +485,28 @@ def _align_forward(ms: int, step: int) -> int:
     return ms + (step - remainder)
 
 
+async def _candle_floor(session: AsyncSession, *, symbol: str, floor_ms: int) -> int:
+    """Не раніше за `floor_ms` і не раніше за найраніший лістинг символу в кеші.
+
+    Кілька режимів (demo/live — одні свічки mainnet, testnet може відрізнятися): береться мінімум, щоб пізніший
+    лістинг не сховав справжню історію. Немає рядка — `floor_ms` (період до лістингу лишиться діркою, поки кеш
+    не заповнить `InstrumentCache.refresh`).
+    """
+    launches = list(
+        await session.scalars(
+            select(StoredInstrument.launch_time_ms).where(
+                StoredInstrument.exchange == EXCHANGE, StoredInstrument.symbol == symbol
+            )
+        )
+    )
+    if not launches:
+        return floor_ms
+    launch = min(launches)
+    if len(set(launches)) > 1:
+        _LOG.info("instrument_launch_modes_differ", symbol=symbol, launch_time_ms=launch, rows=len(launches))
+    return candle_scan_start_ms(floor_ms, launch, step_ms=BACKFILL_TIMEFRAME.duration_ms)
+
+
 def _system_jitter() -> Jitter:
     rng = random.Random()  # noqa: S311 — jitter паузи повтору backfill, не секрет і не ключ
 
@@ -530,10 +562,16 @@ async def _record_candle_gaps(sessions: SessionFactory, *, symbol: str, floor_ms
     решти символів. Інші помилки летять далі.
     """
     step = BACKFILL_TIMEFRAME.duration_ms
-    start = _align_forward(floor_ms, step)
+    configured = _align_forward(floor_ms, step)
+    async with _transaction(sessions) as session:
+        listed = await _candle_floor(session, symbol=symbol, floor_ms=floor_ms)
+    listed = _align_forward(listed, step)
     end = settled_end_ms(now, BACKFILL_TIMEFRAME)
-    if start >= end:
+    if configured >= end:
         return
+    # Дірки шукаємо від лістингу. Авторитетний скан починається раніше — з конфігу: уже відкритий
+    # рядок `[BACKFILL_START, launch)` тоді закривається, а не лишається «поза сканом».
+    candle_from = min(listed, end)
     for attempt in range(1, GAP_SYNC_ATTEMPTS + 1):
         try:
             async with _transaction(sessions) as session:
@@ -542,8 +580,9 @@ async def _record_candle_gaps(sessions: SessionFactory, *, symbol: str, floor_ms
                     exchange=EXCHANGE,
                     symbol=symbol,
                     timeframe=BACKFILL_TIMEFRAME,
-                    start_ms=start,
+                    start_ms=candle_from,
                     end_ms=end,
+                    history_from_ms=configured,
                 )
         except IntegrityError as exc:
             if not is_open_gap_conflict(exc):

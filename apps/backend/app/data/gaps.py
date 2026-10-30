@@ -310,36 +310,48 @@ async def detect_candle_gaps(
     start_ms: int,
     end_ms: int,
     timeframe: Timeframe = Timeframe.H1,
+    history_from_ms: int | None = None,
 ) -> GapSync:
     """Знайти дірки закритих свічок у `[start_ms, end_ms)` і записати їх. Свічки не змінюються.
 
     `end_ms` — зазвичай `settled_end_ms(now)`: свічка, що формується, і щойно закрита в межах `CANDLE_SETTLE_MS` у
     сітку не входять.
     Мітка не на кроці таймфрейму слот не закриває і логується (`data_gap_off_grid`).
+    `history_from_ms`, якщо раніше за `start_ms`, розширює авторитетний скан ліворуч: у `[history_from_ms, start_ms)`
+    дірок свічок немає навмисно (період до лістингу). Відкритий рядок, що починається там, закривається або
+    обрізається до `start_ms`. Без цього аргумента скан лишається `[start_ms, end_ms)`.
     """
     step = timeframe.duration_ms
     start, end = _bounds("start_ms", start_ms, "end_ms", end_ms)
-    present = await _candle_opens(
-        session, exchange=exchange, symbol=symbol, timeframe=timeframe.value, start_ms=start, end_ms=end
-    )
-    off_grid = [ts for ts in present if (ts - start) % step != 0]
-    if off_grid:
-        _LOG.warning(
-            "data_gap_off_grid",
-            exchange=exchange,
-            symbol=symbol,
-            timeframe=timeframe.value,
-            count=len(off_grid),
-            sample_ms=off_grid[:3],
+    history = start if history_from_ms is None else _require_ms("history_from_ms", history_from_ms)
+    if history > start:
+        raise ValueError("history_from_ms пізніший за початок пошуку дірок")
+    if history % step != 0 or start % step != 0 or end % step != 0:
+        raise ValueError("межі сітки не вирівняні за кроком")
+    if start == end:
+        gaps: tuple[GapRange, ...] = ()
+    else:
+        present = await _candle_opens(
+            session, exchange=exchange, symbol=symbol, timeframe=timeframe.value, start_ms=start, end_ms=end
         )
-    gaps = find_gaps(present, start_ms=start, end_ms=end, step_ms=step)
+        off_grid = [ts for ts in present if (ts - start) % step != 0]
+        if off_grid:
+            _LOG.warning(
+                "data_gap_off_grid",
+                exchange=exchange,
+                symbol=symbol,
+                timeframe=timeframe.value,
+                count=len(off_grid),
+                sample_ms=off_grid[:3],
+            )
+        gaps = find_gaps(present, start_ms=start, end_ms=end, step_ms=step)
     return await sync_open_gaps(
         session,
         source=CANDLE_SOURCE,
         exchange=exchange,
         symbol=symbol,
         timeframe=timeframe.value,
-        scan_start_ms=start,
+        scan_start_ms=history,
         scan_end_ms=end,
         gaps=gaps,
     )

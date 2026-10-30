@@ -37,6 +37,7 @@ from app.data.models import Candle as StoredCandle
 from app.exchange.bybit import KLINE_FINALITY_MARGIN_MS
 from app.exchange.errors import ExchangeTimeout
 from app.exchange.fake import Fault
+from app.exchange.models import Instrument as StoredInstrument
 from tests.exchange.factories import FAKE_NOW_MS, OTHER_SYMBOL, SYMBOL, hourly_candle, make_fake
 
 HOUR = H1_MS
@@ -184,6 +185,13 @@ def test_plan_keeps_the_outside_and_grows_or_splits_the_scanned_part() -> None:
     assert plan_open_gaps(
         (GapRange(0, step),), (GapRange(step, 3 * step),), scan_start_ms=step, scan_end_ms=3 * step
     ) == (GapRange(0, 3 * step),)
+    # Скан охоплює лівий край і не бачить там дірки — долістинговий шматок зникає.
+    assert plan_open_gaps(
+        (GapRange(0, 4 * step),),
+        (GapRange(2 * step, 4 * step),),
+        scan_start_ms=0,
+        scan_end_ms=4 * step,
+    ) == (GapRange(2 * step, 4 * step),)
     # Порожній скан нічого не закриває.
     assert plan_open_gaps(existing, (), scan_start_ms=step, scan_end_ms=step) == existing
     with pytest.raises(ValueError, match="поза межами"):
@@ -682,3 +690,64 @@ async def test_a_persistent_conflict_skips_the_series_not_the_pass(
     assert [item[1:] for item in await _open_gaps(conn, symbol=OTHER_SYMBOL)] == [(start, FAKE_NOW_MS)]
     conflicts = [entry for entry in logs if entry["event"] == "data_gap_sync_conflict"]
     assert [(entry["symbol"], entry["attempt"]) for entry in conflicts] == [(SYMBOL, 1), (SYMBOL, 2)]
+
+
+def _instrument_row(*, mode: str, launch_time_ms: int) -> dict[str, object]:
+    return {
+        "exchange": "bybit",
+        "mode": mode,
+        "symbol": SYMBOL,
+        "tick_size": Decimal("0.1"),
+        "qty_step": Decimal("0.001"),
+        "min_qty": Decimal("0.001"),
+        "min_notional": Decimal("5"),
+        "max_leverage": Decimal("100"),
+        "launch_time_ms": launch_time_ms,
+        "status": "Trading",
+        "updated_at_ms": FAKE_NOW_MS,
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_candle_gap_starts_at_the_earliest_listing_not_before_it(conn: AsyncConnection) -> None:
+    """Період до лістингу — не дірка. З двох режимів береться раніший, щоб Testnet не відрізав mainnet."""
+    launch = FAKE_NOW_MS - 3 * HOUR
+    start = launch - 8 * HOUR
+    await conn.execute(insert(StoredInstrument).values(_instrument_row(mode="demo", launch_time_ms=launch)))
+    await conn.execute(
+        insert(StoredInstrument).values(_instrument_row(mode="testnet", launch_time_ms=launch + 5 * HOUR))
+    )
+
+    await sync_market_data(_sessions(conn), make_fake(), symbols=(SYMBOL,), start_ms=start)
+
+    gaps = await _open_gaps(conn)
+    assert gaps
+    assert gaps[0][1] == launch
+    assert all(from_ms >= launch for _gap_id, from_ms, _to_ms in gaps)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_listing_floor_closes_a_prelisting_gap_that_was_already_open(conn: AsyncConnection) -> None:
+    """Уже відкритий рядок до лістингу наступний скан закриває, а не лишає «поза вікном»."""
+    launch = FAKE_NOW_MS - 3 * HOUR
+    start = launch - 8 * HOUR
+    settled = settled_end_ms(FAKE_NOW_MS)
+    await conn.execute(insert(StoredInstrument).values(_instrument_row(mode="demo", launch_time_ms=launch)))
+    await conn.execute(
+        insert(DataGap).values(
+            source=CANDLE_SOURCE,
+            exchange="bybit",
+            symbol=SYMBOL,
+            timeframe="1h",
+            from_ms=start,
+            to_ms=settled,
+            detected_at_ms=start,
+        )
+    )
+
+    await sync_market_data(_sessions(conn), make_fake(), symbols=(SYMBOL,), start_ms=start)
+
+    gaps = await _open_gaps(conn)
+    assert [(from_ms, to_ms) for _gap_id, from_ms, to_ms in gaps] == [(launch, settled)]
