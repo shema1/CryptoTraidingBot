@@ -347,8 +347,10 @@ Backfill бере найраніший `launch_time_ms` серед режимі�
 > `ClockGuard`); T3.2 — після відхилення ордера викликати `refresh_after_rejection`; T4.1/T5.2 — `entry_block`
 > перед входом; T5.1 — не виходити в `RUNNING`, поки в `pause_reasons` стоїть `INSTRUMENT_NOT_TRADING`, і
 > стартовий `refresh` — лише після переведення ботів у `STARTING` (інакше `PAUSED` лише з цією причиною стане
-> `RUNNING` до стартової звірки); T2.2 — плече в розмірі = менше з конфігу та `max_leverage` кешу (ТЗ §15),
-> T3.2/T4.4 — те саме значення в `set_leverage` і звірці; T5.6 — Telegram для `instrument_not_trading`.
+> `RUNNING` до стартової звірки); T3.2/T4.4 — виставляти і звіряти `PositionSize.leverage`
+> (`app/risk/sizing.py`): воно може бути нижче за менше з конфігу та `max_leverage` кешу, бо відстань
+> до ліквідації має лишитись не меншою за `min_liq_distance_sl_multiple` відстаней до стопа; T5.6 — Telegram
+> для `instrument_not_trading`.
 
 ## Таблиці БД
 

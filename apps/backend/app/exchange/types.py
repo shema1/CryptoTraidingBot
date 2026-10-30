@@ -355,7 +355,7 @@ class Position(_Model):
 
 
 class Balance(_Model):
-    """Баланс у валюті розрахунку (USDT). `sizing_equity = min(wallet_balance, equity)` рахує Risk Engine (T2.2)."""
+    """Баланс у валюті розрахунку (USDT). `sizing_equity` рахує `app.risk.sizing.sizing_equity`."""
 
     coin: NonEmptyStr
     wallet_balance: Decimal

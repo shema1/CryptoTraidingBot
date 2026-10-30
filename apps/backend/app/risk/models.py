@@ -51,7 +51,8 @@ LEDGER_KINDS: tuple[str, ...] = ("FEE", "FUNDING", "REALIZED_PNL", "DEPOSIT", "W
 class RiskConfig(Base):
     """Версія лімітів ризику акаунта (ТЗ §8.1, §8.2). Чинна — з найбільшим `version`.
 
-    `params` перевіряє pydantic-схема Risk Engine (T4.1); значення за замовчуванням визначені там, а не тут.
+    `params` — схема `RiskLimits` (T2.2): писати `model_dump_json()`, читати `model_validate_json()` (strict, Decimal
+    рядками). Запис версії і підтвердження послаблення — T4.1.
     """
 
     __tablename__ = "risk_config"
