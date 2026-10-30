@@ -121,7 +121,9 @@ ExchangeError
   методу немає. Адаптер не вирішує, чи можна збільшувати експозицію (це `RiskGate`, T4.1), і не перевіряє напрям руху
   SL (Position Protection Manager, T4.3).
 - Пріоритет черги: методи з фіксованим класом параметра не мають (`FIXED_METHOD_PRIORITY` у `rate_limit.py`:
-  `fetch_time` — `RECONCILE`, `fetch_instruments` / `fetch_candles` / `fetch_funding_history` — `DATA`,
+  `fetch_time` — `RECONCILE`, `fetch_instruments` / `fetch_candles` / `fetch_funding_history` /
+  `fetch_open_interest` / `fetch_premium_index` / `fetch_mark_price_candles` / `fetch_index_price_candles` /
+  `fetch_long_short_ratio` — `DATA`,
   `set_position_protection` — `PROTECTION` і знизити його не можна). Решта REST-методів вимагають keyword
   `priority: RequestPriority`. `subscribe_private_stream` — не REST. Новий вхід рекомендовано як `DATA`
   (може почекати); закриття і SL — `PROTECTION`; звірка і розв'язання `SUBMISSION_UNKNOWN` — `RECONCILE`.
@@ -136,8 +138,8 @@ ExchangeError
 `BybitAdapter` — один клас на `ExchangeMode` (`demo` / `testnet` / `live`). `category` лише `linear`; інше значення —
 `AdapterConfigError` до будь-якого вводу-виводу. Режим змінює публічний хост: testnet — CCXT `set_sandbox_mode`
 (`api-testnet`); demo і live — публічний хост CCXT за замовчуванням (ті самі ринкові дані, що на mainnet, ТЗ §13).
-`enable_demo_trading` не викликається: він перевів би й публічні запити на `api-demo`. Ключі для цих чотирьох методів
-не потрібні. One-way і isolated перевіряються на старті торгового клієнта (T3.2), бо це приватний API.
+`enable_demo_trading` не викликається: він перевів би й публічні запити на `api-demo`. Ключі для публічних методів
+(час, інструменти, свічки, funding і п'ять рядів деривативів) не потрібні. One-way і isolated перевіряються на старті торгового клієнта (T3.2), бо це приватний API.
 
 Усі REST ідуть через `RateLimiter.call` (група `MARKET`, `retry=True`). Пріоритет — `FIXED_METHOD_PRIORITY`:
 `fetch_time` — `RECONCILE`, решта — `DATA`. Транспортні збої (таймаут, 5xx, обрив) адаптер повторює сам до
@@ -184,6 +186,19 @@ ExchangeError
 - `fetch_funding_history` — `[start_ms, end_ms)`, від старіших до новіших; від'ємна ставка допустима. Bybit віддає
   новіші спочатку і на повній сторінці (200) лишає саме їх, тож повна сторінка не вважається повною історією: вікно
   ділиться навпіл, доки сторінка не стане коротшою. Дві різні ставки на одну мітку — `MalformedResponse`.
+- `fetch_open_interest`, `fetch_premium_index`, `fetch_mark_price_candles`, `fetch_index_price_candles`,
+  `fetch_long_short_ratio` (T1.9) — закриті інтервали `[start_ms, end_ms)` за зростанням, той самий запас
+  остаточності, що в trade-kline. Ці методи не входять у протокол `ExchangeAdapter`: їх викликає backfill
+  деривативів. Open interest і long/short мають інший код інтервалу (`1h`, не `60`) і лише `5min`/`15min`/`30min`/
+  `1h`/`4h`/`1d` — інший таймфрейм це `ValueError` до мережі. Сторінка OI ≤ 200, ratio ≤ 500, kline ≤ 1000.
+  Повна сторінка OI/ratio, чий найстаріший час ще пізніший за початок вікна, дочитується курсором (курсор
+  percent-encoded, декодується один раз). Повтор курсора — `MalformedResponse`, понад 8 сторінок у вікні —
+  `ExchangeUnavailable`. `open` premium — close попередньої години, тож може лежати поза `[low, high]`, і свічка
+  віддається як є (`docs/decisions/0009-premium-open.md`). Premium зі зламаним діапазоном години (`high < low`,
+  `close` поза `[low, high]`), mark/index з неузгодженим OHLC і недодатна ціна mark/index не повертаються й не
+  виправляються: лог `derivative_point_rejected`, решта сторінки лишається. Нечисло, чужий
+  `symbol` або `category` — `MalformedResponse` для всієї відповіді. Зберігається поле `openInterest`, не
+  `singleOpenInterest`. Глибина історії — `docs/data/derivatives-history.md`.
 
 **Запас остаточності kline** — `KLINE_FINALITY_MARGIN_MS` = 500 мс, рішення власника (T1.3, 2026-10-29). Він повністю
 додається до затримки сигналу, тож має вкладатися в бюджет ТЗ §5.5 (ціль < 1 с від відкриття свічки входу, межа
@@ -234,8 +249,9 @@ ExchangeError
 Числа лімітів, вікон, backoff і часток — константи `rate_limit.py` (єдине джерело; тест
 `test_documented_bybit_limits_are_the_single_source` фіксує їх). Звірені з документацією Bybit v5 2026-10-29.
 
-Групи публічних методів уже в `bybit.py`: `fetch_time`, `fetch_instruments`, `fetch_candles`, `fetch_funding_history` →
-`MARKET`. Для T3.2: `place_order` → `ORDER_CREATE` (`retry=False`); `cancel_order` → `ORDER_CANCEL`
+Групи публічних методів уже в `bybit.py`: `fetch_time`, `fetch_instruments`, `fetch_candles`, `fetch_funding_history`,
+`fetch_open_interest`, `fetch_premium_index`, `fetch_mark_price_candles`, `fetch_index_price_candles`,
+`fetch_long_short_ratio` → `MARKET`. Для T3.2: `place_order` → `ORDER_CREATE` (`retry=False`); `cancel_order` → `ORDER_CANCEL`
 (`retry=False`); `fetch_open_orders` → `ORDER_REALTIME`; `fetch_order_by_client_id` може потребувати і realtime,
 і history (два `acquire`, T3.2); `fetch_executions` → `EXECUTION_LIST`; `fetch_positions` → `POSITION_LIST`;
 `set_position_protection` → `TRADING_STOP` (`retry=True`, ідемпотентний); `set_leverage` → `SET_LEVERAGE`;

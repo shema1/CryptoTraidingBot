@@ -35,6 +35,7 @@ from app.exchange.types import (
     PositionProtection,
     PositionSide,
     PositionUpdate,
+    PremiumIndex,
     Side,
     StopOrderType,
     Timeframe,
@@ -364,6 +365,48 @@ def test_candle_aligned_open_time_is_accepted_for_every_timeframe(timeframe: Tim
     open_time = FAKE_NOW_MS + EXPECTED_DURATIONS_MS[timeframe]
     candle = Candle.model_validate(_candle_kwargs(timeframe=timeframe, open_time_ms=open_time))
     assert candle.close_time_ms == open_time + EXPECTED_DURATIONS_MS[timeframe]
+
+
+# ---------------------------------------------------------------- PremiumIndex
+
+
+def _premium_kwargs(**over: Any) -> dict[str, Any]:
+    # Година Testnet BTCUSDT 2024-06-01 00:00 UTC: open — close попередньої години, нижче за low цієї.
+    base: dict[str, Any] = {
+        "symbol": SYMBOL,
+        "timeframe": Timeframe.H1,
+        "ts_ms": FAKE_NOW_MS,
+        "open": D("0.00046096"),
+        "high": D("0.00052523"),
+        "low": D("0.00048958"),
+        "close": D("0.00048958"),
+    }
+    return {**base, **over}
+
+
+@pytest.mark.parametrize(
+    "open_", [D("0.00046096"), D("0.0006"), D("-0.001")], ids=["below-low", "above-high", "negative"]
+)
+def test_premium_open_outside_the_hour_range_is_accepted(open_: Decimal) -> None:
+    point = PremiumIndex.model_validate(_premium_kwargs(open=open_))
+    assert point.open == open_
+    assert (point.high, point.low, point.close) == (D("0.00052523"), D("0.00048958"), D("0.00048958"))
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"high": D("0.0004")},  # high < low
+        {"close": D("0.0006")},  # close > high
+        {"close": D("0.0004")},  # close < low
+        {"open": D("NaN")},
+        {"open": D("Infinity")},
+    ],
+    ids=["high<low", "close>high", "close<low", "open-nan", "open-inf"],
+)
+def test_premium_rejects_a_broken_hour_range_and_a_non_finite_open(over: dict[str, Decimal]) -> None:
+    with pytest.raises(ValidationError):
+        PremiumIndex.model_validate(_premium_kwargs(**over))
 
 
 # ---------------------------------------------------------------- Instrument

@@ -23,6 +23,17 @@ demo і live — публічний mainnet (ТЗ §13: у demo ринкові �
 - `GET /v5/market/funding/history`: `startTime`/`endTime` включні, список від новіших до старіших, сторінка ≤ 200.
 Свічка віддається з запасом остаточності `KLINE_FINALITY_MARGIN_MS` після закриття за часом біржі.
 TODO(verify-bybit): чи вистачає цього запасу на mainnet (Testnet: остаточна вже через 0,22–0,69 с).
+
+Дані деривативів (T1.9, документація v5 і Testnet 2026-10-30, глибина — `docs/data/derivatives-history.md`):
+- `GET /v5/market/open-interest`: `intervalTime` (`1h`, не `60`), сторінка ≤ 200, курсор, список від новіших;
+  зберігаємо `openInterest` (сума сторін), не `singleOpenInterest`;
+- `GET /v5/market/mark-price-kline`, `index-price-kline`, `premium-index-price-kline`: як kline, але 5 полів
+  без обсягу, `interval` як у trade-kline (`60` для 1h), сторінка ≤ 1000, без курсора;
+- `GET /v5/market/account-ratio`: `period` (`1h`), сторінка ≤ 500, курсор, `buyRatio`/`sellRatio`.
+Незакритий інтервал входить у список (Testnet: поточна година вже в відповіді). `open` premium — close попередньої
+години, тож може лежати поза `[low, high]` і віддається як є (рішення 0009). Premium зі зламаним діапазоном години
+(`high < low`, `close` поза `[low, high]`) і mark/index із неузгодженим OHLC не віддаються — це прогалина, не
+виправлення цін.
 """
 
 from __future__ import annotations
@@ -62,17 +73,36 @@ from app.exchange.rate_limit import (
     parse_limit_headers,
     retry_after_ms_from,
 )
-from app.exchange.types import Candle, FundingRate, Instrument, Timeframe
+from app.exchange.types import (
+    Candle,
+    DerivativePriceType,
+    FundingRate,
+    Instrument,
+    LongShortRatio,
+    MarkIndexCandle,
+    OpenInterest,
+    PremiumIndex,
+    Timeframe,
+)
 
 _log = get_logger(__name__)
 
 _T = TypeVar("_T")
+_Point = OpenInterest | PremiumIndex | MarkIndexCandle | LongShortRatio
+_P = TypeVar("_P", bound=_Point)
+_BucketParse = Callable[..., tuple[list[_Point], int, int | None, list[int]]]
+_KlineParse = Callable[..., tuple[list[_Point], int, int, list[int]]]
 
 LINEAR_CATEGORY: Final = "linear"
-# Сторінки Bybit v5 (документація): kline ≤ 1000, funding ≤ 200, instruments ≤ 1000.
+# Сторінки Bybit v5 (документація): kline ≤ 1000, funding ≤ 200, instruments ≤ 1000,
+# open interest ≤ 200, long/short ratio ≤ 500.
 KLINE_PAGE: Final = 1000
 FUNDING_PAGE: Final = 200
 INSTRUMENT_PAGE: Final = 1000
+OI_PAGE: Final = 200
+RATIO_PAGE: Final = 500
+# Сторінок курсора всередині одного вікна. Вікно backfill не довше за сторінку, тож 8 — запас на дублі.
+_CURSOR_PAGE_CAP: Final = 8
 # Запас остаточності kline: свічка віддається, лише коли `close_time_ms + запас ≤ time` відповіді біржі.
 # Рішення власника (T1.3, 2026-10-29): 500 мс укладаються в бюджет ТЗ §5.5 (ціль < 1 с, `max_signal_age_ms` 5 с).
 # Testnet того ж дня: свічка вже остаточна через 0,22–0,69 с після межі. Mainnet — TODO(verify-bybit).
@@ -93,6 +123,11 @@ PATH_TIME: Final = "v5/market/time"
 PATH_KLINE: Final = "v5/market/kline"
 PATH_INSTRUMENTS: Final = "v5/market/instruments-info"
 PATH_FUNDING: Final = "v5/market/funding/history"
+PATH_OPEN_INTEREST: Final = "v5/market/open-interest"
+PATH_MARK_KLINE: Final = "v5/market/mark-price-kline"
+PATH_INDEX_KLINE: Final = "v5/market/index-price-kline"
+PATH_PREMIUM_KLINE: Final = "v5/market/premium-index-price-kline"
+PATH_ACCOUNT_RATIO: Final = "v5/market/account-ratio"
 
 # Приклад у доках — `Perpetual`; Testnet 2026-10-29 віддає `LinearPerpetual`. Обидва — безстроковий linear.
 _PERPETUAL_TYPES: Final = frozenset({"LinearPerpetual", "Perpetual"})
@@ -109,12 +144,26 @@ _INTERVAL: Final[Mapping[Timeframe, str]] = {
     Timeframe.H12: "720",
     Timeframe.D1: "D",
 }
+# Open interest і long/short: інший алфавіт інтервалу, ніж у kline (`1h`, не `60`). 1m/2h/6h/12h у v5 немає.
+_BUCKET_INTERVAL: Final[Mapping[Timeframe, str]] = {
+    Timeframe.M5: "5min",
+    Timeframe.M15: "15min",
+    Timeframe.M30: "30min",
+    Timeframe.H1: "1h",
+    Timeframe.H4: "4h",
+    Timeframe.D1: "1d",
+}
 
 _IMPLICIT: Final[Mapping[str, str]] = {
     PATH_TIME: "publicGetV5MarketTime",
     PATH_KLINE: "publicGetV5MarketKline",
     PATH_INSTRUMENTS: "publicGetV5MarketInstrumentsInfo",
     PATH_FUNDING: "publicGetV5MarketFundingHistory",
+    PATH_OPEN_INTEREST: "publicGetV5MarketOpenInterest",
+    PATH_MARK_KLINE: "publicGetV5MarketMarkPriceKline",
+    PATH_INDEX_KLINE: "publicGetV5MarketIndexPriceKline",
+    PATH_PREMIUM_KLINE: "publicGetV5MarketPremiumIndexPriceKline",
+    PATH_ACCOUNT_RATIO: "publicGetV5MarketAccountRatio",
 }
 
 _CANONICAL = re.compile(SYMBOL_RE)
@@ -339,6 +388,374 @@ class BybitAdapter:
                 return []
         self._ensure_open()
         return await self._funding_between(symbol=symbol, exchange_id=exchange_id, start=start_ms, end=resolved_end)
+
+    async def fetch_open_interest(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None = None,
+        limit: int | None = None,
+    ) -> list[OpenInterest]:
+        """Open interest із `ts_ms` у `[start_ms, end_ms)`, за зростанням. Лише закриті інтервали. Пріоритет `DATA`.
+
+        `open_interest` — поле `openInterest` (сума двох сторін). `singleOpenInterest` не зберігається.
+        Пропуск на біржі пропуском і лишається. `end_ms=None` — до `fetch_time()` (виключно).
+        """
+        return cast(
+            list[OpenInterest],
+            await self._fetch_buckets(
+                method="fetch_open_interest",
+                path=PATH_OPEN_INTEREST,
+                page=OI_PAGE,
+                interval_key="intervalTime",
+                symbol=symbol,
+                timeframe=timeframe,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=limit,
+                parse=_parse_open_interest,
+            ),
+        )
+
+    async def fetch_premium_index(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None = None,
+        limit: int | None = None,
+    ) -> list[PremiumIndex]:
+        """Закриті свічки premium index у `[start_ms, end_ms)`, за зростанням. Пріоритет `DATA`.
+
+        Неузгоджений OHLC (буває на Testnet) не повертається: ціну не виправляємо. `end_ms=None` — до `fetch_time()`.
+        """
+        return cast(
+            list[PremiumIndex],
+            await self._fetch_derivative_klines(
+                method="fetch_premium_index",
+                path=PATH_PREMIUM_KLINE,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=limit,
+                parse=_parse_premium_page,
+                price_type=None,
+            ),
+        )
+
+    async def fetch_mark_price_candles(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None = None,
+        limit: int | None = None,
+    ) -> list[MarkIndexCandle]:
+        """Закриті mark-свічки у `[start_ms, end_ms)`, за зростанням. Пріоритет `DATA`.
+
+        `end_ms=None` — до `fetch_time()` (виключно).
+        """
+        return cast(
+            list[MarkIndexCandle],
+            await self._fetch_derivative_klines(
+                method="fetch_mark_price_candles",
+                path=PATH_MARK_KLINE,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=limit,
+                parse=_parse_mark_index_page,
+                price_type=DerivativePriceType.MARK,
+            ),
+        )
+
+    async def fetch_index_price_candles(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None = None,
+        limit: int | None = None,
+    ) -> list[MarkIndexCandle]:
+        """Закриті index-свічки у `[start_ms, end_ms)`, за зростанням. Пріоритет `DATA`.
+
+        `end_ms=None` — до `fetch_time()` (виключно).
+        """
+        return cast(
+            list[MarkIndexCandle],
+            await self._fetch_derivative_klines(
+                method="fetch_index_price_candles",
+                path=PATH_INDEX_KLINE,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=limit,
+                parse=_parse_mark_index_page,
+                price_type=DerivativePriceType.INDEX,
+            ),
+        )
+
+    async def fetch_long_short_ratio(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None = None,
+        limit: int | None = None,
+    ) -> list[LongShortRatio]:
+        """Long/short ratio із `ts_ms` у `[start_ms, end_ms)`, за зростанням. Лише закриті інтервали. Пріоритет `DATA`.
+
+        `end_ms=None` — до `fetch_time()` (виключно). Пропуски не заповнюються.
+        """
+        return cast(
+            list[LongShortRatio],
+            await self._fetch_buckets(
+                method="fetch_long_short_ratio",
+                path=PATH_ACCOUNT_RATIO,
+                page=RATIO_PAGE,
+                interval_key="period",
+                symbol=symbol,
+                timeframe=timeframe,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=limit,
+                parse=_parse_long_short,
+            ),
+        )
+
+    async def _fetch_buckets(
+        self,
+        *,
+        method: str,
+        path: str,
+        page: int,
+        interval_key: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None,
+        limit: int | None,
+        parse: _BucketParse,
+    ) -> list[_Point]:
+        exchange_id = _canonical_symbol(symbol)
+        code = _bucket_code(timeframe)
+        _require_limit(limit)
+        resolved_end = await self._resolved_end(start_ms, end_ms)
+        if resolved_end is None:
+            return []
+        step = timeframe.duration_ms
+        collected: list[_Point] = []
+        first = _ceil_align(start_ms, step)
+        while first < resolved_end and (limit is None or len(collected) < limit):
+            window_end = min(resolved_end, first + page * step)
+            collected.extend(
+                await self._bucket_window(
+                    method=method,
+                    path=path,
+                    page=page,
+                    interval_key=interval_key,
+                    interval_code=code,
+                    symbol=symbol,
+                    exchange_id=exchange_id,
+                    timeframe=timeframe,
+                    first=first,
+                    window_end=window_end,
+                    parse=parse,
+                )
+            )
+            first = window_end
+        merged = _merge_points(collected)
+        if limit is not None:
+            return merged[:limit]
+        return merged
+
+    async def _bucket_window(
+        self,
+        *,
+        method: str,
+        path: str,
+        page: int,
+        interval_key: str,
+        interval_code: str,
+        symbol: str,
+        exchange_id: str,
+        timeframe: Timeframe,
+        first: int,
+        window_end: int,
+        parse: _BucketParse,
+    ) -> list[_Point]:
+        """Одне вікно через курсор. Повна сторінка, чий найстаріший час ще пізніший за `first`, не є кінцем вікна."""
+        cursor: str | None = None
+        seen: set[str] = set()
+        collected: list[_Point] = []
+        for _page in range(_CURSOR_PAGE_CAP):
+            query: dict[str, str] = {
+                "category": LINEAR_CATEGORY,
+                "symbol": exchange_id,
+                interval_key: interval_code,
+                "startTime": str(first),
+                "endTime": str(window_end - 1),
+                "limit": str(page),
+            }
+            if cursor is not None:
+                query["cursor"] = cursor
+            response = await self._read(method=method, path=path, query=query)
+            body = _success(response)
+            points, raw_count, oldest, rejected = parse(
+                body,
+                symbol=symbol,
+                exchange_id=exchange_id,
+                timeframe=timeframe,
+                first=first,
+                window_end=window_end,
+            )
+            _log_rejected(path, symbol, rejected)
+            collected.extend(points)
+            nxt = _next_cursor(_result(body))
+            if nxt is None or raw_count < page or (oldest is not None and oldest <= first):
+                return _merge_points(collected)
+            if nxt in seen:
+                raise MalformedResponse("bybit: nextPageCursor повторився")
+            seen.add(nxt)
+            cursor = nxt
+        raise ExchangeUnavailable("bybit: забагато сторінок курсора")
+
+    async def _fetch_derivative_klines(
+        self,
+        *,
+        method: str,
+        path: str,
+        symbol: str,
+        timeframe: Timeframe,
+        start_ms: int,
+        end_ms: int | None,
+        limit: int | None,
+        parse: _KlineParse,
+        price_type: DerivativePriceType | None,
+    ) -> list[_Point]:
+        exchange_id = _canonical_symbol(symbol)
+        if type(timeframe) is not Timeframe:
+            raise ValueError("timeframe має бути Timeframe")
+        _require_limit(limit)
+        resolved_end = await self._resolved_end(start_ms, end_ms)
+        if resolved_end is None:
+            return []
+        step = timeframe.duration_ms
+        collected: list[_Point] = []
+        first = _ceil_align(start_ms, step)
+        while first < resolved_end and (limit is None or len(collected) < limit):
+            window_end = min(resolved_end, first + KLINE_PAGE * step)
+            collected.extend(
+                await self._derivative_kline_window(
+                    method=method,
+                    path=path,
+                    symbol=symbol,
+                    exchange_id=exchange_id,
+                    timeframe=timeframe,
+                    first=first,
+                    window_end=window_end,
+                    parse=parse,
+                    price_type=price_type,
+                )
+            )
+            first = window_end
+        merged = _merge_points(collected)
+        if limit is not None:
+            return merged[:limit]
+        return merged
+
+    async def _derivative_kline_window(
+        self,
+        *,
+        method: str,
+        path: str,
+        symbol: str,
+        exchange_id: str,
+        timeframe: Timeframe,
+        first: int,
+        window_end: int,
+        parse: _KlineParse,
+        price_type: DerivativePriceType | None,
+    ) -> list[_Point]:
+        slots = -(-(window_end - first) // timeframe.duration_ms)
+        if slots <= 0:
+            return []
+        response = await self._read(
+            method=method,
+            path=path,
+            query={
+                "category": LINEAR_CATEGORY,
+                "symbol": exchange_id,
+                "interval": _INTERVAL[timeframe],
+                "start": str(first),
+                "end": str(window_end - 1),
+                "limit": str(KLINE_PAGE),
+            },
+        )
+        closed, raw_count, in_window, rejected = parse(
+            _success(response),
+            symbol=symbol,
+            exchange_id=exchange_id,
+            timeframe=timeframe,
+            price_type=price_type,
+            first=first,
+            window_end=window_end,
+        )
+        _log_rejected(path, symbol, rejected)
+        if raw_count < KLINE_PAGE or in_window >= slots:
+            return closed
+        if slots == 1:
+            raise MalformedResponse("bybit: сторінка kline обрізана на одній свічці")
+        mid = first + (slots // 2) * timeframe.duration_ms
+        left = await self._derivative_kline_window(
+            method=method,
+            path=path,
+            symbol=symbol,
+            exchange_id=exchange_id,
+            timeframe=timeframe,
+            first=first,
+            window_end=mid,
+            parse=parse,
+            price_type=price_type,
+        )
+        right = await self._derivative_kline_window(
+            method=method,
+            path=path,
+            symbol=symbol,
+            exchange_id=exchange_id,
+            timeframe=timeframe,
+            first=mid,
+            window_end=window_end,
+            parse=parse,
+            price_type=price_type,
+        )
+        return _merge_points([*left, *right])
+
+    async def _resolved_end(self, start_ms: int, end_ms: int | None) -> int | None:
+        """`end` діапазону або `None`, якщо діапазон порожній. `end_ms=None` питає `fetch_time`."""
+        _require_ms("start_ms", start_ms)
+        if end_ms is not None:
+            _require_ms("end_ms", end_ms)
+            if end_ms < start_ms:
+                raise ValueError("end_ms має бути ≥ start_ms")
+            if end_ms == start_ms:
+                return None
+            self._ensure_open()
+            return end_ms
+        self._ensure_open()
+        resolved = await self.fetch_time()
+        if resolved <= start_ms:
+            return None
+        return resolved
 
     async def _kline_window(
         self,
@@ -920,6 +1337,264 @@ def _merge_funding(rows: list[FundingRate]) -> list[FundingRate]:
             raise MalformedResponse("bybit: суперечливі funding одного часу")
         by_time[row.funding_time_ms] = row
     return [by_time[key] for key in sorted(by_time)]
+
+
+def _bucket_code(timeframe: Timeframe) -> str:
+    if type(timeframe) is not Timeframe:
+        raise ValueError("timeframe має бути Timeframe")
+    code = _BUCKET_INTERVAL.get(timeframe)
+    if code is None:
+        raise ValueError(f"інтервал {timeframe.value} для open interest і long/short Bybit не задано")
+    return code
+
+
+def _require_limit(limit: int | None) -> None:
+    if limit is not None and (type(limit) is not int or isinstance(limit, bool) or limit < 1):
+        raise ValueError("limit має бути int ≥ 1")
+
+
+def _interval_closed(ts_ms: int, timeframe: Timeframe, server: int) -> bool:
+    return ts_ms + timeframe.duration_ms + KLINE_FINALITY_MARGIN_MS <= server
+
+
+def _log_rejected(path: str, symbol: str, rejected: list[int]) -> None:
+    if not rejected:
+        return
+    _log.warning(
+        "derivative_point_rejected",
+        path=path,
+        symbol=symbol,
+        count=len(rejected),
+        sample_ms=rejected[:3],
+    )
+
+
+def _merge_points(points: list[_P]) -> list[_P]:
+    by_time: dict[int, _P] = {}
+    for point in points:
+        previous = by_time.get(point.ts_ms)
+        if previous is not None and previous != point:
+            raise MalformedResponse("bybit: суперечливі точки одного часу")
+        by_time[point.ts_ms] = point
+    return [by_time[key] for key in sorted(by_time)]
+
+
+def _accept_open_interest(symbol: str, timeframe: Timeframe, ts: int, value: Decimal) -> OpenInterest | None:
+    try:
+        return OpenInterest(symbol=symbol, timeframe=timeframe, ts_ms=ts, open_interest=value)
+    except (ValidationError, ValueError):
+        return None
+
+
+def _accept_long_short(
+    symbol: str, timeframe: Timeframe, ts: int, buy: Decimal, sell: Decimal
+) -> LongShortRatio | None:
+    try:
+        return LongShortRatio(symbol=symbol, timeframe=timeframe, ts_ms=ts, buy_ratio=buy, sell_ratio=sell)
+    except (ValidationError, ValueError):
+        return None
+
+
+def _try_point(factory: Callable[[], _P]) -> _P | None:
+    """`None` — рядок розібрано, але він не проходить інваріант доменної моделі (його не виправляємо)."""
+    try:
+        return factory()
+    except (ValidationError, ValueError):
+        return None
+
+
+def _parse_open_interest(
+    body: dict[str, object],
+    *,
+    symbol: str,
+    exchange_id: str,
+    timeframe: Timeframe,
+    first: int,
+    window_end: int,
+) -> tuple[list[_Point], int, int | None, list[int]]:
+    result = _result(body)
+    _require_linear(result)
+    if result.get("symbol") != exchange_id:
+        raise MalformedResponse("bybit: symbol open interest не збігається із запитом")
+    rows = _object_rows(result, what="open interest")
+    server = _envelope_time(body)
+    points: list[_Point] = []
+    rejected: list[int] = []
+    timestamps: list[int] = []
+    for row in rows:
+        ts = _ms(row.get("timestamp"), what="timestamp")
+        timestamps.append(ts)
+        value = _decimal(row.get("openInterest"), what="openInterest")
+        if not first <= ts < window_end or not _interval_closed(ts, timeframe, server):
+            continue
+        built: _Point | None = _accept_open_interest(symbol, timeframe, ts, value)
+        if built is None:
+            rejected.append(ts)
+        else:
+            points.append(built)
+    oldest = min(timestamps) if timestamps else None
+    return _merge_points(points), len(rows), oldest, rejected
+
+
+def _parse_long_short(
+    body: dict[str, object],
+    *,
+    symbol: str,
+    exchange_id: str,
+    timeframe: Timeframe,
+    first: int,
+    window_end: int,
+) -> tuple[list[_Point], int, int | None, list[int]]:
+    result = _result(body)
+    if "category" in result:
+        _require_linear(result)
+    rows = _object_rows(result, what="long/short")
+    server = _envelope_time(body)
+    points: list[_Point] = []
+    rejected: list[int] = []
+    timestamps: list[int] = []
+    for row in rows:
+        if row.get("symbol") != exchange_id:
+            raise MalformedResponse("bybit: symbol long/short не збігається із запитом")
+        ts = _ms(row.get("timestamp"), what="timestamp")
+        timestamps.append(ts)
+        buy = _decimal(row.get("buyRatio"), what="buyRatio")
+        sell = _decimal(row.get("sellRatio"), what="sellRatio")
+        if not first <= ts < window_end or not _interval_closed(ts, timeframe, server):
+            continue
+        built = _accept_long_short(symbol, timeframe, ts, buy, sell)
+        if built is None:
+            rejected.append(ts)
+        else:
+            points.append(built)
+    oldest = min(timestamps) if timestamps else None
+    return _merge_points(points), len(rows), oldest, rejected
+
+
+def _parse_premium_page(
+    body: dict[str, object],
+    *,
+    symbol: str,
+    exchange_id: str,
+    timeframe: Timeframe,
+    price_type: DerivativePriceType | None,
+    first: int,
+    window_end: int,
+) -> tuple[list[_Point], int, int, list[int]]:
+    del price_type
+    return _parse_price_page(
+        body,
+        symbol=symbol,
+        exchange_id=exchange_id,
+        timeframe=timeframe,
+        first=first,
+        window_end=window_end,
+        build=lambda row, ts: _try_point(
+            lambda: PremiumIndex(
+                symbol=symbol,
+                timeframe=timeframe,
+                ts_ms=ts,
+                open=_decimal(row[1], what="open"),
+                high=_decimal(row[2], what="high"),
+                low=_decimal(row[3], what="low"),
+                close=_decimal(row[4], what="close"),
+            )
+        ),
+    )
+
+
+def _parse_mark_index_page(
+    body: dict[str, object],
+    *,
+    symbol: str,
+    exchange_id: str,
+    timeframe: Timeframe,
+    price_type: DerivativePriceType | None,
+    first: int,
+    window_end: int,
+) -> tuple[list[_Point], int, int, list[int]]:
+    if price_type is None:
+        raise MalformedResponse("bybit: price_type mark/index не задано")
+    kind = price_type
+
+    def build(row: list[object], ts: int) -> _Point | None:
+        return _try_point(
+            lambda: MarkIndexCandle(
+                symbol=symbol,
+                timeframe=timeframe,
+                price_type=kind,
+                ts_ms=ts,
+                open=_decimal(row[1], what="open"),
+                high=_decimal(row[2], what="high"),
+                low=_decimal(row[3], what="low"),
+                close=_decimal(row[4], what="close"),
+            )
+        )
+
+    return _parse_price_page(
+        body,
+        symbol=symbol,
+        exchange_id=exchange_id,
+        timeframe=timeframe,
+        first=first,
+        window_end=window_end,
+        build=build,
+    )
+
+
+def _parse_price_page(
+    body: dict[str, object],
+    *,
+    symbol: str,
+    exchange_id: str,
+    timeframe: Timeframe,
+    first: int,
+    window_end: int,
+    build: Callable[[list[object], int], _Point | None],
+) -> tuple[list[_Point], int, int, list[int]]:
+    del symbol
+    result = _result(body)
+    _require_linear(result)
+    if result.get("symbol") != exchange_id:
+        raise MalformedResponse("bybit: symbol kline не збігається із запитом")
+    rows = result.get("list")
+    if type(rows) is not list:
+        raise MalformedResponse("bybit: kline list не є масивом")
+    server = _envelope_time(body)
+    points: list[_Point] = []
+    rejected: list[int] = []
+    in_window = 0
+    for row in rows:
+        if type(row) is not list or len(row) < 5:
+            raise MalformedResponse("bybit: свічка дериватива не є масивом із 5 полів")
+        typed = cast(list[object], row)
+        ts = _ms(typed[0], what="startTime")
+        if not first <= ts < window_end:
+            continue
+        in_window += 1
+        if not _interval_closed(ts, timeframe, server):
+            continue
+        # Ціни читаємо до моделі: нечисло — нерозбірна відповідь, а не пропущена свічка.
+        for index, name in ((1, "open"), (2, "high"), (3, "low"), (4, "close")):
+            _decimal(typed[index], what=name)
+        built = build(typed, ts)
+        if built is None:
+            rejected.append(ts)
+        else:
+            points.append(built)
+    return _merge_points(points), len(rows), in_window, rejected
+
+
+def _object_rows(result: dict[str, object], *, what: str) -> list[dict[str, object]]:
+    rows = result.get("list")
+    if type(rows) is not list:
+        raise MalformedResponse(f"bybit: {what} list не є масивом")
+    parsed: list[dict[str, object]] = []
+    for row in rows:
+        if type(row) is not dict:
+            raise MalformedResponse(f"bybit: елемент {what} не є об'єктом")
+        parsed.append(row)
+    return parsed
 
 
 def _text(row: dict[str, object], key: str) -> str:

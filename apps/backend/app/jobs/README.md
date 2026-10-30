@@ -30,7 +30,7 @@
 | `run_worker` | `worker.py` | цикл: зняти прострочені `RUNNING`, взяти одну `QUEUED`, виконати. Порожня черга або збій БД — пауза `POLL_INTERVAL_MS`; збій БД, коли зупинку вже запитано, — вихід без повтору |
 | `claim_next` | `worker.py` | `FOR UPDATE SKIP LOCKED`. Повертає `(задача, False)`, `(None, False)` якщо черга порожня, `(None, True)` якщо рядок уже записаний `FAILED` (`BAD_PARAMS`) і треба брати наступний без паузи |
 | `fail_stale_jobs` | `worker.py` | `RUNNING`, чий `heartbeat_at_ms` старіший за `STALE_AFTER_MS`, → `FAILED` / `STALE_HEARTBEAT`. Вік рівно поріг ще живий |
-| `handle_backfill`, `default_handlers` | `worker.py` | `backfill_candles` → `app.data.backfill.run_backfill_job`. Словник `handlers=` у `serve` / `run_worker` замінює цей набір, а не доповнює |
+| `handle_backfill`, `handle_derivatives`, `default_handlers` | `worker.py` | `backfill_candles` → `run_backfill_job`; `backfill_derivatives` → `run_derivatives_job`. Словник `handlers=` у `serve` / `run_worker` замінює цей набір, а не доповнює |
 | `open_worker_market` | `worker.py` | публічний `BybitAdapter` режиму `demo` (mainnet без ключів) і `RateLimiter` з роллю `WORKER` |
 | `JobContext.report` | `worker.py` | прогрес `Decimal` у `[0, 1]` і `progress_message` (обрізається до 500 символів); разом оновлює heartbeat |
 | `lower_os_priority` | `worker.py` | POSIX `nice(+NICE_INCREMENT)`; Windows — `BELOW_NORMAL`. Немає прав — попередження в лог, процес працює далі |
@@ -71,7 +71,7 @@ Backfill ідемпотентний, тож повтор безпечний. `ki
 | `STALE_HEARTBEAT` | `RUNNING` без свіжого heartbeat |
 | `UNKNOWN_KIND` | для `kind` немає обробника |
 | `BAD_PARAMS` | `params` — не JSON-об'єкт |
-| `BACKFILL_INCOMPLETE` | біржа відхилила частину символів; решту вже докачано (`result.failed_symbols`) |
+| `BACKFILL_INCOMPLETE` | біржа відхилила частину символів свічок або деривативів; решту вже докачано (`result.failed_symbols`). Свічки: `candles_inserted`, `funding_inserted`. Деривативи: лічильники п'яти рядів |
 | `HANDLER_ERROR` | інший виняток обробника (`result.error_type` — лише ім'я класу) |
 
 Успіх: `progress = 1`, `result` — JSON-об'єкт з обробника або `null`, `error = null`, статус `DONE`.
@@ -113,4 +113,5 @@ Backfill ідемпотентний, тож повтор безпечний. `ki
 | --- | --- | --- |
 | T0.4 | `[x]` | таблиця `jobs` |
 | T1.8 | `[x]` | процес воркера (один на БД, lock `WORKER_LOCK_ID`), `backfill_candles`, прострочений heartbeat |
+| T1.9 | `[x]` | той самий процес виконує `backfill_derivatives` (пріоритет 210, після свічок) |
 | T2.10 | `[ ]` | Optuna як задача воркера |

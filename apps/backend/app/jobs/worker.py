@@ -57,6 +57,12 @@ from app.data.backfill import (
     SessionFactory,
     run_backfill_job,
 )
+from app.data.derivatives import (
+    JOB_KIND_DERIVATIVES,
+    DerivativesBackfillIncomplete,
+    DerivativesSource,
+    run_derivatives_job,
+)
 from app.exchange.bybit import BybitAdapter, ExchangeMode
 from app.exchange.rate_limit import ProcessRole, RateLimiter
 from app.jobs.models import Job
@@ -203,8 +209,30 @@ async def handle_backfill(ctx: JobContext) -> dict[str, int]:
     return {"candles_inserted": stats.candles_inserted, "funding_inserted": stats.funding_inserted}
 
 
+async def handle_derivatives(ctx: JobContext) -> dict[str, int]:
+    """`backfill_derivatives`. `DerivativesBackfillIncomplete` летить далі: цикл запише `FAILED`."""
+    stats = await run_derivatives_job(ctx.sessions, _as_derivatives(ctx.source), ctx.params)
+    return stats.as_dict()
+
+
 def default_handlers() -> dict[str, JobHandler]:
-    return {JOB_KIND_BACKFILL: handle_backfill}
+    return {JOB_KIND_BACKFILL: handle_backfill, JOB_KIND_DERIVATIVES: handle_derivatives}
+
+
+_DERIVATIVE_METHODS: Final = (
+    "fetch_open_interest",
+    "fetch_premium_index",
+    "fetch_mark_price_candles",
+    "fetch_index_price_candles",
+    "fetch_long_short_ratio",
+)
+
+
+def _as_derivatives(source: object) -> DerivativesSource:
+    """`BybitAdapter` вміє і свічки, і деривативи. Джерело лише зі свічками — помилка обробника, не тихий пропуск."""
+    if any(not callable(getattr(source, name, None)) for name in _DERIVATIVE_METHODS):
+        raise TypeError("джерело воркера не вміє читати деривативи")
+    return cast(DerivativesSource, source)
 
 
 def _require_ms(name: str, value: int, *, minimum: int) -> None:
@@ -625,6 +653,21 @@ async def _finish_ok(sessions: SessionFactory, claimed: ClaimedJob, result: Mapp
 
 
 async def _finish_exc(sessions: SessionFactory, claimed: ClaimedJob, exc: BaseException) -> None:
+    if isinstance(exc, DerivativesBackfillIncomplete):
+        _LOG.error(
+            "job_failed",
+            job_id=str(claimed.id),
+            kind=claimed.kind,
+            error=ERROR_BACKFILL_INCOMPLETE,
+            failed_symbols=list(exc.failed_symbols),
+        )
+        await _finish_failed(
+            sessions,
+            claimed.id,
+            error=ERROR_BACKFILL_INCOMPLETE,
+            result={**exc.stats.as_dict(), "failed_symbols": list(exc.failed_symbols)},
+        )
+        return
     if isinstance(exc, BackfillIncomplete):
         _LOG.error(
             "job_failed",

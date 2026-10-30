@@ -52,6 +52,15 @@ def _ohlc_checks(positive: bool) -> tuple[CheckConstraint, ...]:
     return checks
 
 
+def _premium_checks() -> tuple[CheckConstraint, ...]:
+    """Діапазон години premium без `open`: Bybit віддає як `open` close попередньої години (міграція 0004, T1.9)."""
+    return (
+        CheckConstraint("high >= low", name="high_ge_low"),
+        CheckConstraint("high >= close", name="high_ge_close"),
+        CheckConstraint("low <= close", name="low_le_close"),
+    )
+
+
 class Candle(Base):
     """Закрита свічка (ТЗ §4.1). Незакриті свічки в БД не потрапляють (`is_closed` завжди true)."""
 
@@ -167,10 +176,13 @@ class OpenInterest(Base):
 
 
 class PremiumIndex(Base):
-    """Свічки premium index (ТЗ §4.4). Значення можуть бути від'ємними. `ts_ms` — час відкриття свічки."""
+    """Свічки premium index (ТЗ §4.4). Значення можуть бути від'ємними. `ts_ms` — час відкриття свічки.
+
+    `open` — close попередньої години, тож може лежати поза `[low, high]` цієї (`docs/decisions/0009-premium-open.md`).
+    """
 
     __tablename__ = "premium_index"
-    __table_args__ = _series_args(*_ohlc_checks(positive=False))
+    __table_args__ = _series_args(*_premium_checks())
 
     exchange: Mapped[str] = mapped_column(Text)
     symbol: Mapped[str] = mapped_column(Text)

@@ -45,6 +45,8 @@ TimestampMs = Annotated[int, Field(ge=0)]
 Price = Annotated[Decimal, Field(gt=0)]
 Qty = Annotated[Decimal, Field(gt=0)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0)]
+# Частка long/short: біржа віддає рядок у [0, 1] (buyRatio / sellRatio).
+UnitRatio = Annotated[Decimal, Field(ge=0, le=1)]
 Symbol = Annotated[str, Field(pattern=SYMBOL_RE)]
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 ClientOrderId = Annotated[str, Field(pattern=CLIENT_ORDER_ID_RE)]
@@ -142,6 +144,13 @@ class MarginMode(StrEnum):
 
     ISOLATED = "ISOLATED"
     CROSS = "CROSS"
+
+
+class DerivativePriceType(StrEnum):
+    """Ряд `mark_index_candles.price_type` (ТЗ §15). Значення збігаються з `PRICE_TYPES` у `app.data.models`."""
+
+    MARK = "mark"
+    INDEX = "index"
 
 
 class Timeframe(StrEnum):
@@ -359,6 +368,92 @@ class FundingRate(_Model):
     symbol: Symbol
     funding_time_ms: TimestampMs
     rate: Decimal
+
+
+def _aligned_to_timeframe(ts_ms: int, timeframe: Timeframe) -> None:
+    if ts_ms % timeframe.duration_ms != 0:
+        raise ValueError("ts_ms не вирівняний за таймфреймом")
+
+
+def _finite_ohlc(*, open_: Decimal, high: Decimal, low: Decimal, close: Decimal) -> None:
+    for name, value in (("open", open_), ("high", high), ("low", low), ("close", close)):
+        if not value.is_finite():
+            raise ValueError(f"{name} має бути скінченним")
+    if high < low or high < open_ or high < close or low > open_ or low > close:
+        raise ValueError("OHLC неузгоджений")
+
+
+def _finite_hour_range(*, open_: Decimal, high: Decimal, low: Decimal, close: Decimal) -> None:
+    """Як `_finite_ohlc`, але `open` не мусить лежати в `[low, high]`."""
+    for name, value in (("open", open_), ("high", high), ("low", low), ("close", close)):
+        if not value.is_finite():
+            raise ValueError(f"{name} має бути скінченним")
+    if high < low or high < close or low > close:
+        raise ValueError("high/low/close неузгоджені")
+
+
+class _DerivativePoint(_Model):
+    """Точка ряду деривативів. `ts_ms` — початок інтервалу, як `startTime` свічки Bybit."""
+
+    symbol: Symbol
+    timeframe: Timeframe
+    ts_ms: TimestampMs
+
+    @model_validator(mode="after")
+    def _on_grid(self) -> _DerivativePoint:
+        _aligned_to_timeframe(self.ts_ms, self.timeframe)
+        return self
+
+    @property
+    def close_time_ms(self) -> int:
+        """Кінець інтервалу (не включно). Точка відома, коли `close_time_ms ≤ now_ms()`."""
+        return self.ts_ms + self.timeframe.duration_ms
+
+
+class OpenInterest(_DerivativePoint):
+    """Open interest на початок інтервалу. Для linear Bybit це сума двох сторін у базовій монеті, ≥ 0."""
+
+    open_interest: NonNegativeDecimal
+
+
+class PremiumIndex(_DerivativePoint):
+    """Свічка premium index. Значення безрозмірні і можуть бути від'ємними або нулем.
+
+    Bybit віддає як `open` close попередньої години, а `high`/`low`/`close` — лише за цю годину, тож `open` може
+    лежати поза `[low, high]`. Перевіряється лише діапазон години (`docs/decisions/0009-premium-open.md`).
+    """
+
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+    @model_validator(mode="after")
+    def _ohlc(self) -> PremiumIndex:
+        _finite_hour_range(open_=self.open, high=self.high, low=self.low, close=self.close)
+        return self
+
+
+class MarkIndexCandle(_DerivativePoint):
+    """Mark- або index-свічка. Ціни додатні: нуль і від'ємне значення біржа для цих рядів не віддає."""
+
+    price_type: DerivativePriceType
+    open: Price
+    high: Price
+    low: Price
+    close: Price
+
+    @model_validator(mode="after")
+    def _ohlc(self) -> MarkIndexCandle:
+        _finite_ohlc(open_=self.open, high=self.high, low=self.low, close=self.close)
+        return self
+
+
+class LongShortRatio(_DerivativePoint):
+    """Частки рахунків у long (`buy_ratio`) і short (`sell_ratio`), кожна в [0, 1]."""
+
+    buy_ratio: UnitRatio
+    sell_ratio: UnitRatio
 
 
 # --- Запити ---

@@ -1004,4 +1004,8 @@ qty        = floor_to_lot( min(qty_risk, qty_lev, qty_expo, qty_symbol_cap) )
 - актуальні комісії, а також формат і довжина `orderLinkId`;
 - тип виконання TP/SL у режимі `Full` (market) і фактичний slippage на стопах;
 - які з потрібних ендпоінтів і WS-потоків доступні в Demo Trading (ордери, trading-stop, позиції, execution list, приватний WS, перевірка дозволів ключа);
-- глибина історії open interest, premium index і long/short ratio; формат WS-потоку ліквідацій.
+- формат WS-потоку ліквідацій.
+
+**Уже перевірено** (рішення `docs/decisions/0010-derivatives-history-verified.md`):
+
+- глибина історії open interest, premium index, mark- і index-свічок і long/short ratio — на Testnet і mainnet, 2026-10-30, задача T1.9; результати — `docs/data/derivatives-history.md`. Перша точка ряду не збігається з `launchTime` інструмента; години без даних лишаються прогалинами (розділ 4.2). `open` свічки premium index — це close попередньої години (`docs/decisions/0009-premium-open.md`).

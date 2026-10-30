@@ -16,7 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from app.api.models import AuditLog
-from app.data.models import Candle, DataGap, MarkIndexCandle
+from app.data.models import Candle, DataGap, MarkIndexCandle, PremiumIndex
 from app.exchange.models import ExchangeAccount
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening, ModelArtifact
 from app.risk.models import EmergencyRun, LedgerEntry, RiskConfig, SystemState
@@ -642,6 +642,39 @@ async def test_mark_and_index_candles_coexist(conn: AsyncConnection) -> None:
     await conn.execute(insert(MarkIndexCandle).values(price_type="mark", **base))
     await conn.execute(insert(MarkIndexCandle).values(price_type="index", **base))
     await expect_violation(conn, insert(MarkIndexCandle).values(price_type="mark", **base), "pk_mark_index_candles")
+
+
+def premium_values(**overrides: Any) -> dict[str, Any]:
+    # Testnet BTCUSDT 2024-06-01 00:00 UTC: open — close попередньої години, нижче за low цієї (0004, T1.9).
+    values: dict[str, Any] = {
+        "exchange": "bybit",
+        "symbol": SYMBOL,
+        "interval": "1h",
+        "ts_ms": T0,
+        "open": Decimal("0.00046096"),
+        "high": Decimal("0.00052523"),
+        "low": Decimal("0.00048958"),
+        "close": Decimal("0.00048958"),
+    }
+    values.update(overrides)
+    return values
+
+
+async def test_premium_open_may_lie_outside_the_hour_range(conn: AsyncConnection) -> None:
+    await conn.execute(insert(PremiumIndex).values(premium_values()))
+    await conn.execute(insert(PremiumIndex).values(premium_values(ts_ms=T0 + HOUR_MS, open=Decimal("0.001"))))
+    assert await ok(conn, select(func.count()).select_from(PremiumIndex)) == 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "constraint"),
+    [
+        ({"close": Decimal("0.0006")}, "ck_premium_index_high_ge_close"),
+        ({"close": Decimal("0.0004")}, "ck_premium_index_low_le_close"),
+    ],
+)
+async def test_premium_checks(conn: AsyncConnection, overrides: dict[str, Any], constraint: str) -> None:
+    await expect_violation(conn, insert(PremiumIndex).values(premium_values(**overrides)), constraint)
 
 
 async def test_data_gap_is_recorded_once(conn: AsyncConnection) -> None:

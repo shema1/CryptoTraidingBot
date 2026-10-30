@@ -33,6 +33,18 @@ FUNCTIONS = {
     "ctb_require_confirmed_audit",
     "ctb_api_idempotency_guard",
 }
+# CHECK `premium_index` про діапазон години. 0001: open теж у [low, high]; 0004 (T1.9): open — close попередньої
+# години (так рахує Bybit), обмежені лише high, low і close.
+PREMIUM_CHECKS_0001 = {
+    "ck_premium_index_high_ge_low": "CHECK ((high >= low))",
+    "ck_premium_index_high_ge_open_close": "CHECK (((high >= open) AND (high >= close)))",
+    "ck_premium_index_low_le_open_close": "CHECK (((low <= open) AND (low <= close)))",
+}
+PREMIUM_CHECKS_0004 = {
+    "ck_premium_index_high_ge_low": "CHECK ((high >= low))",
+    "ck_premium_index_high_ge_close": "CHECK ((high >= close))",
+    "ck_premium_index_low_le_close": "CHECK ((low <= close))",
+}
 
 
 async def _scalars(url: URL, sql: str) -> list[object]:
@@ -40,6 +52,34 @@ async def _scalars(url: URL, sql: str) -> list[object]:
     try:
         async with engine.connect() as conn:
             return list((await conn.execute(text(sql))).scalars())
+    finally:
+        await engine.dispose()
+
+
+async def _execute(url: URL, sql: str) -> None:
+    engine = make_engine(url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(sql))
+    finally:
+        await engine.dispose()
+
+
+async def _premium_range_checks(url: URL) -> dict[str, str]:
+    """CHECK `premium_index` про high/low: ім'я → вираз, як його зберіг PostgreSQL."""
+    rows = await _rows(
+        url,
+        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint"
+        " WHERE conrelid = 'premium_index'::regclass AND contype = 'c' AND conname ~ '_(high|low)_'",
+    )
+    return {str(name): str(definition) for name, definition in rows}
+
+
+async def _rows(url: URL, sql: str) -> list[tuple[object, ...]]:
+    engine = make_engine(url)
+    try:
+        async with engine.connect() as conn:
+            return [tuple(row) for row in (await conn.execute(text(sql))).all()]
     finally:
         await engine.dispose()
 
@@ -74,6 +114,20 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
     expected = set(load_models().tables)
     assert await _public_tables(migrated_db) == expected
     assert await _functions(migrated_db) >= FUNCTIONS
+    assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0004
+
+    # 0004 (T1.9): open premium не обмежений [low, high]. Відкат повертає старі CHECK і прибирає рядки,
+    # які під ними не могли б існувати; узгоджений рядок лишається.
+    await _execute(
+        migrated_db,
+        "INSERT INTO premium_index (exchange, symbol, interval, ts_ms, open, high, low, close) VALUES"
+        " ('bybit', 'BTC/USDT:USDT', '1h', 0, 0.0006, 0.0005, 0.0004, 0.0004),"
+        " ('bybit', 'BTC/USDT:USDT', '1h', 3600000, 0.00045, 0.0005, 0.0004, 0.0004)",
+    )
+    await run_alembic(migrated_db, "downgrade", "-1")
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0003"]
+    assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0001
+    assert await _scalars(migrated_db, "SELECT ts_ms FROM premium_index") == [3600000]
 
     # 0003 (T1.7): колонка `instruments.launch_time_ms`. Таблиці ті самі.
     await run_alembic(migrated_db, "downgrade", "-1")
@@ -93,7 +147,8 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
 
     await run_alembic(migrated_db, "upgrade", "head")
     assert await _public_tables(migrated_db) == expected
-    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0003"]
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0004"]
+    assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0004
 
 
 @pytest.mark.asyncio

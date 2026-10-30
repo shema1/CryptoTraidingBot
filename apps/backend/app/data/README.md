@@ -6,7 +6,8 @@
 ліквідацій (окремий процес `python -m app.data.collector`), виявлення прогалин без інтерполяції, контроль
 синхронізації часу.
 
-> Заплановано: T1.9, T1.10. Backfill свічок 1h і funding — T1.4 (`backfill.py`). Прогалини — T1.5 (`gaps.py`).
+> Заплановано: T1.10 (колектор ліквідацій). Backfill свічок 1h і funding — T1.4 (`backfill.py`).
+> Backfill деривативів — T1.9 (`derivatives.py`). Прогалини — T1.5 (`gaps.py`).
 > Контроль часу — T1.6 (`time_sync.py`); запуск у торговому процесі й перехід ботів у `RECONCILING` — T5.1.
 
 ## Розділи ТЗ
@@ -32,7 +33,11 @@
 | `FUNDING_WINDOW_MS`, `INSERT_CHUNK_ROWS`, `SYNC_RETRY_BASE_MS` | `backfill.py` | вікно funding за виклик (60 діб); рядків в одному INSERT (1000, ліміт asyncpg — 32767 параметрів); перша пауза повтору (30 с) |
 | `BackfillStats`, `SyncResult`, `BackfillIncomplete` | `backfill.py` | скільки рядків додано; id задачі, символи, віддані воркеру, і `failed_symbols`; виняток задачі з `failed_symbols` і `stats` |
 | `GapRange`, `find_gaps`, `window_has_gap`, `plan_open_gaps` | `gaps.py` | напіввідкритий інтервал; дірки сітки; чи вікно їх перетинає; зведення після скану |
-| `detect_candle_gaps`, `sync_open_gaps`, `GapSync` | `gaps.py` | записати дірки свічок; звести відкриті рядки будь-якого `source` (його викличуть T1.9 і T1.10); що змінилось за прохід |
+| `sync_derivatives`, `run_derivatives_job`, `enqueue_derivatives_job` | `derivatives.py` | прохід `research_symbols`; задача воркера; поставити `jobs.kind = backfill_derivatives` (активна задача з цим ключем лише одна) |
+| `DerivativesSync`, `DerivativesSync.from_settings` | `derivatives.py` | той самий розклад, що в `MarketDataSync`, але лише `research_symbols` і п'ять рядів деривативів |
+| `JOB_KIND_DERIVATIVES`, `DERIVATIVES_DEDUP_KEY`, `DERIVATIVES_JOB_PRIORITY`, `DERIVATIVES_TIMEFRAME` | `derivatives.py` | `backfill_derivatives`, ключ дедуплікації, пріоритет 210 (після свічок з пріоритетом 200), інтервал `1h` |
+| `DerivativesStats`, `DerivativesSyncResult`, `DerivativesBackfillIncomplete` | `derivatives.py` | скільки рядків додано по рядах; id задачі, символи воркера і `failed_symbols`; виняток задачі |
+| `detect_candle_gaps`, `sync_open_gaps`, `GapSync` | `gaps.py` | записати дірки свічок; звести відкриті рядки будь-якого `source` (деривативи вже викликають його; ліквідації — T1.10); що змінилось за прохід |
 | `has_open_gap`, `open_gaps_in_window` | `gaps.py` | чи є відкрита прогалина у вікні `[start_ms, end_ms)` і які саме |
 | `settled_end_ms`, `CANDLE_SETTLE_MS` | `gaps.py` | кінець сітки, яку вже можна перевіряти; запас після закриття свічки (`KLINE_FINALITY_MARGIN_MS` 500 мс + допуск годинника `CLOCK_DRIFT_LIMIT_MS` 1 с з `app/core/clock.py` = 1500 мс) |
 | `is_open_gap_conflict` | `gaps.py` | чи `IntegrityError` — зіткнення двох процесів на `uq_data_gaps_open` (а не інша помилка цілісності) |
@@ -97,10 +102,41 @@
 
 `has_open_gap` / `open_gaps_in_window` читають лише відкриті рядки. `False` означає «відкритого рядка в цьому вікні
 немає», а не «ряд уже перевіряли»: перед тим, як трактувати його як дозвіл торгувати, вікно має пройти детектор
-(backfill викликає його після проходу свічок). Інші джерела (`open_interest`, `mark_candles`, …) пишуть тим самим
-`sync_open_gaps`; до T1.9/T1.10 їхніх рядків немає, і це не прогалина свічок. Два процеси, що зводять один ряд
+(backfill викликає його після проходу свічок). Джерела деривативів (`open_interest`, `premium_index`,
+`mark_candles`, `index_candles`, `long_short`) пише `derivatives.py` тим самим `sync_open_gaps`. `liquidations` —
+T1.10; поки колектора немає, рядків цього джерела немає, і це не прогалина свічок. Два процеси, що зводять один ряд
 одночасно, можуть зіткнутися на `uq_data_gaps_open` (`IntegrityError`): транзакція відкочується, а виклик розпізнає
-це через `is_open_gap_conflict` і повторює (як `_record_candle_gaps` у backfill), не зупиняючи інші ряди.
+це через `is_open_gap_conflict` і повторює (як `_record_candle_gaps` у backfill і `_record_gaps` у derivatives),
+не зупиняючи інші ряди.
+
+## Деривативи (T1.9, ТЗ §4.4)
+
+П'ять рядів 1h для `research_symbols`: open interest, premium index, mark-свічки, index-свічки, long/short ratio.
+Методи читання є лише в `BybitAdapter` (не в протоколі `ExchangeAdapter`): усі REST ідуть через rate limiter,
+пріоритет `DATA`, група `MARKET`. Глибина історії ендпоінтів — `docs/data/derivatives-history.md`. Код не підставляє
+дату «раніше біржа не віддає»: сітка починається з `max(BACKFILL_START_MS, лістинг)`, а відсутня точка після
+лістингу лишається відкритою прогалиною.
+
+Курсор ряду — `max(ts_ms)` у БД. Вставка `ON CONFLICT DO NOTHING`: повторний прохід не змінює кількість рядків і не
+перезаписує вже збережене значення. Точка пишеться, лише якщо інтервал закритий за локальним годинником
+(`close_time_ms ≤ now`). Порожнє вікно курсор не зупиняє: дані можуть починатися пізніше за лістинг, і ця дірка
+має лишитися видимою. Внутрішню дірку позаду курсора цей прохід не закриває.
+
+Вікно одного коміту — одна сторінка ендпоінта (open interest 200, kline 1000, long/short 500 годин). Символ, у якого
+хоч один ряд довший за `INLINE_MAX_BARS` (168 годин), цілком іде в одну задачу `backfill_derivatives` (пріоритет 210,
+окремий `dedup_key` від свічок). Її виконує `python -m app.jobs.worker`. Збій біржі на одному символі не зупиняє
+інші: прохід розкладу повертає `failed_symbols`, задача кидає `DerivativesBackfillIncomplete` (у `jobs.error` —
+той самий код `BACKFILL_INCOMPLETE`, у `result` — лічильники рядів і `failed_symbols`).
+
+Параметри задачі: `symbols`, `interval` (`1h`), `start_ms`. Кінець діапазону — годинник у момент виконання.
+`DerivativesSync.from_settings` бере лише `RESEARCH_SYMBOLS` (торговий символ, якого немає в цьому списку, не
+качається). Виклик із торгового процесу — разом із `MarketDataSync` (T5); окремий entrypoint не додавався.
+
+`open` premium — close попередньої години й може лежати поза `[low, high]`: така свічка пишеться як є
+(`docs/decisions/0009-premium-open.md`, міграція 0004). Зламаний діапазон години premium (`high < low`, `close` поза
+`[low, high]`), неузгоджений OHLC і недодатну ціну mark/index адаптер не виправляє і не повертає: у БД дірка, у лог
+`derivative_point_rejected`. Зберігається `openInterest` (сума сторін), не `singleOpenInterest`. Mark і index —
+окремі `price_type` в одній таблиці й окремі прогалини.
 
 ## Час (T1.6, ТЗ §4.3)
 
@@ -185,13 +221,15 @@ T3.2); правило біржі `server_time − recv_window ≤ timestamp < se
   (рядок зберігає id і `detected_at_ms`, межі оновлюються, T1.5), а закрита не заважає зареєструвати нову.
 - `funding_rates` — PK `(exchange, symbol, funding_time_ms)`, `rate` (може бути від'ємним).
 - Деривативи — hypertables (chunk 30 днів, без compression), PK `(exchange, symbol, interval, ts_ms)`:
-  `open_interest` (`open_interest ≥ 0`), `premium_index` (OHLC, можуть бути від'ємними), `long_short_ratio`
+  `open_interest` (`open_interest ≥ 0`), `premium_index` (OHLC, можуть бути від'ємними; CHECK лише
+  `high ≥ low`, `low ≤ close ≤ high`, `open` не обмежений — міграція 0004, рішення 0009), `long_short_ratio`
   (`buy_ratio`, `sell_ratio` ∈ [0, 1]), `liquidations_hourly` (`long_/short_` `count`, `qty` у базовій валюті,
   `notional` у USDT, усе ≥ 0; `ts_ms` — початок години). `mark_index_candles` — PK
   `(exchange, symbol, price_type, interval, ts_ms)`, `price_type` = `mark` / `index` (`docs/decisions/0005-schema-t0-4.md`).
 - Таймфрейм/інтервал — `^[0-9]+(m|min|h|d|w)$`; символ — канонічний CCXT (`app.core.db.SYMBOL_RE`).
 
-Схема створюється міграцією `migrations/versions/0001_initial_schema.py`; обмеження й тригери перевіряють `tests/db/test_constraints.py`, `tests/db/test_guards.py` і `tests/db/test_migrations.py`.
+Схема створюється міграцією `migrations/versions/0001_initial_schema.py`; CHECK-и `premium_index` замінює
+`0004_premium_open_unbounded.py`; обмеження й тригери перевіряють `tests/db/test_constraints.py`, `tests/db/test_guards.py` і `tests/db/test_migrations.py`.
 
 ## Стан реалізації
 
@@ -202,5 +240,5 @@ T3.2); правило біржі `server_time − recv_window ≤ timestamp < se
 | T1.5 | `[x]` | детектор прогалин свічок → `data_gaps`; запит вікна `[start, end)`; без інтерполяції; запас остаточності останньої свічки; повтор при зіткненні процесів |
 | T1.6 | `[x]` | `time_sync.py`: розбіжність з `fetch_time` (старт, 10 хв, з похибкою RTT і старіння), детектор стрибків щосекунди, епохи стрибків і квитки звірки по акаунтах, `request_recheck`, `RECV_WINDOW_MS` |
 | T1.7 | `[x]` | початок сітки свічок від `launch_time_ms` (найраніший серед режимів); funding без цього зсуву |
-| T1.9 | `[ ]` | Backfill даних деривативів |
+| T1.9 | `[x]` | інкрементальний backfill п'яти рядів деривативів 1h для `research_symbols`; довга історія — `backfill_derivatives`; прогалини в `data_gaps` |
 | T1.10 | `[ ]` | Колектор ліквідацій |

@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -19,11 +19,17 @@ from app.core.db import create_engine, session_factory
 from app.data.backfill import (
     BACKFILL_DEDUP_KEY,
     JOB_KIND_BACKFILL,
+    MarketDataSource,
     SessionFactory,
     backfill_job_params,
     enqueue_backfill_job,
 )
+from app.data.derivatives import JOB_KIND_DERIVATIVES, derivatives_job_params
 from app.data.models import Candle, DataGap, FundingRate
+from app.data.models import LongShortRatio as StoredRatio
+from app.data.models import MarkIndexCandle as StoredMark
+from app.data.models import OpenInterest as StoredOpenInterest
+from app.data.models import PremiumIndex as StoredPremium
 from app.exchange.types import Candle as ExchangeCandle
 from app.exchange.types import FundingRate as ExchangeFunding
 from app.exchange.types import Timeframe
@@ -40,8 +46,10 @@ from app.jobs.worker import (
     JobContext,
     claim_next,
     handle_backfill,
+    handle_derivatives,
     run_worker,
 )
+from tests.data.test_derivatives_backfill import Book, _fill
 from tests.exchange.factories import FAKE_NOW_MS, OTHER_SYMBOL, SYMBOL, hourly_candle, make_fake
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -63,6 +71,10 @@ async def _wipe(engine: AsyncEngine) -> None:
         await conn.execute(delete(DataGap))
         await conn.execute(delete(Candle))
         await conn.execute(delete(FundingRate))
+        await conn.execute(delete(StoredOpenInterest))
+        await conn.execute(delete(StoredPremium))
+        await conn.execute(delete(StoredMark))
+        await conn.execute(delete(StoredRatio))
         await conn.execute(delete(Job))
 
 
@@ -337,6 +349,38 @@ async def test_backfill_job_is_done_and_an_incomplete_one_is_failed(
     assert failed["error"] == ERROR_BACKFILL_INCOMPLETE
     assert failed["result"]["failed_symbols"] == [UNKNOWN_SYMBOL]
     assert failed["result"]["candles_inserted"] == 1
+
+
+async def test_incomplete_derivatives_job_is_failed_and_keeps_the_other_symbol(
+    db: tuple[AsyncEngine, SessionFactory], fake_clock: FakeClock
+) -> None:
+    _engine, sessions = db
+    book = Book()
+    book.fail.add(SYMBOL)
+    _fill(book, [FAKE_NOW_MS - 2 * HOUR_MS], OTHER_SYMBOL)
+    job_id = await _add(
+        sessions,
+        kind=JOB_KIND_DERIVATIVES,
+        params=derivatives_job_params((SYMBOL, OTHER_SYMBOL), FAKE_NOW_MS - 2 * HOUR_MS),
+        dedup_key="backfill_derivatives",
+    )
+    stop = asyncio.Event()
+
+    async def routed(ctx: JobContext) -> dict[str, int]:
+        try:
+            return await handle_derivatives(ctx)
+        finally:
+            stop.set()
+
+    # `run_worker` типізований під джерело свічок; обробник деривативів сам перевіряє методи (`_as_derivatives`).
+    source = cast(MarketDataSource, book)
+    await run_worker(sessions, source, handlers={JOB_KIND_DERIVATIVES: routed}, stop=stop, sleep=_instant(fake_clock))
+    row = await _load(sessions, job_id)
+    assert row["status"] == "FAILED"
+    assert row["error"] == ERROR_BACKFILL_INCOMPLETE
+    assert row["result"]["failed_symbols"] == [SYMBOL]
+    assert row["result"]["open_interest"] == 1
+    assert row["result"]["premium_index"] == 1
 
 
 async def test_handler_error_is_failed_without_the_exception_text(

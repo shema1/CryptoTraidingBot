@@ -152,6 +152,11 @@ FIXED_METHOD_PRIORITY: Final[Mapping[str, RequestPriority]] = MappingProxyType(
         "fetch_instruments": RequestPriority.DATA,
         "fetch_candles": RequestPriority.DATA,
         "fetch_funding_history": RequestPriority.DATA,
+        "fetch_open_interest": RequestPriority.DATA,
+        "fetch_premium_index": RequestPriority.DATA,
+        "fetch_mark_price_candles": RequestPriority.DATA,
+        "fetch_index_price_candles": RequestPriority.DATA,
+        "fetch_long_short_ratio": RequestPriority.DATA,
         "set_position_protection": RequestPriority.PROTECTION,
     }
 )
