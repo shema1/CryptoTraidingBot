@@ -19,6 +19,10 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36,<2.1", # моделі БД і async-сесії (app/core/db.py, T0.4)
     "structlog>=25.1,<26", # JSON-логи з маскуванням секретів (core/logging.py, T0.3)
     "uvicorn>=0.50,<1", # ASGI-сервер API у торговому процесі (app/api/server.py, T0.7); без extras
+    # Фічі (app/ml/features.py, T2.1). Pandas свідомо не підключено: вікна й старші ТФ рахуються індексами,
+    # без shift(-n), bfill і resample. Стеля <2.5: 2.5 уже без Python 3.11, і lock розщеплювався на дві версії —
+    # навчання й live під різними Python рахували б фічі різним numpy.
+    "numpy>=2.1,<2.5",
 ]
 
 [dependency-groups]
