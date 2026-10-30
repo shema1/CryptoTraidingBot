@@ -36,7 +36,8 @@
 Якщо Fable недоступна на вашому тарифі — змініть `model: fable` на `model: opus` у `.claude/agents/trading-safety-reviewer.md`.
 
 ## Hooks: що блокується
-- **Заборонено:** читати/редагувати `.env*` (крім `.env.example`), використовувати `BYBIT_LIVE_API_KEY/SECRET` у командах, ключі `*.pem/*.key`; звертатися до mainnet Bybit (`api.bybit.com`, `stream.bybit.com`); запуск з `TRADING_MODE=live` / `BYBIT_TESTNET=false`; `--force-takeover`; `docker compose down -v`, видалення volume; `rm -rf` кореня, `models/`, `migrations/`; force-push; редагування закомічених міграцій, артефактів у `models/`, згенерованих `.cursor/rules/*.mdc`.
+- **Заборонено:** читати/редагувати `.env*` (крім `.env.example`), використовувати `BYBIT_LIVE_API_KEY/SECRET` у командах, ключі `*.pem/*.key`; запуск з `TRADING_MODE=live` / `BYBIT_TESTNET=false`; `--force-takeover`; `docker compose down -v`, видалення volume; `rm -rf` кореня, `models/`, `migrations/`; force-push; редагування закомічених міграцій, артефактів у `models/`, згенерованих `.cursor/rules/*.mdc`.
+- **Не блокується:** звернення до mainnet-адрес Bybit (`api.bybit.com`, `stream.bybit.com`, `api.bytick.com`) — правило знято 2026-10-30 на вимогу власника. Live-ключі та режим `live` лишаються заблокованими (пункт вище).
 - **З підтвердженням:** `DROP/TRUNCATE`, `alembic downgrade`, `git reset --hard`, інший `rm -r`, `pip install` поза lock-файлом, зміна `AppInfo.md`.
 - **Після редагування `.py`:** `ruff format` + `ruff check`; проблеми повертаються агенту для виправлення.
 - **Після редагування `.claude/rules/*.md`:** автоматично перегенеровуються правила Cursor.

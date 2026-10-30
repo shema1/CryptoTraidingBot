@@ -30,8 +30,6 @@ SHELL_RULES: list[tuple[str, str, str]] = [
      "Доступ до .env заборонено: там секрети. Використовуйте .env.example або попросіть користувача."),
     (r"--force-takeover", "deny",
      "--force-takeover виконується лише людиною вручну після перевірки, що старий процес не працює (ТЗ §6.4)."),
-    (r"\b(?:api|api2|stream)\.bybit\.com\b|\bapi\.bytick\.com\b", "deny",
-     "Звернення до MAINNET Bybit заборонене для агента. Використовуйте testnet (api-testnet / stream-testnet.bybit.com) або demo (api-demo / stream-demo.bybit.com)."),
     (r"\b(?:TRADING_MODE|BOT_MODE|MODE)=['\"]?live\b|\bBYBIT_TESTNET=['\"]?(?:false|0)\b|--mode[= ]live\b", "deny",
      "Запуск у режимі LIVE агентом заборонений. Live запускає лише людина через UI з підтвердженням."),
     (r"\bBYBIT_LIVE_API_(?:KEY|SECRET)\b", "deny",
