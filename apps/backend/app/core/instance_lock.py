@@ -16,6 +16,10 @@ PostgreSQL advisory lock не дає запустити другий екзем�
 
 Lock діє в межах однієї БД (`POSTGRES_DB`): інша БД чи інший комп'ютер його не бачать
 (захист між комп'ютерами — `allowed_host_id`, T5.1).
+
+Той самий механізм з ключем `WORKER_LOCK_ID` і `application_name` `ctb-worker pid=N` тримає воркер задач
+(`app/jobs/worker.py`, `docs/decisions/0008-single-worker.md`): на одній БД працює лише один воркер, бо частка
+rate limit воркера (ТЗ §6.5) розрахована на один процес. Перехоплення для воркера немає.
 """
 
 from __future__ import annotations
@@ -49,6 +53,8 @@ __all__ = [
     "LOCK_NAMESPACE",
     "RETRY_INTERVAL_MS",
     "TERMINATE_WAIT_MS",
+    "WORKER_APPLICATION_NAME_PREFIX",
+    "WORKER_LOCK_ID",
     "Connector",
     "InstanceLock",
     "InstanceLockError",
@@ -70,6 +76,8 @@ __all__ = [
 # Зміна ключа = старий і новий код не бачать один одного, тож лише свідомо.
 LOCK_NAMESPACE: Final = 0x63746200  # "ctb\0"
 BACKEND_LOCK_ID: Final = 1  # торговий процес
+WORKER_LOCK_ID: Final = 2  # воркер задач: один процес на БД (частка rate limit ТЗ §6.5)
+# Інший advisory-простір — знімок інструментів (`app/exchange/instruments.py`).
 
 # Серверні keepalive сесії lock: PostgreSQL виявляє мертвого клієнта за idle + interval × count секунд.
 KEEPALIVE_IDLE_S: Final = 10
@@ -90,7 +98,11 @@ _CLOSE_TIMEOUT_S: Final = 5.0
 
 # `application_name` сесії lock: за ним оператор знаходить процес ОС (`client_addr` за Docker — адреса шлюзу).
 APPLICATION_NAME_PREFIX: Final = "ctb-backend"
-_APPLICATION_NAME_RE: Final = re.compile(r"ctb-backend pid=(\d{1,10})")
+WORKER_APPLICATION_NAME_PREFIX: Final = "ctb-worker"
+_APPLICATION_NAME_PREFIXES: Final = (APPLICATION_NAME_PREFIX, WORKER_APPLICATION_NAME_PREFIX)
+_APPLICATION_NAME_RE: Final = re.compile(
+    "(?:" + "|".join(re.escape(prefix) for prefix in _APPLICATION_NAME_PREFIXES) + r") pid=(\d{1,10})"
+)
 
 _TAKEOVER_ACTOR: Final = "cli"
 _TAKEOVER_TARGET: Final = "backend"
@@ -232,9 +244,16 @@ class TakeoverRefused(InstanceLockError):
         super().__init__(f"перехоплення lock не виконано: {reason}")
 
 
-def application_name(pid: int) -> str:
+def application_name(pid: int, *, prefix: str = APPLICATION_NAME_PREFIX) -> str:
     """`application_name` сесії lock: ASCII, ≤ 63 символів (довші PostgreSQL обрізає)."""
-    return f"{APPLICATION_NAME_PREFIX} pid={pid}"
+    _check_prefix(prefix)
+    return f"{prefix} pid={pid}"
+
+
+def _check_prefix(prefix: str) -> None:
+    # Інший префікс `parse_client_os_pid` не розпізнав би: у лозі власника зник би pid процесу ОС.
+    if prefix not in _APPLICATION_NAME_PREFIXES:
+        raise ValueError(f"application_name prefix має бути одним з {_APPLICATION_NAME_PREFIXES}: {prefix!r}")
 
 
 def parse_client_os_pid(name: str | None) -> int | None:
@@ -245,10 +264,10 @@ def parse_client_os_pid(name: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def lock_server_settings(pid: int | None = None) -> dict[str, str]:
+def lock_server_settings(pid: int | None = None, *, prefix: str = APPLICATION_NAME_PREFIX) -> dict[str, str]:
     """Параметри сесії lock, що передаються серверу при підключенні (`server_settings` asyncpg)."""
     return {
-        "application_name": application_name(os.getpid() if pid is None else pid),
+        "application_name": application_name(os.getpid() if pid is None else pid, prefix=prefix),
         "tcp_keepalives_idle": str(KEEPALIVE_IDLE_S),
         "tcp_keepalives_interval": str(KEEPALIVE_INTERVAL_S),
         "tcp_keepalives_count": str(KEEPALIVE_COUNT),
@@ -298,7 +317,7 @@ def _holder(row: Mapping[str, object]) -> LockHolder:
 
 
 class InstanceLock:
-    """Advisory lock торгового процесу на окремій сесії PostgreSQL.
+    """Advisory lock процесу (торговий — `BACKEND_LOCK_ID`, воркер — `WORKER_LOCK_ID`) на окремій сесії PostgreSQL.
 
     Життєвий цикл: `acquire()` → `run_exclusive()` (робота під `watch()`) → `release()`. Один екземпляр — одна спроба
     володіння; після втрати чи звільнення новий lock береться новим процесом (новий старт = звірка, ТЗ §11.1).
@@ -309,11 +328,14 @@ class InstanceLock:
         url: URL,
         *,
         lock_id: int = BACKEND_LOCK_ID,
+        application_name_prefix: str = APPLICATION_NAME_PREFIX,
         connect: Connector = connect_lock_session,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        _check_prefix(application_name_prefix)
         self._url = url
         self._key = (LOCK_NAMESPACE, lock_id)
+        self._prefix = application_name_prefix
         self._connect = connect
         self._sleep = sleep
         self._conn: LockConnection | None = None
@@ -487,7 +509,7 @@ class InstanceLock:
         if self._conn is not None and not self._conn.is_closed():
             return self._conn
         self._drop_connection()
-        conn = await self._connect(self._url, server_settings=lock_server_settings())
+        conn = await self._connect(self._url, server_settings=lock_server_settings(prefix=self._prefix))
         self._closed = asyncio.Event()
         self._conn = conn
         conn.add_termination_listener(self._on_connection_closed)

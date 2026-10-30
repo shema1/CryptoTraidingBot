@@ -62,7 +62,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 | `LOG_CONSOLE` | `true` | `false` для служби launchd/systemd (stderr-файл не ротується) |
 | `POSTGRES_HOST`, `POSTGRES_PORT` | `127.0.0.1`, `5432` | БД на іншому локальному порту (хост — лише loopback) |
 | `POSTGRES_DB`, `POSTGRES_USER` | `ctb`, `ctb` | майже ніколи; тестова БД — `<POSTGRES_DB>_test` |
-| `LOCK_WAIT_S` | `60` | скільки секунд при старті чекати, поки звільниться lock іншого екземпляра |
+| `LOCK_WAIT_S` | `60` | скільки секунд при старті чекати, поки звільниться lock іншого екземпляра (торгового процесу чи воркера — у кожного свій) |
 | `API_PORT` | `8000` | порт 8000 зайнятий іншою програмою (код виходу 16) |
 | `API_ALLOWED_ORIGINS` | `http://127.0.0.1:5173` | UI відкривається з іншої адреси (лише `127.0.0.1` / `localhost` / `[::1]` з портом) |
 | `RATE_LIMIT_SHARE_TRADING_PCT` | `50` | частка IP-ліміту Bybit торгового процесу, %; сума трьох часток — рівно 100 (роль процесу в `.env` не задається — її визначає команда запуску) |
@@ -129,6 +129,17 @@ printf 'Authorization: Bearer %s\n' "$API_TOKEN" | curl -H @- http://127.0.0.1:8
 
 Очікувано: `{"status":"ok", …, "checks":{"instance_lock":true,"database":true}}`. Без токена — 401, це правильно.
 
+Воркер задач (backfill довгої історії; Optuna — пізніше) — окремий процес. `API_TOKEN` йому не потрібен: лише
+БД з кроку 4. Ключі біржі він не читає; свічки бере з публічного mainnet. Пріоритет процесу нижчий за звичайний.
+На одній БД працює лише один воркер: другий чекає `LOCK_WAIT_S` і завершується з кодом 10.
+
+```bash
+cd apps/backend && uv run python -m app.jobs.worker
+```
+
+Зупинка — Ctrl+C (код 0, поточна задача знову `QUEUED`). Якщо БД у цей момент недоступна, воркер однаково
+завершується, а задача стає `FAILED` за простроченим heartbeat. Логи — `logs/worker/`.
+
 ## 6. Веб-інтерфейс (поки каркас)
 
 ```bash
@@ -146,6 +157,10 @@ cd apps/web && npm run dev    # http://127.0.0.1:5173
 | код 16, `api_bind_failed` | порт `API_PORT` зайнятий | закрити програму на порту або змінити `API_PORT` |
 | код 10, `instance_lock_held_by_other` | уже працює інший екземпляр на тій самій БД | зупинити його; лог показує pid процесу |
 | код 11, `instance_lock_db_unavailable` | БД не запущена | крок 4 |
+| `python -m app.jobs.worker` → код 15, `worker_db_not_configured` | немає `POSTGRES_PASSWORD` | крок 2 |
+| воркер → код 10, `instance_lock_held_by_other` | уже працює інший воркер на тій самій БД | зупинити його; лог показує pid процесу |
+| воркер → код 11, `instance_lock_db_unavailable` або `worker_db_unavailable` | БД не запущена | крок 4 |
+| воркер → код 12, `instance_lock_lost` | БД перезапустилась або обірвалось з'єднання | запустити воркер знову; задачу, що виконувалась, буде позначено `FAILED` |
 | health → 503, `"database": false` | БД недоступна | `docker compose ps`, крок 4 |
 | змінюючий запит → 503 `IDEMPOTENCY_STORE_UNAVAILABLE` | не застосовано міграції або БД недоступна | `uv run alembic upgrade head` |
 | 403 `HOST_NOT_ALLOWED` / `ORIGIN_NOT_ALLOWED` | запит не на `127.0.0.1:<API_PORT>` або UI з адреси поза `API_ALLOWED_ORIGINS` | відкривати UI з `http://127.0.0.1:5173` або додати адресу в `API_ALLOWED_ORIGINS` |

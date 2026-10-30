@@ -26,6 +26,7 @@ from app.core.instance_lock import (
     KEEPALIVE_TIMEOUT_S,
     LOCK_NAMESPACE,
     RETRY_INTERVAL_MS,
+    WORKER_APPLICATION_NAME_PREFIX,
     InstanceLock,
     InstanceLockHeld,
     InstanceLockLost,
@@ -33,6 +34,7 @@ from app.core.instance_lock import (
     LockHolder,
     TakeoverRefused,
     application_name,
+    lock_server_settings,
     parse_client_os_pid,
     run_exclusive,
 )
@@ -250,6 +252,21 @@ def test_application_name_is_short_ascii_and_parseable() -> None:
 @pytest.mark.parametrize("value", [None, "", "psql", "ctb-backend pid=", "ctb-backend pid=12a", "xctb-backend pid=1"])
 def test_foreign_application_name_has_no_client_pid(value: str | None) -> None:
     assert parse_client_os_pid(value) is None
+
+
+def test_worker_application_name_is_parseable() -> None:
+    name = application_name(77, prefix=WORKER_APPLICATION_NAME_PREFIX)
+    assert name == "ctb-worker pid=77"
+    assert parse_client_os_pid(name) == 77
+    assert lock_server_settings(77, prefix=WORKER_APPLICATION_NAME_PREFIX)["application_name"] == name
+    assert lock_server_settings(77)["application_name"] == "ctb-backend pid=77"
+
+
+def test_unknown_application_name_prefix_is_rejected() -> None:
+    with pytest.raises(ValueError, match="prefix"):
+        application_name(1, prefix="ctb-collector")
+    with pytest.raises(ValueError, match="prefix"):
+        InstanceLock(URL.create("postgresql+asyncpg"), application_name_prefix="other")
 
 
 # --- повтори та дедлайн ---

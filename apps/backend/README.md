@@ -26,6 +26,7 @@ uv run pytest -q -m "not slow"                    # швидкі тести
 uv run pytest -q -m testnet                       # лише Testnet; публічні дані T1.3 ключів не потребують (приватні виклики — T3.x, ключі в .env); тест остаточності kline — ще й slow (до ~85 с), без нього: -m "testnet and not slow"
 uv run pytest -q -m integration                   # схема БД, міграції, lock на ctb_test (потрібна docker compose БД)
 uv run python -m app                              # торговий процес: lock + локальний API на 127.0.0.1:API_PORT
+uv run python -m app.jobs.worker                  # воркер задач (backfill, далі Optuna); без торгових ключів і без API_TOKEN
 uv run alembic upgrade head                       # міграції основної dev-БД (`-x db=test` — тестової)
 uv run alembic revision --autogenerate --rev-id 0002 -m "коротко"   # нова міграція (TimescaleDB/тригери — дописати вручну)
 uv run alembic check                              # моделі й міграції не розходяться
@@ -78,6 +79,35 @@ uv run python -m app                              # торговий проце�
 | 14 | `EXIT_STOP_TIMEOUT` | після SIGTERM/SIGINT робота не зупинилась за 5 с — аварійний вихід (`os._exit`) |
 | 15 | `EXIT_CONFIG_INVALID` | не задано `API_TOKEN` — процес не стартує (до підключення до БД і перевірки TTY) |
 | 16 | `EXIT_API_BIND_FAILED` | `127.0.0.1:API_PORT` зайнятий або недоступний (`api_bind_failed`) — lock звільнено |
+
+## Воркер задач (`python -m app.jobs.worker`)
+
+```bash
+uv run python -m app.jobs.worker                  # черга jobs до SIGTERM/SIGINT (з apps/backend)
+```
+
+- Старт: `Settings` → `configure_logging(process="worker")` → знижений пріоритет ОС → single-instance lock воркера
+  (`WORKER_LOCK_ID`, до `LOCK_WAIT_S`) → публічний адаптер Bybit (mainnet, роль rate limiter `WORKER`) → цикл черги
+  під watchdog-ом lock. `API_TOKEN` не потрібен. На одній БД працює лише один воркер: частка rate limit розрахована
+  на один процес (`docs/decisions/0008-single-worker.md`). Деталі черги, lock і кодів `jobs.error` —
+  [`app/jobs/README.md`](app/jobs/README.md).
+- Логи — `logs/worker/`.
+- Коди виходу (`app/jobs/worker.py`, ті самі числа, що в торгового процесу):
+
+| Код | Константа | Значення |
+| --- | --- | --- |
+| 0 | `EXIT_OK` | зупинка за SIGTERM/SIGINT (зокрема під час очікування lock); поточна задача повертається в `QUEUED` (БД недоступна — процес однаково виходить, задача лишається `RUNNING` до прострочення heartbeat) |
+| 1 | `EXIT_UNCAUGHT` | необроблений виняток — маскований `uncaught_exception` |
+| 2 | — | зайві аргументи (argparse) |
+| 10 | `EXIT_LOCK_HELD` | уже працює інший воркер на тій самій БД (весь `LOCK_WAIT_S`) — лог `instance_lock_held_by_other` показує його pid |
+| 11 | `EXIT_DB_UNAVAILABLE` | БД недоступна весь `LOCK_WAIT_S` або на першому проході черги |
+| 12 | `EXIT_LOCK_LOST` | lock втрачено під час роботи (рестарт БД, обрив); задача лишається `RUNNING` до прострочення heartbeat |
+| 14 | `EXIT_STOP_TIMEOUT` | цикл не зупинився за 5 с після зовнішнього скасування — аварійний вихід |
+| 15 | `EXIT_CONFIG_INVALID` | не задано `POSTGRES_PASSWORD` |
+
+- Тести процесу: `tests/jobs/test_worker_process.py` (маркери `integration` + `slow`: другий воркер не стартує —
+  код 10; SIGTERM під час очікування lock — код 0; втрата lock — код 12; `kill -9` лишає `RUNNING` до наступного
+  старту; SIGTERM — код 0 і `QUEUED`).
 
 ## Конфігурація
 

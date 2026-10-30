@@ -42,12 +42,12 @@
 | `get_logger(name=APP, **initial)` | `logging.py` | structlog-логер; канали `APP`, `TRADING`, `ORDERS` або `app.<модуль>` |
 | `bind_context(**values)`, `clear_context()` | `logging.py` | контекст запису (`bot_id`, `symbol`, `client_order_id`, `signal_id`) через contextvars |
 | `SecretMasker`, `MASK`, `SECRET_MASK`, `MIN_SECRET_LEN`, `MAX_STR_LEN` | `logging.py` | процесор маскування і його константи; `SecretMasker.mask(value)` — маскована JSON-придатна копія значення поза логами (`request`/`result` в `audit_log`, T0.7) |
-| `InstanceLock(url, *, lock_id=BACKEND_LOCK_ID)` | `instance_lock.py` | advisory lock торгового процесу на окремій сесії (одноразовий): `acquire(wait_ms=, takeover=)`, `watch()`, `release()`, `held`, `session_pid`, `lost_reason`, `ensure_held()` |
+| `InstanceLock(url, *, lock_id=BACKEND_LOCK_ID, application_name_prefix=APPLICATION_NAME_PREFIX)` | `instance_lock.py` | advisory lock процесу (торговий; воркер — `WORKER_LOCK_ID` і `WORKER_APPLICATION_NAME_PREFIX`) на окремій сесії (одноразовий): `acquire(wait_ms=, takeover=)`, `watch()`, `release()`, `held`, `session_pid`, `lost_reason`, `ensure_held()` |
 | `run_exclusive(lock, body, *, on_stuck)` | `instance_lock.py` | виконати `body` під watchdog-ом lock; втрата lock чи зовнішнє скасування → `body` скасовано й дочекано (≤ `BODY_STOP_TIMEOUT_MS`, інакше `on_stuck`), потім `InstanceLockLost` / `CancelledError` |
 | `InstanceLockHeld`, `InstanceLockUnavailable`, `InstanceLockLost`, `TakeoverRefused` | `instance_lock.py` | lock тримає інша сесія (з `holders`); БД недоступна (`last_error`); lock втрачено (`reason`); перехоплення не виконано (`not_confirmed` / `holder_changed` / `audit_failed`) |
 | `LockHolder` | `instance_lock.py` | власник lock з `pg_locks` + `pg_stat_activity`: pid сесії, pid процесу ОС з `application_name`, адреса, користувач, стан, час у мс |
-| `connect_lock_session(url, *, server_settings)`, `lock_server_settings()` | `instance_lock.py` | окреме raw-з'єднання asyncpg (поза пулом) і параметри сесії lock (`application_name`, серверні keepalive) |
-| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
+| `connect_lock_session(url, *, server_settings)`, `lock_server_settings(pid=None, *, prefix=)`, `application_name(pid, *, prefix=)` | `instance_lock.py` | окреме raw-з'єднання asyncpg (поза пулом) і параметри сесії lock (`application_name` `ctb-backend pid=N` або `ctb-worker pid=N`; інший префікс — `ValueError`; серверні keepalive) |
+| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `WORKER_LOCK_ID`, `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
 
 Поля `Settings` (межі й defaults визначені в `config.py`):
 
@@ -64,7 +64,7 @@
 | `postgres_user` | `POSTGRES_USER` | `ctb` | власник БД (superuser контейнера, лише локально) |
 | `postgres_password` | `POSTGRES_PASSWORD` | — (обов'язково для compose) | `SecretStr` |
 | `postgres_readonly_password` | `POSTGRES_READONLY_PASSWORD` | — (обов'язково для compose) | `SecretStr`; пароль ролі `ctb_readonly`, застосовується лише при першій ініціалізації volume |
-| `lock_wait_s` | `LOCK_WAIT_S` | `60` | скільки секунд при старті торгового процесу повторювати спроби взяти lock; 0 … 600 (0 — одна спроба) |
+| `lock_wait_s` | `LOCK_WAIT_S` | `60` | скільки секунд при старті торгового процесу і воркера повторювати спроби взяти свій lock; 0 … 600 (0 — одна спроба) |
 | `api_port` | `API_PORT` | `8000` | порт локального API; 1024 … 65535. Адреса не налаштовується: `API_BIND_HOST` = `127.0.0.1` |
 | `api_token` | `API_TOKEN` | — (обов'язково для торгового процесу) | `SecretStr`; bearer-токен UI, ≥ `API_TOKEN_MIN_LEN` = 32 символи token68 (`[A-Za-z0-9._~+/-]`, `=` лише в кінці), з них ≥ `API_TOKEN_MIN_DISTINCT` = 10 різних (`aaaa…` відхиляється); без нього `python -m app` завершується з кодом 15 |
 | `api_allowed_origins` | `API_ALLOWED_ORIGINS` | `http://127.0.0.1:5173` | origins UI для перевірки `Origin` і CORS; у `.env` через кому; лише `http(s)://127.0.0.1\|localhost\|[::1]:<порт>` без шляху (інше, `*`, `null` → помилка валідації); нормалізуються в нижній регістр, дублікати прибираються; порожній список — браузер не має доступу |
@@ -160,7 +160,10 @@
 ## Single-instance lock (`instance_lock.py`)
 
 Не дає запустити другий екземпляр торгового процесу (`python -m app`) на тій самій БД (ТЗ §6.4, рішення
-`docs/decisions/0006-instance-lock.md`).
+`docs/decisions/0006-instance-lock.md`). Той самий механізм з ключем `(LOCK_NAMESPACE, WORKER_LOCK_ID)` =
+`(0x63746200, 2)` і `application_name = "ctb-worker pid=<pid ОС>"` тримає воркер задач (`app/jobs/worker.py`,
+рішення `docs/decisions/0008-single-worker.md`): один воркер на БД. Перехоплення (`takeover`) воркер не використовує;
+решта розділу — однаково для обох процесів, коди виходу воркера — `app/jobs/README.md`.
 
 - **Ключ:** `pg_try_advisory_lock(LOCK_NAMESPACE, BACKEND_LOCK_ID)` = `(0x63746200 "ctb\0", 1)`; у `pg_locks` —
   `locktype = 'advisory'`, `classid`/`objid`, `objsubid = 2`. Lock діє в межах **однієї БД** (`POSTGRES_DB`): другий
