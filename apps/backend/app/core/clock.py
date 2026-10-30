@@ -6,6 +6,8 @@
 Поточний годинник зберігається в модульній змінній — свідомий виняток із правила «без глобального стану»:
 це не торговий стан, а точка підміни часу. `ContextVar` не підходить: `loop.run_in_executor` не копіює
 контекст, і код у потоці мовчки взяв би реальний час замість фейкового.
+
+Контроль розбіжності з часом біржі та стрибків годинника — `app/data/time_sync.py` (T1.6).
 """
 
 from __future__ import annotations
@@ -13,7 +15,12 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Protocol
+from typing import Final, Protocol
+
+# ТЗ §4.3: розбіжність локального годинника з часом біржі понад 1 с блокує нові входи (`app/data/time_sync.py`).
+# Одне джерело: на ньому ж стоять запас детектора прогалин (`CANDLE_SETTLE_MS`), допуск `signals.computed_at_ms`
+# (`CLOCK_TOLERANCE_MS`) і нижня межа `RECV_WINDOW_MS`. Тут, а не в `app/data`: його імпортує `core/config.py`.
+CLOCK_DRIFT_LIMIT_MS: Final = 1000
 
 
 class Clock(Protocol):

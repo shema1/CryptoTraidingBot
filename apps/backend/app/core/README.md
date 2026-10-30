@@ -26,6 +26,7 @@
 | `API_BIND_HOST`, `API_TOKEN_MIN_LEN`, `API_TOKEN_MIN_DISTINCT` | `config.py` | адреса локального API — лише `127.0.0.1` (не налаштовується); мінімальна довжина `API_TOKEN` (32) і кількість різних символів у ньому (10) |
 | `H1_MS`, `DEFAULT_TRADING_SYMBOL`, `DEFAULT_RESEARCH_SYMBOLS` | `config.py` | година в мс; торговий символ і список 8 символів навчання (ТЗ §5А.6) |
 | `DEFAULT_BACKFILL_START_MS`, `DEFAULT_BACKFILL_INTERVAL_S`, `BACKFILL_INTERVAL_MIN_S`, `BACKFILL_INTERVAL_MAX_S`, `RESEARCH_SYMBOLS_MIN`, `RESEARCH_SYMBOLS_MAX` | `config.py` | початок історії, інтервал докачування (60…86400 с) і межі довжини `research_symbols` (5…8) |
+| `DEFAULT_RECV_WINDOW_MS`, `RECV_WINDOW_MIN_MS`, `RECV_WINDOW_MAX_MS` | `config.py` | recvWindow приватних запитів Bybit: 5000 мс (default біржі), межі 2000 (= 2 × `CLOCK_DRIFT_LIMIT_MS`) … 10000 |
 | `Base`, `NAMING_CONVENTION` | `db.py` | декларативна основа всіх моделей; детерміновані назви обмежень (`pk_`, `uq_`, `ck_`, `fk_`, `ix_`) |
 | `TimeMs`, `CreatedMs`, `Money` | `db.py` | анотації колонок: `BIGINT` мс; `BIGINT` мс з default `now_ms()` при вставці; `NUMERIC` (`Decimal`) |
 | `enum_check(column, values)`, `sql_list(values)`, `MODES` | `db.py` | `CHECK (column IN (...))` для статусів; режими `demo`/`testnet`/`live` |
@@ -33,6 +34,7 @@
 | `MODEL_MODULES`, `load_models()` | `db.py` | перелік модулів `app/*/models.py`; імпорт усіх і спільний `MetaData` (Alembic, тести) |
 | `create_engine(url, **kw)`, `session_factory(engine)` | `db.py` | async engine (asyncpg, `pool_pre_ping`) і фабрика `AsyncSession` (`expire_on_commit=False`) |
 | `now_ms()`, `monotonic_ms()` | `clock.py` | системний час (UTC epoch, `int` мс) і монотонний годинник (`int` мс, лише для інтервалів) |
+| `CLOCK_DRIFT_LIMIT_MS` | `clock.py` | 1000 мс — допуск розбіжності з часом біржі (ТЗ §4.3); одне джерело для контролю часу (`app/data/time_sync.py`), запасу детектора прогалин, допуску `signals` і нижньої межі `RECV_WINDOW_MS` |
 | `Clock`, `SystemClock`, `FakeClock` | `clock.py` | протокол годинника, реальний і фейковий; `FakeClock.advance(ms)` рухає обидва, `jump_wall(delta_ms)` / `set_now(ms)` — лише системний (імітація стрибка) |
 | `get_clock()`, `use_clock(clock)` | `clock.py` | поточний годинник і context manager підміни (відновлює попередній і при винятку) |
 | `configure_logging(settings, *, process, extra_secrets=())` | `logging.py` | налаштувати логування процесу (`backend` / `worker` / `collector`); ідемпотентно |
@@ -73,6 +75,7 @@
 | `research_symbols` | `RESEARCH_SYMBOLS` | BTC, ETH, SOL, XRP, BNB, DOGE, ADA, LTC (`…/USDT:USDT`) | 5–8 USDT-perpetual для навчання (ТЗ §5А.6); у `.env` через кому; дубль або інший формат — помилка валідації |
 | `backfill_start_ms` | `BACKFILL_START_MS` | `1577836800000` | початок історії свічок і funding, мс UTC (2020-01-01T00:00:00Z); має бути кратним 1h |
 | `backfill_interval_s` | `BACKFILL_INTERVAL_S` | `600` | інтервал інкрементального докачування, секунди; 60 … 86400 |
+| `recv_window_ms` | `RECV_WINDOW_MS` | `5000` | recvWindow приватних запитів Bybit, мс; 2000 … 10000. Bybit приймає запит, коли `server_time − recv_window ≤ timestamp < server_time + 1000`: нижня межа — допустиме відставання годинника (1 с) плюс стільки ж на передачу. Годинник, що випереджає біржу на ~1 с і більше, ламає всі приватні запити незалежно від вікна. Поки ні на що не впливає: читатиме торговий клієнт (T3.2, CCXT `options.recvWindow`) |
 
 ## Логування
 
@@ -141,9 +144,9 @@
   торговий стан). `ContextVar` не підходить: `loop.run_in_executor` не копіює контекст, і потік мовчки взяв би
   реальний час.
 - Тести: autouse-фікстура `fake_clock` (`tests/conftest.py`) ставить `FakeClock` (2026-01-01T00:00:00Z) для кожного тесту.
-
-> Заплановано: порівняння з `fetch_time()` біржі, детектор стрибка системного годинника відносно монотонного,
-> `recvWindow` — T1.6; T5.6 — Telegram.
+- `CLOCK_DRIFT_LIMIT_MS` (1000 мс, ТЗ §4.3) лежить тут, а не в `app/data`: його імпортує `config.py` (межа
+  `RECV_WINDOW_MS`), а `app/data` залежить від `core`. Порівняння з `fetch_time()` біржі й детектор стрибків
+  системного годинника відносно монотонного — `app/data/time_sync.py` (T1.6, README `app/data`).
 
 ## База даних (`db.py`)
 
@@ -224,4 +227,5 @@
 | T0.3 | `[x]` | повний `Settings` (`frozen`, межі, `LOG_*`, `hide_input_in_errors`), `logging.py` з каналами, ротацією, маскуванням і хуками винятків, `clock.py` з `FakeClock`, заборона прямого доступу до часу (`TID251`) |
 | T0.4 | `[x]` | `POSTGRES_HOST` (лише loopback), `POSTGRES_PORT`, `database_url()`; `db.py` — `Base`, naming convention, типи колонок, engine/сесії |
 | T0.6 | `[x]` | `instance_lock.py` — advisory lock торгового процесу (окрема сесія з серверними keepalive, повтори `LOCK_WAIT_S`, власник у лог, watchdog втрати, ручне перехоплення з аудитом); `LOCK_WAIT_S` |
+| T1.6 | `[x]` | `CLOCK_DRIFT_LIMIT_MS` перенесено сюди з `app/data/gaps.py` (одне джерело); `RECV_WINDOW_MS` |
 | T5.6 | `[ ]` | Telegram-сповіщення |

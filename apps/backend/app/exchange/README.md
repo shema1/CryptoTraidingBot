@@ -10,6 +10,14 @@
 > T3.5 (приватний WebSocket). Зараз є контракт, доменні типи, винятки, `FakeExchangeAdapter` (T1.1),
 > rate limiter (T1.2), публічні REST-методи Bybit і `fetch_time` (`bybit.py`, T1.3) і моделі БД (T0.4).
 > `BybitAdapter` навмисно не є повним `ExchangeAdapter`: ордери, позиції й приватний WS — T3.2/T3.5.
+> T3.2 (з T1.6): приватний клієнт підписує запити локальним часом (без `adjustForTimeDifference`) з
+> `options.recvWindow` = `Settings.recv_window_ms` (`RECV_WINDOW_MS`, 5000 мс; CCXT шле його в `X-BAPI-RECV-WINDOW`);
+> retCode `10002` («request time exceeds the time window range») — відмова, після якої
+> `ClockGuard.request_recheck(reason=...)` (`app/data/time_sync.py`). Годинник, що випереджає біржу на ~1 с і більше,
+> дає `10002` і на SL та закритті — рішення для захисту відкрите (`docs/ai/TASKS.md`, T1.6).
+> T3.3 (з T1.6): біржа може прийняти запит до `recv_window` + ~1 с після відправки, тож «не знайдено» за
+> `clientOrderId` раніше за `submit + recv_window_ms + CLOCK_DRIFT_LIMIT_MS` не доводить, що ордера не буде.
+> TODO(verify-bybit): де саме Bybit перевіряє `recvWindow` — на шлюзі при отриманні чи в matching engine.
 
 ## Розділи ТЗ
 

@@ -36,6 +36,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.clock import CLOCK_DRIFT_LIMIT_MS
 from app.core.db import MODES, Base, CreatedMs, Money, TimeMs, enum_check, sql_list, symbol_check
 from app.exchange.types import CLIENT_ORDER_ID_RE
 
@@ -64,8 +65,9 @@ PAUSE_REASONS: tuple[str, ...] = (
 )
 
 # --- Сигнал (ТЗ §5.5, §6.3) ---
-# Допуск розбіжності локального годинника з біржею (ТЗ §4.3: більше 1 с — блок нових входів).
-CLOCK_TOLERANCE_MS = 1000
+# Допуск розбіжності локального годинника з біржею (ТЗ §4.3: більше 1 с — блок нових входів). Міграція 0001 має
+# те саме число літералом: зміна ліміту потребує нової міграції CHECK `computed_after_entry_open`.
+CLOCK_TOLERANCE_MS = CLOCK_DRIFT_LIMIT_MS
 DIRECTIONS: tuple[str, ...] = ("LONG", "SHORT")
 PREDICTIONS: tuple[str, ...] = ("LONG", "SHORT", "NONE")
 SIGNAL_DECISIONS: tuple[str, ...] = ("ENTER", "SKIP")

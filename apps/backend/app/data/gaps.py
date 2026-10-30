@@ -30,7 +30,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.clock import now_ms
+from app.core.clock import CLOCK_DRIFT_LIMIT_MS, now_ms
 from app.core.db import SYMBOL_RE
 from app.core.logging import get_logger
 from app.data.models import GAP_SOURCES, INTERVAL_RE, OPEN_GAP_INDEX, DataGap
@@ -41,10 +41,9 @@ from app.exchange.types import Timeframe
 
 # Джерело ряду свічок у `data_gaps.source` (ТЗ §15). Інші джерела пишуть T1.9 і T1.10 тим самим `sync_open_gaps`.
 CANDLE_SOURCE: Final = "candles"
-# ТЗ §4.3: розбіжність локального годинника з часом біржі понад 1 с блокує нові входи (контроль — T1.6).
-CLOCK_DRIFT_LIMIT_MS: Final = 1000
 # Свічка, закрита менше ніж стільки тому за локальним годинником, ще не прогалина: адаптер віддає її лише через
-# `KLINE_FINALITY_MARGIN_MS` після закриття за часом біржі, а годинник може відставати від біржі до 1 с (T1.3).
+# `KLINE_FINALITY_MARGIN_MS` після закриття за часом біржі, а годинник може відставати від біржі до
+# `CLOCK_DRIFT_LIMIT_MS` (`app/core/clock.py`; більша розбіжність блокує нові входи — `app/data/time_sync.py`).
 CANDLE_SETTLE_MS: Final = KLINE_FINALITY_MARGIN_MS + CLOCK_DRIFT_LIMIT_MS
 _UNIQUE_VIOLATION: Final = "23505"
 _LOG = get_logger("app.data")

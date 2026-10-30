@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, SecretBytes, SecretStr, field_validator, 
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from sqlalchemy.engine import URL
 
+from app.core.clock import CLOCK_DRIFT_LIMIT_MS
 from app.core.db import SYMBOL_RE
 from app.exchange.rate_limit import (
     DEFAULT_SHARE_COLLECTOR_PCT,
@@ -67,6 +68,16 @@ DEFAULT_BACKFILL_START_MS: Final = 1_577_836_800_000
 DEFAULT_BACKFILL_INTERVAL_S: Final = 600
 BACKFILL_INTERVAL_MIN_S: Final = 60
 BACKFILL_INTERVAL_MAX_S: Final = 86_400
+# recvWindow приватних запитів Bybit (ТЗ §4.3). Біржа приймає запит, лише коли
+# `server_time − recv_window ≤ timestamp < server_time + 1000` (документація v5, 2026-10-30), default біржі — 5000.
+# Нижня межа: годинник може відставати від біржі до `CLOCK_DRIFT_LIMIT_MS` (більше — блок нових входів, а SL і
+# закриття проходять, доки відставання разом із передачею менше за вікно), плюс стільки ж на передачу запиту.
+# Годинник, що випереджає біржу приблизно на 1 с і більше, ламає всі приватні запити незалежно від вікна (відкрите
+# питання до ТЗ §4.3, docs/ai/TASKS.md T1.6). Верхня: довше вікно лише дозволяє біржі виконати запит, що застряг у
+# мережі, — вхід за застарілою ціною, і пізніше стає надійним «не знайдено» при розв'язанні `SUBMISSION_UNKNOWN` (T3.3).
+DEFAULT_RECV_WINDOW_MS: Final = 5_000
+RECV_WINDOW_MIN_MS: Final = 2 * CLOCK_DRIFT_LIMIT_MS
+RECV_WINDOW_MAX_MS: Final = 10_000
 _SYMBOL: Final = re.compile(SYMBOL_RE)
 
 
@@ -142,6 +153,10 @@ class Settings(BaseSettings):
     backfill_interval_s: Annotated[int, Field(ge=BACKFILL_INTERVAL_MIN_S, le=BACKFILL_INTERVAL_MAX_S)] = (
         DEFAULT_BACKFILL_INTERVAL_S
     )
+
+    # --- Час (ТЗ §4.3, T1.6) ---
+    # recvWindow приватних запитів Bybit, мс (2000 … 10000). Використовує торговий клієнт (T3.2).
+    recv_window_ms: Annotated[int, Field(ge=RECV_WINDOW_MIN_MS, le=RECV_WINDOW_MAX_MS)] = DEFAULT_RECV_WINDOW_MS
 
     @field_validator("log_dir")
     @classmethod

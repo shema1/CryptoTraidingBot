@@ -16,7 +16,7 @@
 | Що | Де | Опис |
 | --- | --- | --- |
 | `Bot`, `Signal`, `Order`, `OrderEvent`, `Fill`, `Position`, `DecisionLog` | `models.py` | таблиці торгового ядра |
-| `BOT_STATUSES`, `PAUSE_REASONS`, `SIGNAL_STATUSES`, `ORDER_STATES`, `ORDER_TERMINAL_STATES`, `ORDER_ORIGINS`, `POSITION_STATUSES`, `PROTECTION_STATUSES`, `CLOCK_TOLERANCE_MS` | `models.py` | набори значень як у ТЗ §6.1, §6.3, §7.1, §9, §11.4; допуск годинника 1000 мс (§4.3). Формат `clientOrderId` для CHECK — `CLIENT_ORDER_ID_RE` з `app/exchange/types.py` (T1.1) |
+| `BOT_STATUSES`, `PAUSE_REASONS`, `SIGNAL_STATUSES`, `ORDER_STATES`, `ORDER_TERMINAL_STATES`, `ORDER_ORIGINS`, `POSITION_STATUSES`, `PROTECTION_STATUSES`, `CLOCK_TOLERANCE_MS` | `models.py` | набори значень як у ТЗ §6.1, §6.3, §7.1, §9, §11.4; допуск годинника `CLOCK_TOLERANCE_MS` = `CLOCK_DRIFT_LIMIT_MS` (1000 мс, `app/core/clock.py`, §4.3; міграція 0001 має його літералом — зміна ліміту потребує нової міграції). Формат `clientOrderId` для CHECK — `CLIENT_ORDER_ID_RE` з `app/exchange/types.py` (T1.1) |
 
 ## Таблиці БД
 

@@ -390,3 +390,32 @@ def test_backfill_interval_bounds(seconds: int) -> None:
 @pytest.mark.parametrize("seconds", [60, 86_400])
 def test_backfill_interval_boundaries_are_accepted(seconds: int) -> None:
     assert _settings(backfill_interval_s=seconds).backfill_interval_s == seconds
+
+
+# --- recvWindow приватних запитів Bybit (ТЗ §4.3, T1.6) ---
+
+
+def test_recv_window_defaults_to_the_bybit_default_and_covers_the_drift_limit() -> None:
+    from app.core.clock import CLOCK_DRIFT_LIMIT_MS
+    from app.core.config import DEFAULT_RECV_WINDOW_MS, RECV_WINDOW_MAX_MS, RECV_WINDOW_MIN_MS
+
+    assert _settings().recv_window_ms == DEFAULT_RECV_WINDOW_MS == 5_000
+    # Годинник може відставати від біржі до ліміту розбіжності, і ще треба час на передачу запиту.
+    assert RECV_WINDOW_MIN_MS == 2 * CLOCK_DRIFT_LIMIT_MS
+    assert RECV_WINDOW_MIN_MS <= DEFAULT_RECV_WINDOW_MS <= RECV_WINDOW_MAX_MS == 10_000
+
+
+@pytest.mark.parametrize("value", [1_999, 10_001, 0, -5_000])
+def test_recv_window_bounds(value: int) -> None:
+    with pytest.raises(ValidationError):
+        _settings(recv_window_ms=value)
+
+
+@pytest.mark.parametrize("value", [2_000, 10_000])
+def test_recv_window_boundaries_are_accepted(value: int) -> None:
+    assert _settings(recv_window_ms=value).recv_window_ms == value
+
+
+def test_empty_recv_window_variable_means_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RECV_WINDOW_MS", "")
+    assert _settings().recv_window_ms == 5_000

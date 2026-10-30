@@ -112,6 +112,8 @@ module = [
     "app.protection.*",
     "app.reconcile.*",
     "app.core.*",
+    # Контроль часу блокує нові входи (ТЗ §4.3, T1.6) — та сама строгість, що й у торгового ядра.
+    "app.data.time_sync",
 ]
 disallow_any_generics = true
 disallow_subclassing_any = true

@@ -15,13 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionm
 from sqlalchemy.orm import Session, UOWTransaction
 from structlog.testing import capture_logs
 
-from app.core.clock import FakeClock
+from app.core.clock import CLOCK_DRIFT_LIMIT_MS, FakeClock
 from app.core.config import H1_MS
 from app.data.backfill import backfill_symbol, sync_market_data
 from app.data.gaps import (
     CANDLE_SETTLE_MS,
     CANDLE_SOURCE,
-    CLOCK_DRIFT_LIMIT_MS,
     GapRange,
     GapSync,
     detect_candle_gaps,
