@@ -20,6 +20,7 @@ from app.core.clock import FakeClock
 from app.core.instance_lock import (
     AUDIT_ACTION_FORCE_TAKEOVER,
     BACKEND_LOCK_ID,
+    COLLECTOR_APPLICATION_NAME_PREFIX,
     KEEPALIVE_COUNT,
     KEEPALIVE_IDLE_S,
     KEEPALIVE_INTERVAL_S,
@@ -262,9 +263,16 @@ def test_worker_application_name_is_parseable() -> None:
     assert lock_server_settings(77)["application_name"] == "ctb-backend pid=77"
 
 
+def test_collector_application_name_is_parseable() -> None:
+    name = application_name(77, prefix=COLLECTOR_APPLICATION_NAME_PREFIX)
+    assert name == "ctb-collector pid=77"
+    assert parse_client_os_pid(name) == 77
+    assert lock_server_settings(77, prefix=COLLECTOR_APPLICATION_NAME_PREFIX)["application_name"] == name
+
+
 def test_unknown_application_name_prefix_is_rejected() -> None:
     with pytest.raises(ValueError, match="prefix"):
-        application_name(1, prefix="ctb-collector")
+        application_name(1, prefix="ctb-other")
     with pytest.raises(ValueError, match="prefix"):
         InstanceLock(URL.create("postgresql+asyncpg"), application_name_prefix="other")
 

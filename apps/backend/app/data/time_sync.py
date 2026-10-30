@@ -144,7 +144,7 @@ SleepMs = Callable[[int], Awaitable[None]]
 
 
 class ClockGuard:
-    """Стан годинника процесу. Один на торговий процес; див. docstring модуля.
+    """Стан годинника процесу. Один на процес (торговий; колектор ліквідацій — для меж години); див. docstring модуля.
 
     Перед новим входом — `state(scope).entries_allowed` для області звірки бота (акаунта). Звірка: квиток
     `begin_reconcile(scope)` до її старту, після успіху — `confirm_reconciled(ticket)`.

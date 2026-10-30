@@ -1099,6 +1099,11 @@ def _requested_symbols(symbols: Collection[str] | None) -> frozenset[str] | None
     return frozenset(requested)
 
 
+def exchange_symbol(symbol: str) -> str:
+    """Канонічний `BTC/USDT:USDT` → біржовий `BTCUSDT`. Інший запис — `ValueError` без мережі."""
+    return _canonical_symbol(symbol)
+
+
 def _canonical_symbol(symbol: object) -> str:
     """Канонічний `BTC/USDT:USDT` → біржовий `BTCUSDT`. Інший запис — `ValueError` без мережі."""
     if type(symbol) is not str or _CANONICAL.fullmatch(symbol) is None:

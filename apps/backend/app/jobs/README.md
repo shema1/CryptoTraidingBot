@@ -11,7 +11,8 @@
 колектором перевищили б ліміт (бан IP зачепив би і SL торгового процесу). Тому воркер тримає single-instance lock
 `WORKER_LOCK_ID` = `2` у просторі `LOCK_NAMESPACE` = `0x63746200` (`app/core/instance_lock.py`, той самий механізм,
 що в торгового процесу з `BACKEND_LOCK_ID` = `1`): окрема сесія з серверними keepalive, `application_name` =
-`ctb-worker pid=<pid ОС>`. Задачі йдуть по одній, тож і GPU-задачі (`device: cuda`, ТЗ §5.6) не паралеляться.
+`ctb-worker pid=<pid ОС>`. Колектор з тієї самої причини тримає `COLLECTOR_LOCK_ID` = `3`
+(`app/data/collector.py`). Задачі йдуть по одній, тож і GPU-задачі (`device: cuda`, ТЗ §5.6) не паралеляться.
 `SKIP LOCKED` лишається захистом черги від подвійного взяття.
 
 > Заплановано: T2.10 — Optuna як `kind` цього ж воркера.

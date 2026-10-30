@@ -27,6 +27,7 @@ uv run pytest -q -m testnet                       # лише Testnet; публі
 uv run pytest -q -m integration                   # схема БД, міграції, lock на ctb_test (потрібна docker compose БД)
 uv run python -m app                              # торговий процес: lock + локальний API на 127.0.0.1:API_PORT
 uv run python -m app.jobs.worker                  # воркер задач (backfill, далі Optuna); без торгових ключів і без API_TOKEN
+uv run python -m app.data.collector               # колектор ліквідацій і деривативів; без торгових ключів і без API_TOKEN
 uv run alembic upgrade head                       # міграції основної dev-БД (`-x db=test` — тестової)
 uv run alembic revision --autogenerate --rev-id 0002 -m "коротко"   # нова міграція (TimescaleDB/тригери — дописати вручну)
 uv run alembic check                              # моделі й міграції не розходяться
@@ -108,6 +109,39 @@ uv run python -m app.jobs.worker                  # черга jobs до SIGTERM
 - Тести процесу: `tests/jobs/test_worker_process.py` (маркери `integration` + `slow`: другий воркер не стартує —
   код 10; SIGTERM під час очікування lock — код 0; втрата lock — код 12; `kill -9` лишає `RUNNING` до наступного
   старту; SIGTERM — код 0 і `QUEUED`).
+
+## Колектор ліквідацій (`python -m app.data.collector`)
+
+```bash
+uv run python -m app.data.collector               # публічний WS ліквідацій до SIGTERM/SIGINT (з apps/backend)
+```
+
+- Старт: `Settings` → `configure_logging(process="collector")` → single-instance lock колектора
+  (`COLLECTOR_LOCK_ID` = 3, до `LOCK_WAIT_S`) → `RateLimiter` з роллю `COLLECTOR` → під watchdog-ом lock разом:
+  `ClockGuard` (`fetch_time` публічним REST mainnet через цей лімітер, ТЗ §4.3), підписка на `allLiquidation`
+  для `research_symbols` (публічний mainnet WS, окремий запит на символ, без ключів) і хвіст деривативів
+  `DerivativesSync` раз на `BACKFILL_INTERVAL_S` (довшу за 168 год історію ставить воркеру задачею). Години не
+  закриваються і деривативи не качаються, поки годинник не перевірено. Запис у БД — окрема задача з паузою після
+  помилок. `API_TOKEN` не потрібен. Пріоритет ОС не знижується. Деталі агрегації — [`app/data/README.md`](app/data/README.md)
+  і [`docs/data/liquidations.md`](../../docs/data/liquidations.md).
+- Логи — `logs/collector/`.
+- Коди виходу (`app/data/collector.py`):
+
+| Код | Константа | Значення |
+| --- | --- | --- |
+| 0 | `EXIT_OK` | зупинка за SIGTERM/SIGINT одразу, зокрема під час очікування lock, з'єднання чи кадру тихого потоку |
+| 1 | `EXIT_UNCAUGHT` | необроблений виняток — маскований `uncaught_exception` |
+| 2 | — | зайві аргументи (argparse) |
+| 10 | `EXIT_LOCK_HELD` | уже працює інший колектор на тій самій БД (весь `LOCK_WAIT_S`) |
+| 11 | `EXIT_DB_UNAVAILABLE` | БД недоступна весь `LOCK_WAIT_S` |
+| 12 | `EXIT_LOCK_LOST` | lock втрачено під час роботи |
+| 14 | `EXIT_STOP_TIMEOUT` | цикл не зупинився за 5 с після зовнішнього скасування — аварійний вихід (втрата lock — код 12) |
+| 15 | `EXIT_CONFIG_INVALID` | не задано `POSTGRES_PASSWORD` (`collector_db_not_configured`) |
+
+- Тести: `tests/exchange/test_liquidation_messages.py`, `tests/data/test_collector_derivatives.py` (розклад
+  деривативів, годинник, збій, зупинка, запис хвоста в тестову БД), `tests/data/test_liquidations.py` (агрегація записаного кадру,
+  запас 1 с на межах години, довіра до годинника і стрибок, відхилений символ, таймаут підписки, stale, реконект з
+  backoff, БД недоступна чи зависла, зупинка за `stop` у тихому потоці й під час з'єднання, прогалини на тестовій БД).
 
 ## Конфігурація
 

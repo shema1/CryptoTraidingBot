@@ -20,6 +20,8 @@ Lock діє в межах однієї БД (`POSTGRES_DB`): інша БД чи 
 Той самий механізм з ключем `WORKER_LOCK_ID` і `application_name` `ctb-worker pid=N` тримає воркер задач
 (`app/jobs/worker.py`, `docs/decisions/0008-single-worker.md`): на одній БД працює лише один воркер, бо частка
 rate limit воркера (ТЗ §6.5) розрахована на один процес. Перехоплення для воркера немає.
+Колектор ліквідацій бере `COLLECTOR_LOCK_ID` і `application_name` `ctb-collector pid=N` з тієї самої причини:
+частка колектора теж розрахована на один процес (`app/data/collector.py`).
 """
 
 from __future__ import annotations
@@ -44,6 +46,8 @@ __all__ = [
     "AUDIT_ACTION_FORCE_TAKEOVER",
     "BACKEND_LOCK_ID",
     "BODY_STOP_TIMEOUT_MS",
+    "COLLECTOR_APPLICATION_NAME_PREFIX",
+    "COLLECTOR_LOCK_ID",
     "HEARTBEAT_INTERVAL_MS",
     "HEARTBEAT_TIMEOUT_MS",
     "KEEPALIVE_COUNT",
@@ -77,6 +81,7 @@ __all__ = [
 LOCK_NAMESPACE: Final = 0x63746200  # "ctb\0"
 BACKEND_LOCK_ID: Final = 1  # торговий процес
 WORKER_LOCK_ID: Final = 2  # воркер задач: один процес на БД (частка rate limit ТЗ §6.5)
+COLLECTOR_LOCK_ID: Final = 3  # колектор ліквідацій: один процес на БД (частка rate limit ТЗ §6.5)
 # Інший advisory-простір — знімок інструментів (`app/exchange/instruments.py`).
 
 # Серверні keepalive сесії lock: PostgreSQL виявляє мертвого клієнта за idle + interval × count секунд.
@@ -99,7 +104,12 @@ _CLOSE_TIMEOUT_S: Final = 5.0
 # `application_name` сесії lock: за ним оператор знаходить процес ОС (`client_addr` за Docker — адреса шлюзу).
 APPLICATION_NAME_PREFIX: Final = "ctb-backend"
 WORKER_APPLICATION_NAME_PREFIX: Final = "ctb-worker"
-_APPLICATION_NAME_PREFIXES: Final = (APPLICATION_NAME_PREFIX, WORKER_APPLICATION_NAME_PREFIX)
+COLLECTOR_APPLICATION_NAME_PREFIX: Final = "ctb-collector"
+_APPLICATION_NAME_PREFIXES: Final = (
+    APPLICATION_NAME_PREFIX,
+    WORKER_APPLICATION_NAME_PREFIX,
+    COLLECTOR_APPLICATION_NAME_PREFIX,
+)
 _APPLICATION_NAME_RE: Final = re.compile(
     "(?:" + "|".join(re.escape(prefix) for prefix in _APPLICATION_NAME_PREFIXES) + r") pid=(\d{1,10})"
 )
@@ -317,7 +327,7 @@ def _holder(row: Mapping[str, object]) -> LockHolder:
 
 
 class InstanceLock:
-    """Advisory lock процесу (торговий — `BACKEND_LOCK_ID`, воркер — `WORKER_LOCK_ID`) на окремій сесії PostgreSQL.
+    """Advisory lock процесу (торговий — `BACKEND_LOCK_ID`, воркер — `WORKER_LOCK_ID`, колектор — `COLLECTOR_LOCK_ID`).
 
     Життєвий цикл: `acquire()` → `run_exclusive()` (робота під `watch()`) → `release()`. Один екземпляр — одна спроба
     володіння; після втрати чи звільнення новий lock береться новим процесом (новий старт = звірка, ТЗ §11.1).

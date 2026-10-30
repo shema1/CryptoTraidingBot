@@ -43,7 +43,8 @@
 | `ExchangeError` і підкласи, `is_definite_rejection(exc)` | `errors.py` | ієрархія винятків (нижче) |
 | `FakeExchangeAdapter`, `Fault`, `FaultKind`, `FakeCall` | `fake.py` | in-memory біржа для тестів (нижче); **імпортується лише з `tests/`**; `FakeCall.priority` |
 | `RateLimiter`, `RequestPriority`, `ProcessRole`, `EndpointGroup` | `rate_limit.py` | черга REST одного процесу (нижче); числа лімітів — константи модуля |
-| `BybitAdapter`, `ExchangeMode`, `BybitPublicClient` | `bybit.py` | публічні REST і `fetch_time` (нижче); імпорт `from app.exchange.bybit import …` (пакет `app.exchange` CCXT не тягне) |
+| `BybitAdapter`, `ExchangeMode`, `BybitPublicClient`, `exchange_symbol` | `bybit.py` | публічні REST і `fetch_time` (нижче); `exchange_symbol` — `BTC/USDT:USDT` → `BTCUSDT` без мережі; імпорт `from app.exchange.bybit import …` (пакет `app.exchange` CCXT не тягне) |
+| `liquidation_stream_url`, `liquidation_topic`, `parse_liquidation_message`, `read_liquidation_session`, `AiohttpLiquidationConnector` | `liquidations.py` | публічний WS ліквідацій (нижче); сирий aiohttp за модуль не виходить |
 | `ExchangeAccount`, `Instrument` (ORM) | `models.py` | таблиці `exchange_accounts`, `instruments` (ТЗ §6.4, §15); у кеші ще `launch_time_ms` (T1.7) |
 | `EXCHANGES`, `KEY_CHECK_RESULTS` | `models.py` | допустимі біржі (`bybit`); результати перевірки ключа |
 | `PriceRole`, `round_price`, `floor_to_step`, `ceil_to_step` | `rounding.py` | ціна кратна `tickSize`; напрям — той, що не збільшує ризик (нижче) |
@@ -206,6 +207,32 @@ ExchangeError
 за часом біржі. **TODO(verify-bybit):** чи вистачає запасу на mainnet (Testnet малоліквідний). Перевірка на Testnet —
 `test_kline_returned_right_after_the_finality_margin_does_not_change_later` (`-m testnet`, `slow`, до ~85 с).
 
+## Публічний потік ліквідацій (`liquidations.py`, T1.10)
+
+Окремо від CCXT: тема `allLiquidation.{symbol}` на `wss://stream.bybit.com/v5/public/linear` (demo і live — той самий
+публічний mainnet; testnet — `wss://stream-testnet.bybit.com/v5/public/linear`). Ключів немає. `category=linear` сидить
+у шляху. Формат звірено з документацією v5 2026-10-30, відповіді на підписку й ping — на публічному mainnet того ж дня
+(`docs/data/liquidations.md`).
+
+Кожен символ — окремий запит `subscribe` з `req_id` = темою: mainnet відхиляє спільний запит цілком, якщо хоч одна
+тема невідома (`success: false`, без `failTopics`). Відповідь прив'язується до символу за `req_id`
+(`LiquidationMessage.symbol`, `detail` — обрізаний `ret_msg`); відповідь без нашого `req_id` — `ignore`. Відхилений
+символ — `liquidation_topic_rejected` (error), решта працює; відхилено всі — `ExchangeUnavailable`.
+
+`parse_liquidation_message` не довіряє числу там, де Bybit обіцяє рядок: `v` і `p` — додатні скінченні десяткові рядки,
+`T`/`ts` — невід'ємне ціле в межах 53 біт або рядок із цифр. `Buy` — ліквідація long, `Sell` — short (сторона позиції).
+`type = snapshot` — пачка нових подій, не знімок історії і не повтор при підписці. Чужий символ — `ignore`. Зламаний
+кадр нашої теми — `unusable`: годину з ним нулем не записують. Порожня `data` — валідна пачка без подій.
+
+`read_liquidation_session` тримає читання і нагляд окремими задачами. Ping — JSON `{"op":"ping"}` кожні
+`PING_INTERVAL_MS` (20 с). `receive()` без таймауту: у aiohttp 3.14 таймаут `receive` ставить abnormal closure і ламає
+сокет. Тиша понад `STALE_AFTER_MS` (60 с), відповіді не на всі підписки за `SUBSCRIBE_TIMEOUT_MS` (10 с,
+`liquidation_subscribe_timeout` з `awaiting`), відхилені всі теми і обрив — `ExchangeUnavailable`. `stop` завершує
+сесію без винятку одразу, не чекаючи кадру: після `stop` ping не йде, тож у тихому потоці кадру може не бути
+хвилинами. `on_progress` — синхронний сигнал після кожного кадру: БД пише окрема задача колектора, читання її не чекає.
+`AiohttpLiquidationConnector` обмежує відкриття з'єднання `HANDSHAKE_TIMEOUT_S` (15 с): `ClientTimeout` сесії не
+покриває відповідь на upgrade. Агрегація і процес — `app/data/liquidations.py` і `app/data/collector.py`.
+
 ## Rate limiter (`rate_limit.py`, ТЗ §6.5)
 
 Один `RateLimiter` на процес. Публічні методи `BybitAdapter` ідуть через `call` (група `MARKET`, `retry=True`).
@@ -356,7 +383,9 @@ hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `cont
 курсор, `max_qty`, невідомий `retCode`), `test_bybit_ccxt_client.py` (справжній CCXT з підміненою сесією aiohttp: URL
 і кодування курсора, паралельні запити без черги, мапінг транспортних збоїв і лог, закриття),
 `test_bybit_testnet.py` (`-m testnet`, без ключів; модуль перевизначає autouse `fake_clock` на `SystemClock` і
-перевіряє хост testnet до першого запиту). Повний contract-набір на Testnet/Demo — після T3.2: він ставить ордери.
+перевіряє хост testnet до першого запиту), `test_liquidation_messages.py` (кадр `allLiquidation` з документації v5:
+`Sell` → short, `Buy` → long, зіпсований кадр, URL; записані з mainnet відмова підписки й pong, `req_id`, таймаут
+handshake). Повний contract-набір на Testnet/Demo — після T3.2: він ставить ордери.
 
 ## Стан реалізації
 
@@ -367,5 +396,6 @@ hypothesis), `test_errors.py` (ієрархія, `is_definite_rejection`), `cont
 | T1.2 | `[x]` | `rate_limit.py`: черга з пріоритетами, частка IP, backoff, заголовки Bybit |
 | T1.3 | `[x]` | `bybit.py`: `fetch_time`, свічки, інструменти, funding; `category=linear`; група `MARKET` |
 | T1.7 | `[x]` | кеш `instruments`, округлення qty/ціни, пауза `INSTRUMENT_NOT_TRADING`, початок скану свічок від `launchTime` |
+| T1.10 | `[~]` | `liquidations.py`: публічний WS `allLiquidation`, розбір кадру; добовий прогін колектора ще відкритий |
 | T3.2 | `[ ]` | Bybit: торгові методи та мапінг помилок |
 | T3.5 | `[ ]` | Приватний WebSocket і реконект |

@@ -6,8 +6,10 @@
 ліквідацій (окремий процес `python -m app.data.collector`), виявлення прогалин без інтерполяції, контроль
 синхронізації часу.
 
-> Заплановано: T1.10 (колектор ліквідацій). Backfill свічок 1h і funding — T1.4 (`backfill.py`).
-> Backfill деривативів — T1.9 (`derivatives.py`). Прогалини — T1.5 (`gaps.py`).
+> Backfill свічок 1h і funding — T1.4 (`backfill.py`). Backfill деривативів — T1.9 (`derivatives.py`; хвіст за
+> розкладом — колектор, T1.10; довга історія — воркер).
+> Колектор ліквідацій — T1.10 (`collector.py`): процес запущено, добова перевірка `data_gaps` ще відкрита.
+> Прогалини — T1.5 (`gaps.py`).
 > Контроль часу — T1.6 (`time_sync.py`); запуск у торговому процесі й перехід ботів у `RECONCILING` — T5.1.
 
 ## Розділи ТЗ
@@ -37,7 +39,15 @@
 | `DerivativesSync`, `DerivativesSync.from_settings` | `derivatives.py` | той самий розклад, що в `MarketDataSync`, але лише `research_symbols` і п'ять рядів деривативів |
 | `JOB_KIND_DERIVATIVES`, `DERIVATIVES_DEDUP_KEY`, `DERIVATIVES_JOB_PRIORITY`, `DERIVATIVES_TIMEFRAME` | `derivatives.py` | `backfill_derivatives`, ключ дедуплікації, пріоритет 210 (після свічок з пріоритетом 200), інтервал `1h` |
 | `DerivativesStats`, `DerivativesSyncResult`, `DerivativesBackfillIncomplete` | `derivatives.py` | скільки рядків додано по рядах; id задачі, символи воркера і `failed_symbols`; виняток задачі |
-| `detect_candle_gaps`, `sync_open_gaps`, `GapSync` | `gaps.py` | записати дірки свічок; звести відкриті рядки будь-якого `source` (деривативи вже викликають його; ліквідації — T1.10); що змінилось за прохід |
+| `detect_candle_gaps`, `sync_open_gaps`, `GapSync` | `gaps.py` | записати дірки свічок; звести відкриті рядки будь-якого `source` (деривативи і ліквідації викликають його); що змінилось за прохід |
+| `LiquidationBook`, `SealedHour`, `save_liquidations`, `sync_liquidation_gaps` | `liquidations.py` | години в пам'яті (підписка по символу, стан годинника); запис `liquidations_hourly` (`ON CONFLICT DO NOTHING`); прогалини `source = liquidations` |
+| `SEAL_MARGIN_MS`, `CLOCK_MARGIN_MS`, `liquidation_scan_end_ms`, `hour_start_ms` | `liquidations.py` | 30 с після кінця години; 1 с запасу на зсув годинника (`CLOCK_DRIFT_LIMIT_MS`); кінець сітки прогалин; початок години UTC |
+| `ClockView`, `clock_trusted` | `liquidations.py` | стан годинника для книги (`ClockGuard`); чи можна рахувати межі години (немає `CLOCK_UNVERIFIED` / `CLOCK_DRIFT`) |
+| `run_collector`, `serve`, `main`, `reconnect_delay_ms` | `collector.py` | цикл підписки й окрема задача запису в БД; процес до SIGTERM; пауза реконекту (1 с, ×2, стеля 60 с, jitter) |
+| `watch_clock`, `collect_with_clock` | `collector.py` | `ClockGuard.run` з `book.observe_clock()` після кожного тіку; колектор поруч із ним (збій контролю часу зупиняє колектор) |
+| `run_derivatives`, `DERIVATIVES_POLL_MS` | `collector.py` | хвіст деривативів за розкладом `DerivativesSync` (опитування раз на 5000 мс), лише коли годиннику вірять; збій — у лог, ліквідації не зупиняє |
+| `RECONNECT_BASE_MS`, `RECONNECT_CAP_MS`, `GAP_SYNC_INTERVAL_MS` | `collector.py` | 1000 мс, 60 000 мс, зведення прогалин під час сесії раз на 60 с |
+| `DB_RETRY_BASE_MS`, `DB_RETRY_CAP_MS`, `db_retry_delay_ms`, `FINAL_FLUSH_TIMEOUT_MS` | `collector.py` | пауза після помилки БД 1000 мс, ×2, стеля 60 000 мс; останній запис при зупинці ≤ 3000 мс (менше за `BODY_STOP_TIMEOUT_MS`) |
 | `has_open_gap`, `open_gaps_in_window` | `gaps.py` | чи є відкрита прогалина у вікні `[start_ms, end_ms)` і які саме |
 | `settled_end_ms`, `CANDLE_SETTLE_MS` | `gaps.py` | кінець сітки, яку вже можна перевіряти; запас після закриття свічки (`KLINE_FINALITY_MARGIN_MS` 500 мс + допуск годинника `CLOCK_DRIFT_LIMIT_MS` 1 с з `app/core/clock.py` = 1500 мс) |
 | `is_open_gap_conflict` | `gaps.py` | чи `IntegrityError` — зіткнення двох процесів на `uq_data_gaps_open` (а не інша помилка цілісності) |
@@ -103,8 +113,8 @@
 `has_open_gap` / `open_gaps_in_window` читають лише відкриті рядки. `False` означає «відкритого рядка в цьому вікні
 немає», а не «ряд уже перевіряли»: перед тим, як трактувати його як дозвіл торгувати, вікно має пройти детектор
 (backfill викликає його після проходу свічок). Джерела деривативів (`open_interest`, `premium_index`,
-`mark_candles`, `index_candles`, `long_short`) пише `derivatives.py` тим самим `sync_open_gaps`. `liquidations` —
-T1.10; поки колектора немає, рядків цього джерела немає, і це не прогалина свічок. Два процеси, що зводять один ряд
+`mark_candles`, `index_candles`, `long_short`) пише `derivatives.py` тим самим `sync_open_gaps`. `liquidations`
+пише `liquidations.py` (розділ нижче). Два процеси, що зводять один ряд
 одночасно, можуть зіткнутися на `uq_data_gaps_open` (`IntegrityError`): транзакція відкочується, а виклик розпізнає
 це через `is_open_gap_conflict` і повторює (як `_record_candle_gaps` у backfill і `_record_gaps` у derivatives),
 не зупиняючи інші ряди.
@@ -130,7 +140,9 @@ T1.10; поки колектора немає, рядків цього джер�
 
 Параметри задачі: `symbols`, `interval` (`1h`), `start_ms`. Кінець діапазону — годинник у момент виконання.
 `DerivativesSync.from_settings` бере лише `RESEARCH_SYMBOLS` (торговий символ, якого немає в цьому списку, не
-качається). Виклик із торгового процесу — разом із `MarketDataSync` (T5); окремий entrypoint не додавався.
+качається). Розклад крутить колектор (`python -m app.data.collector`, ТЗ §4.4, §6.4) через свій `BybitAdapter` з
+лімітером ролі `COLLECTOR` — розділ «Ліквідації» нижче. Funding лишається в `MarketDataSync` разом зі свічками
+(торговий процес, T5; `docs/decisions/0011-funding-with-candles.md`).
 
 `open` premium — close попередньої години й може лежати поза `[low, high]`: така свічка пишеться як є
 (`docs/decisions/0009-premium-open.md`, міграція 0004). Зламаний діапазон години premium (`high < low`, `close` поза
@@ -138,11 +150,72 @@ T1.10; поки колектора немає, рядків цього джер�
 `derivative_point_rejected`. Зберігається `openInterest` (сума сторін), не `singleOpenInterest`. Mark і index —
 окремі `price_type` в одній таблиці й окремі прогалини.
 
+## Ліквідації (T1.10, ТЗ §4.4)
+
+Окремий процес `python -m app.data.collector` (він же качає хвіст деривативів — нижче). Торгових ключів не
+використовує і ордерів не ставить. Слухає публічний
+WebSocket Bybit `allLiquidation.{symbol}` для `research_symbols` (хост mainnet, як публічні дані воркера). Формат кадру,
+сторона позиції і правила закриття години — `docs/data/liquidations.md`. Історії у біржі немає: простій і все, що було
+до першої повністю прослуханої години, лишається відкритою прогалиною.
+
+`LiquidationBook` пише годину символу, лише якщо його підписку підтверджено щонайменше за `CLOCK_MARGIN_MS` (1 с) до
+початку години, кадр прийшов щонайменше через 1 с після її кінця (`SEAL_MARGIN_MS` = 30 с від кінця, довше за ping
+20 с) і весь цей час годиннику вірили. Тиха година, прослухана цілком, — нулі. Недослухана година і година
+зі зіпсованим кадром у таблицю не йдуть: їх закриє `sync_liquidation_gaps` як `data_gaps.source = liquidations`,
+`timeframe = 1h`. Повторна вставка — `ON CONFLICT DO NOTHING`. Пізній кадр уже записаної години лише логується
+(`liquidation_late_event`): id події біржа не дає, тож два однакові кадри в відкритій годині рахуються обидва.
+
+**Годинник.** Межі години — за локальним годинником, події — за `T` біржі. Тому колектор тримає власний
+`ClockGuard` (ТЗ §4.3, розділ «Час» нижче): `fetch_time` публічним REST через `BybitAdapter` з лімітером ролі
+`COLLECTOR` (частка 20%, ТЗ §6.5). Книга читає `clock.state()` на кожному виклику, а `watch_clock` — після кожного
+тіку `ClockGuard`. Годиннику не вірять (`CLOCK_UNVERIFIED`, `CLOCK_DRIFT`) або змінився `jump_epoch` (стрибок) →
+відкриті години відкидаються (`liquidation_clock_untrusted`), записані й готові лишаються. Відлік повних годин
+починається заново, коли годиннику знову вірять (`liquidation_clock_trusted`). `CLOCK_JUMP_UNRECONCILED` книга не
+враховує: це про звірку рахунку, якої в колектора немає. Стрибок вона бачить за `jump_epoch`.
+
+**Запис у БД** — окрема задача (`_Writer`): цикл читання лише смикає її після кожного кадру і БД не чекає, тож
+повільна БД не робить здорове з'єднання «тихим». Прогалини зводяться на старті, після кожної сесії, після
+невдалого з'єднання і раз на `GAP_SYNC_INTERVAL_MS` (60 с) або щойно годину записано. Після помилки БД
+(`liquidation_save_failed` / `liquidation_gap_sync_failed`, з `failures` і `retry_in_ms`) наступна спроба — не
+раніше `db_retry_delay_ms`, тож лог не повторюється на кожен кадр. Успіх після помилок —
+`liquidation_db_recovered`. Невдалий запис години її не підтверджує: вона лишається в пам'яті. Після `stop` —
+останній прохід без паузи, не довше `FINAL_FLUSH_TIMEOUT_MS` (інакше `liquidation_final_flush_timeout`, error).
+Період до лістингу діркою не є, щойно в `instruments` є `launch_time_ms` (той самий `candle_scan_start_ms`, що у
+свічок). Немає рядка кешу — сітка з `BACKFILL_START_MS`.
+
+**Підписка.** Кожен символ — окремий запит із `req_id` = темою: mainnet відхиляє спільний запит цілком, якщо хоч
+одна тема невідома. Відхилений символ — `liquidation_topic_rejected` (error) і прогалини лише для нього. Відхилено
+всі — нове з'єднання.
+
+**Деривативи** (ТЗ §4.4, §6.4). Поруч із потоком `run_derivatives` крутить `DerivativesSync.run_if_due` з того самого
+`BybitAdapter` (частка `COLLECTOR`): перший прохід — щойно годиннику вірять, далі раз на `BACKFILL_INTERVAL_S`, після
+збою — пауза самого `DerivativesSync`. Хвіст ≤ `INLINE_MAX_BARS` (168 год) качає колектор, довшу історію — воркер
+(задача `backfill_derivatives`, її ставить той самий прохід). Поки годиннику не вірять, прохід не запускається
+(`derivatives_waiting_for_clock`, warning): межа «закритої» години рахується за локальним годинником, а незакриту
+біржову годину вставка `ON CONFLICT DO NOTHING` уже не виправила б. Підсумок проходу — `derivatives_synced` (лічильники
+рядів, `job_symbols`, `failed_symbols`). Збій — `derivatives_sync_failed` (error; несподіваний виняток — з
+трасуванням), і колектор ліквідацій працює далі: деривативи можна докачати пізніше, ліквідації — ні. `stop`
+перериває прохід посеред (`derivatives_sync_interrupted`): вікна комітяться окремо, повтор ідемпотентний.
+
+На одній БД — один колектор
+(`COLLECTOR_LOCK_ID` = 3, `ctb-collector pid=N`). Реконект: від `RECONNECT_BASE_MS` (1 с), подвоєння, стеля
+`RECONNECT_CAP_MS` (60 с), jitter `[пауза / 2, пауза]`; підтверджена підписка знову ставить паузу на базову.
+Обрив, відхилено всі символи, тиша понад 60 с і немає відповіді на будь-яку підписку за 10 с
+(`liquidation_subscribe_timeout`) — нове з'єднання. Відкриття з'єднання — не довше 15 с. SIGTERM/SIGINT зупиняють
+колектор одразу: `stop` перериває і очікування кадру (після `stop` ping не йде, тож у тихому потоці кадру може не
+бути хвилинами), і встановлення з'єднання; сокет, що відкрився разом зі `stop`, закривається без підписки.
+Пріоритет ОС не знижується.
+
+Коди виходу і команда — `apps/backend/README.md`. Добова перевірка «без втрат» за відкритими `data_gaps` ще попереду:
+процес має відпрацювати добу. Префікс від `BACKFILL_START_MS` або лістингу до першої повної години — очікуваний і
+постійний. Дірка всередині вже зібраного хвоста — втрата.
+
 ## Час (T1.6, ТЗ §4.3)
 
 `ClockGuard` блокує лише **нові входи**; захист і закриття стан годинника не питають. Коди причин — `ClockBlockReason`.
-> Заплановано: перед входом `state(scope).entries_allowed` читатимуть цикл бота (T5.2) і `RiskGate` (T4.1); зараз
-> модуль ще ніхто не викликає.
+> Заплановано: перед входом `state(scope).entries_allowed` читатимуть цикл бота (T5.2) і `RiskGate` (T4.1). Зараз
+> `ClockGuard` працює лише в колекторі ліквідацій (T1.10): там він не блокує входи, а вирішує, чи можна закривати
+> години (розділ «Ліквідації» вище).
 
 **Розбіжність з біржею.** `check_drift()` — при старті (ТЗ §11.1 п. 6) і кожні 10 хв. Один вимір — `fetch_time`
 між двома читаннями годинника: локальний час — середина запиту, похибка — `⌈RTT / 2⌉` плюс `CLOCK_RATE_TOLERANCE_PPM`
@@ -241,4 +314,4 @@ T3.2); правило біржі `server_time − recv_window ≤ timestamp < se
 | T1.6 | `[x]` | `time_sync.py`: розбіжність з `fetch_time` (старт, 10 хв, з похибкою RTT і старіння), детектор стрибків щосекунди, епохи стрибків і квитки звірки по акаунтах, `request_recheck`, `RECV_WINDOW_MS` |
 | T1.7 | `[x]` | початок сітки свічок від `launch_time_ms` (найраніший серед режимів); funding без цього зсуву |
 | T1.9 | `[x]` | інкрементальний backfill п'яти рядів деривативів 1h для `research_symbols`; довга історія — `backfill_derivatives`; прогалини в `data_gaps` |
-| T1.10 | `[ ]` | Колектор ліквідацій |
+| T1.10 | `[~]` | колектор `python -m app.data.collector`: публічний WS `allLiquidation`, агрегат 1h long/short, реконект, прогалини; добу без втрат ще не перевірено |

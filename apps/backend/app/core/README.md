@@ -42,12 +42,12 @@
 | `get_logger(name=APP, **initial)` | `logging.py` | structlog-логер; канали `APP`, `TRADING`, `ORDERS` або `app.<модуль>` |
 | `bind_context(**values)`, `clear_context()` | `logging.py` | контекст запису (`bot_id`, `symbol`, `client_order_id`, `signal_id`) через contextvars |
 | `SecretMasker`, `MASK`, `SECRET_MASK`, `MIN_SECRET_LEN`, `MAX_STR_LEN` | `logging.py` | процесор маскування і його константи; `SecretMasker.mask(value)` — маскована JSON-придатна копія значення поза логами (`request`/`result` в `audit_log`, T0.7) |
-| `InstanceLock(url, *, lock_id=BACKEND_LOCK_ID, application_name_prefix=APPLICATION_NAME_PREFIX)` | `instance_lock.py` | advisory lock процесу (торговий; воркер — `WORKER_LOCK_ID` і `WORKER_APPLICATION_NAME_PREFIX`) на окремій сесії (одноразовий): `acquire(wait_ms=, takeover=)`, `watch()`, `release()`, `held`, `session_pid`, `lost_reason`, `ensure_held()` |
+| `InstanceLock(url, *, lock_id=BACKEND_LOCK_ID, application_name_prefix=APPLICATION_NAME_PREFIX)` | `instance_lock.py` | advisory lock процесу (торговий; воркер — `WORKER_LOCK_ID` і `WORKER_APPLICATION_NAME_PREFIX`; колектор — `COLLECTOR_LOCK_ID` і `COLLECTOR_APPLICATION_NAME_PREFIX`) на окремій сесії (одноразовий): `acquire(wait_ms=, takeover=)`, `watch()`, `release()`, `held`, `session_pid`, `lost_reason`, `ensure_held()` |
 | `run_exclusive(lock, body, *, on_stuck)` | `instance_lock.py` | виконати `body` під watchdog-ом lock; втрата lock чи зовнішнє скасування → `body` скасовано й дочекано (≤ `BODY_STOP_TIMEOUT_MS`, інакше `on_stuck`), потім `InstanceLockLost` / `CancelledError` |
 | `InstanceLockHeld`, `InstanceLockUnavailable`, `InstanceLockLost`, `TakeoverRefused` | `instance_lock.py` | lock тримає інша сесія (з `holders`); БД недоступна (`last_error`); lock втрачено (`reason`); перехоплення не виконано (`not_confirmed` / `holder_changed` / `audit_failed`) |
 | `LockHolder` | `instance_lock.py` | власник lock з `pg_locks` + `pg_stat_activity`: pid сесії, pid процесу ОС з `application_name`, адреса, користувач, стан, час у мс |
-| `connect_lock_session(url, *, server_settings)`, `lock_server_settings(pid=None, *, prefix=)`, `application_name(pid, *, prefix=)` | `instance_lock.py` | окреме raw-з'єднання asyncpg (поза пулом) і параметри сесії lock (`application_name` `ctb-backend pid=N` або `ctb-worker pid=N`; інший префікс — `ValueError`; серверні keepalive) |
-| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `WORKER_LOCK_ID`, `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
+| `connect_lock_session(url, *, server_settings)`, `lock_server_settings(pid=None, *, prefix=)`, `application_name(pid, *, prefix=)` | `instance_lock.py` | окреме raw-з'єднання asyncpg (поза пулом) і параметри сесії lock (`application_name` `ctb-backend pid=N`, `ctb-worker pid=N` або `ctb-collector pid=N`; інший префікс — `ValueError`; серверні keepalive) |
+| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `WORKER_LOCK_ID`, `COLLECTOR_LOCK_ID`, `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
 
 Поля `Settings` (межі й defaults визначені в `config.py`):
 
@@ -162,8 +162,11 @@
 Не дає запустити другий екземпляр торгового процесу (`python -m app`) на тій самій БД (ТЗ §6.4, рішення
 `docs/decisions/0006-instance-lock.md`). Той самий механізм з ключем `(LOCK_NAMESPACE, WORKER_LOCK_ID)` =
 `(0x63746200, 2)` і `application_name = "ctb-worker pid=<pid ОС>"` тримає воркер задач (`app/jobs/worker.py`,
-рішення `docs/decisions/0008-single-worker.md`): один воркер на БД. Перехоплення (`takeover`) воркер не використовує;
-решта розділу — однаково для обох процесів, коди виходу воркера — `app/jobs/README.md`.
+рішення `docs/decisions/0008-single-worker.md`): один воркер на БД. Колектор ліквідацій бере
+`(LOCK_NAMESPACE, COLLECTOR_LOCK_ID)` = `(0x63746200, 3)` і `application_name = "ctb-collector pid=<pid ОС>"`
+(`app/data/collector.py`): частка IP колектора теж розрахована на один процес. Перехоплення (`takeover`) воркер і
+колектор не використовують; решта розділу — однаково для всіх трьох процесів, коди виходу воркера —
+`app/jobs/README.md`, колектора — `apps/backend/README.md`.
 
 - **Ключ:** `pg_try_advisory_lock(LOCK_NAMESPACE, BACKEND_LOCK_ID)` = `(0x63746200 "ctb\0", 1)`; у `pg_locks` —
   `locktype = 'advisory'`, `classid`/`objid`, `objsubid = 2`. Lock діє в межах **однієї БД** (`POSTGRES_DB`): другий

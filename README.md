@@ -35,6 +35,7 @@ uv run pytest -q
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 uv run python -m app                              # торговий процес + API на 127.0.0.1:8000 (другий екземпляр на тій самій БД не стартує; коди виходу — apps/backend/README.md)
 uv run python -m app.jobs.worker                  # воркер задач (backfill); коди виходу — apps/backend/README.md
+uv run python -m app.data.collector               # колектор ліквідацій і хвоста деривативів; коди виходу — apps/backend/README.md
 
 # веб (з apps/web)
 npm run typecheck

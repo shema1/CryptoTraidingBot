@@ -8,6 +8,9 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "alembic>=1.14,<2", # міграції схеми БД (migrations/, T0.4)
     "asyncpg>=0.30,<1", # async-драйвер PostgreSQL для SQLAlchemy (T0.4)
+    # Публічний WS ліквідацій (app/exchange/liquidations.py, T1.10). CCXT уже тягне aiohttp транзитивно;
+    # прямий імпорт вимагає прямої залежності.
+    "aiohttp>=3.14,<4",
     # Bybit v5 REST (app/exchange/bybit.py, T1.3): сирі рядки цін, не unified float CCXT.
     "ccxt>=4.5.91,<5",
     "fastapi>=0.160,<1", # локальний API (app/api, T0.7); тягне starlette і opentelemetry-api (лише API, без SDK)
