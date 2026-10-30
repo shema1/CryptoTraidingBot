@@ -47,11 +47,15 @@
 
 0. Якщо в корені є тека `ai-setup/` — з кореня проєкту виконайте `bash ai-setup/install.sh`. Скрипт розгорне `.claude/` і `.mcp.json`, перевірить запобіжники й видалить `ai-setup/`.
 1. Потрібні: `python3`, [uv](https://docs.astral.sh/uv/) (для `uvx postgres-mcp`), Node.js (для `npx`), Docker.
-2. Змінна для MCP бази (read-only роль `ctb_readonly` створює `docker compose up` при першій ініціалізації БД; пароль — `POSTGRES_READONLY_PASSWORD`), наприклад у `~/.zshrc`:
+2. Змінна `MCP_DATABASE_URI` для MCP `postgres-readonly`. Її читає не `.env`, а оточення, з яким стартує Claude Code / Cursor, тож вона задається в профілі shell. Read-only роль `ctb_readonly` створює `docker compose up` при першій ініціалізації БД; пароль — `POSTGRES_READONLY_PASSWORD` з `.env` (пароль власника `ctb` сюди не кладіть). Один раз, з кореня проєкту — команда переносить пароль з `.env` у `~/.zshenv`, не показуючи його на екрані:
    ```bash
-   export MCP_DATABASE_URI="postgresql://ctb_readonly:<пароль>@127.0.0.1:5432/ctb"
+   echo "export MCP_DATABASE_URI='postgresql://ctb_readonly:$(grep '^POSTGRES_READONLY_PASSWORD=' .env | cut -d= -f2-)@127.0.0.1:5432/ctb'" >> ~/.zshenv
    ```
-   Поки БД не запущена (`docker compose up -d`), сервер `postgres-readonly` не підключиться — це нормально. Після запуску БД перепідключіть MCP (`/mcp`) або перезапустіть сесію.
+   - `~/.zshenv` читає будь-який zsh, а не лише інтерактивний термінал (`~/.zshrc`). Bash у WSL2 — `~/.bashrc`.
+   - Змінювали `POSTGRES_PORT` або `POSTGRES_DB` — виправте `5432` / `ctb` у рядку. Пароль із команди `secrets.token_urlsafe` (getting-started, крок 2) кодувати не треба; символи `@ : / # ?` у паролі пишуться як `%XX`.
+   - Змінна підхоплюється лише при старті: повністю перезапустіть застосунок Claude / Cursor або термінал, з якого запускаєте `claude`.
+
+   Поки БД не запущена (`docker compose up -d`), сервер `postgres-readonly` не підключиться — це нормально. Після запуску БД перепідключіть MCP (`/mcp` у терміналі) або почніть нову сесію. Сервер не підключається й при запущеній БД — у новому терміналі `[ -n "$MCP_DATABASE_URI" ] && echo set` має вивести `set`; інакше змінна не потрапила в профіль.
 3. **Claude Code:** відкрийте теку проєкту, запустіть `claude`, підтвердіть довіру проєкту та MCP-сервери з `.mcp.json`. Перевірка: `/mcp` (сервери), `/agents` (3 субагенти), `/hooks` (hooks), `/memory` (CLAUDE.md і rules).
 4. **Cursor:** Settings → MCP — увімкніть сервери з `.cursor/mcp.json`; Settings → Rules — мають бути видні правила з `.cursor/rules` і `AGENTS.md`; Settings → Hooks — перевірте, що `.cursor/hooks.json` підхоплено (за потреби перезапустіть Cursor). Skills Cursor знайде в `.claude/skills/`.
 5. **Windows / WSL2:** якщо працюєте в Windows без WSL і команда `python3` недоступна — замініть `python3` на `python` у `.claude/settings.json` та `.cursor/hooks.json`.

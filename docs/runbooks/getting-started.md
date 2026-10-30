@@ -87,8 +87,12 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 (cd apps/backend && uv sync)
 (cd apps/web && npm ci)
 uv run --project apps/backend pre-commit install    # git-хуки (лише для розробки)
-bash ai-setup/install.sh                            # лише якщо працюєте з AI-агентами (.claude/, .mcp.json)
+bash ai-setup/install.sh                            # лише якщо в корені є тека ai-setup/ (AI-агенти: .claude/, .mcp.json)
 ```
+
+Працюєте з AI-агентами (Claude Code, Cursor) — після кроку 4 задайте `MCP_DATABASE_URI` для MCP `postgres-readonly`
+(агент читає dev-БД через роль `ctb_readonly`): `docs/ai/AI_SETUP.md`, «Встановлення», крок 2. Змінна живе в профілі
+shell, а не в `.env`; без неї бекенд працює, лише агент не бачить БД.
 
 ## 4. База даних
 

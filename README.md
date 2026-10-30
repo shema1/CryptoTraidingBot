@@ -57,6 +57,7 @@ docker compose stop timescaledb                  # зупинка (дані ли
 - Порт публікується лише на `127.0.0.1:5432`; `restart: unless-stopped`, `healthcheck` через `pg_isready`.
 - Основна БД `ctb` (власник `ctb`), окрема БД `ctb_test` для `integration`-тестів, read-only роль `ctb_readonly`
   для MCP `postgres-readonly` (сесії за замовчуванням read-only, доступ лише до основної БД, `SELECT` на всі поточні й майбутні таблиці).
+  MCP підключається через змінну `MCP_DATABASE_URI` у профілі shell — [`docs/ai/AI_SETUP.md`](docs/ai/AI_SETUP.md), «Встановлення», крок 2.
 - Init-скрипт (`infra/db/init/`) виконується **лише при першій ініціалізації порожнього volume**. Зміна пароля пізніше — `ALTER ROLE` у `psql`.
   Видалення volume знищує всі дані БД — робіть це лише свідомо й на dev-БД.
 
