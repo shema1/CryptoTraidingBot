@@ -1126,3 +1126,147 @@ def test_a_mark_series_built_once_gives_the_same_labels() -> None:
     with pytest.raises(ValueError, match="SimCandle"):
         MarkSeries((object(),))  # type: ignore[arg-type]
     assert len(MarkSeries(())) == 0
+
+
+def test_strict_path_rejects_a_gap_after_an_early_target_and_the_loose_path_keeps_it() -> None:
+    hit = _candle(0, 100, 105, "99.5", 104)
+    later = _candle(2, 100, 101, 99, 100)
+    with pytest.raises(IncompletePath) as caught:
+        simulate_trade(
+            (hit, later),
+            entry_index=0,
+            side=_LONG,
+            atr=_ATR,
+            params=_params(3),
+            costs=_zero_slip(),
+        )
+    assert caught.value.last_index is None
+    trade = simulate_trade(
+        (hit, later),
+        entry_index=0,
+        side=_LONG,
+        atr=_ATR,
+        params=_params(3),
+        costs=_zero_slip(),
+        strict_path=False,
+    )
+    assert trade.exit_reason is ExitReason.TAKE_PROFIT
+    assert trade.exit_index == 0
+    complete = _pad((hit,), index=0, horizon=3)
+    assert simulate_trade(
+        complete,
+        entry_index=0,
+        side=_LONG,
+        atr=_ATR,
+        params=_params(3),
+        costs=_zero_slip(),
+        strict_path=False,
+    ) == simulate_trade(
+        complete,
+        entry_index=0,
+        side=_LONG,
+        atr=_ATR,
+        params=_params(3),
+        costs=_zero_slip(),
+    )
+
+
+def test_loose_path_names_the_last_bar_when_no_barrier_fired() -> None:
+    bars = tuple(_candle(index, 100, 101, 99, 100) for index in (0, 1, 3))
+    with pytest.raises(IncompletePath) as caught:
+        simulate_trade(
+            bars,
+            entry_index=0,
+            side=_LONG,
+            atr=_ATR,
+            params=_params(4),
+            costs=_zero_slip(),
+            strict_path=False,
+        )
+    assert caught.value.last_index == 1
+
+
+def test_broken_path_is_the_stop_budget_not_a_skipped_trade() -> None:
+    from app.ml.trade_sim import close_broken_path
+
+    bars = tuple(_candle(index, 100, 101, 99, 100) for index in range(2))
+    trade = close_broken_path(
+        bars,
+        entry_index=0,
+        last_index=1,
+        side=_LONG,
+        atr=_ATR,
+        params=_params(4),
+        costs=_zero_slip(),
+    )
+    assert trade.exit_reason is ExitReason.DATA_GAP
+    assert trade.exit_index == 1
+    assert trade.net_per_unit == -trade.loss_per_unit
+    assert trade.meta_label == 0
+    with pytest.raises(ValueError, match="не суцільний"):
+        close_broken_path(
+            tuple(_candle(index, 100, 101, 99, 100) for index in (0, 2)),
+            entry_index=0,
+            last_index=1,
+            side=_LONG,
+            atr=_ATR,
+            params=_params(4),
+            costs=_zero_slip(),
+        )
+
+
+def test_market_close_of_an_open_trade_takes_the_given_price_and_market_costs() -> None:
+    from app.ml.trade_sim import close_at_market
+
+    bars = _pad((_candle(0, 100, 101, 99, 100), _candle(1, 100, "100.5", "98.5", 99)), index=0, horizon=3)
+    trade = simulate_trade(bars, entry_index=0, side=_LONG, atr=_ATR, params=_params(3), costs=_zero_slip())
+    assert trade.exit_reason is ExitReason.TIME_STOP
+    closed = close_at_market(bars, trade, exit_index=1, reference_exit=Decimal("98.5"), costs=_zero_slip())
+    assert closed.exit_reason is ExitReason.EMERGENCY_STOP
+    assert closed.exit_index == 1
+    assert closed.exit_open_time_ms == bars[1].open_time_ms
+    assert closed.reference_exit == Decimal("98.5")
+    assert closed.exit_fill == Decimal("98.5")
+    # −1,5 − 0,1 − 0,0985
+    assert closed.net_per_unit == Decimal("-1.6985")
+    assert closed.loss_per_unit == trade.loss_per_unit
+    assert closed.stop_price_source is trade.stop_price_source
+    assert closed.meta_label == 0
+
+    # Market-вихід: slippage ноги входу (10 bps) проти закриття, як у time-stop.
+    slipped = CostModel(
+        taker_fee_rate=Decimal("0.001"),
+        maker_fee_rate=Decimal("0.0002"),
+        slippage_entry_atr=Decimal(0),
+        slippage_entry_bps=Decimal(10),
+        slippage_sl_atr=Decimal(0),
+        slippage_sl_bps=Decimal(0),
+        slippage_tp_atr=Decimal(0),
+        slippage_tp_bps=Decimal(0),
+    )
+    costly = simulate_trade(bars, entry_index=0, side=_LONG, atr=_ATR, params=_params(3), costs=slipped)
+    forced = close_at_market(bars, costly, exit_index=1, reference_exit=Decimal("98.5"), costs=slipped)
+    assert forced.exit_fill == Decimal("98.4015")
+    # 98,4015 − 100,1 − 0,1001 − 0,0984015
+    assert forced.net_per_unit == Decimal("-1.8970015")
+
+
+def test_market_close_rejects_a_bar_the_exchange_already_closed_and_foreign_inputs() -> None:
+    from app.ml.trade_sim import close_at_market, close_broken_path
+
+    bars = _pad((_candle(0, 100, 101, 99, 100), _candle(1, 100, "100.5", 97, 99)), index=0, horizon=3)
+    stopped = simulate_trade(bars, entry_index=0, side=_LONG, atr=_ATR, params=_params(3), costs=_zero_slip())
+    assert stopped.exit_reason is ExitReason.STOP_LOSS
+    with pytest.raises(ValueError, match="вже закрита"):
+        close_at_market(bars, stopped, exit_index=1, reference_exit=Decimal(99), costs=_zero_slip())
+    with pytest.raises(ValueError, match="поза свічкою"):
+        close_at_market(bars, stopped, exit_index=0, reference_exit=Decimal("98.9"), costs=_zero_slip())
+    with pytest.raises(ValueError, match="модель витрат"):
+        close_at_market(bars, stopped, exit_index=0, reference_exit=Decimal(99), costs=CostModel())
+    with pytest.raises(ValueError, match="exit_index"):
+        close_at_market(bars, stopped, exit_index=2, reference_exit=Decimal(99), costs=_zero_slip())
+    broken = close_broken_path(
+        bars, entry_index=0, last_index=0, side=_LONG, atr=_ATR, params=_params(3), costs=_zero_slip()
+    )
+    with pytest.raises(ValueError, match="DATA_GAP"):
+        close_at_market(bars, broken, exit_index=0, reference_exit=Decimal(99), costs=_zero_slip())

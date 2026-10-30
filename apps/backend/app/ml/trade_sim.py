@@ -18,7 +18,8 @@ Mark-свічки індексує `MarkSeries`, один раз на ряд.
 
 Майбутні свічки після `t-1` входять лише в шлях угоди (це і є мітка). Рівні бар'єрів і ATR їх не читають.
 Мітка є лише коли шлях суцільний до `open[t + horizon]`: інакше біля дірки лишились би лише ранні TP.
-Вихід не вигадується.
+Вихід не вигадується. Примусові виходи бектесту — `close_broken_path` (дірка під час утримання) і
+`close_at_market` (Emergency Stop); розмітка їх не викликає.
 """
 
 from __future__ import annotations
@@ -46,11 +47,18 @@ _LabelT = TypeVar("_LabelT", bound=Hashable)
 
 
 class ExitReason(StrEnum):
-    """Чим закрилась угода. Meta-мітка 1 — лише `TAKE_PROFIT`."""
+    """Чим закрилась угода. Meta-мітка 1 — лише `TAKE_PROFIT`.
+
+    `DATA_GAP` — не ціновий вихід: бектест закриває угоду бюджетом стопа, коли шлях до горизонту
+    обірвався і бар'єр на відомому префіксі не спрацював. `EMERGENCY_STOP` — примусове market-закриття
+    бектестом, коли просадка дійшла ліміту (`HALTED`, ТЗ §8.5, §10.3). У розмітку обидва не потрапляють.
+    """
 
     TAKE_PROFIT = "TAKE_PROFIT"
     STOP_LOSS = "STOP_LOSS"
     TIME_STOP = "TIME_STOP"
+    DATA_GAP = "DATA_GAP"
+    EMERGENCY_STOP = "EMERGENCY_STOP"
 
 
 class StopPriceSource(StrEnum):
@@ -84,7 +92,15 @@ class TradePathError(ValueError):
 
 
 class IncompletePath(TradePathError):
-    """До time-stop не вистачає суцільних свічок, а бар'єр раніше не спрацював."""
+    """До time-stop не вистачає суцільних свічок, а бар'єр раніше не спрацював.
+
+    `last_index` — остання суцільна свічка від входу, якщо прохід ішов без `strict_path`.
+    Інакше `None`: розмітка не користується частковим шляхом.
+    """
+
+    def __init__(self, message: str, *, last_index: int | None = None) -> None:
+        super().__init__(message)
+        self.last_index = last_index
 
 
 class NoAtr(TradePathError):
@@ -334,11 +350,14 @@ def simulate_trade(
     funding: Sequence[FundingEvent] = (),
     bar_ms: int = HOUR_MS,
     entry_is_maker: bool = False,
+    strict_path: bool = True,
 ) -> SimulatedTrade:
     """Закрити одну угоду. `atr` — вже ATR(t-1); ця функція його не перераховує і свічок після входу в нього не бере.
 
-    Шлях має бути суцільним до свічки time-stop, навіть якщо бар'єр спрацював раніше: інакше біля кінця
-    ряду і дірок у вибірці лишались би лише ранні TP. Немає цього шляху — `IncompletePath`.
+    За замовчуванням шлях має бути суцільним до свічки time-stop, навіть якщо бар'єр спрацював раніше:
+    інакше біля кінця ряду і дірок у вибірці лишались би лише ранні TP. Немає цього шляху — `IncompletePath`.
+    `strict_path=False` (лише бектест) повертає бар'єр на суцільному префіксі; дірка, поки угода ще відкрита,
+    лишається `IncompletePath` з `last_index`. Розмітка цей прапорець не передає.
     Багато угод на одному ряді — передавати `MarkSeries`, побудований один раз.
     """
     spec = params if params is not None else TargetParams()
@@ -351,12 +370,15 @@ def simulate_trade(
         raise ValueError("params має бути TargetParams, costs — CostModel")
     if type(entry_is_maker) is not bool:
         raise ValueError("entry_is_maker має бути bool")
+    if type(strict_path) is not bool:
+        raise ValueError("strict_path має бути bool")
     if entry_is_maker:
         raise ValueError("post-only у версії 1 вимкнено: бектест моделює лише market-вхід")
     require_decimal("atr", atr, positive=True)
     if entry_index >= len(candles):
         raise IncompletePath("немає свічки входу")
-    _require_path(candles, entry_index, spec.horizon_bars, bar_ms)
+    if strict_path:
+        _require_path(candles, entry_index, spec.horizon_bars, bar_ms)
     entry = _as_candle(candles[entry_index])
     stop, take = _barriers(side, entry.open, atr, spec)
     priced = model.execution(
@@ -375,12 +397,14 @@ def simulate_trade(
     source, stop_marks = _stop_source(candles, entry_index, spec.horizon_bars, _mark_series(mark_candles))
     exit_index = entry_index + spec.horizon_bars
     previous = entry
+    last_index = entry_index
     outcome: tuple[ExitReason, Decimal] | None = None
     for index in range(entry_index, min(len(candles), exit_index)):
         bar = _as_candle(candles[index])
         if index > entry_index and bar.open_time_ms - previous.open_time_ms != bar_ms:
-            raise IncompletePath("дірка в траєкторії до бар'єра")
+            raise IncompletePath("дірка в траєкторії до бар'єра", last_index=None if strict_path else last_index)
         previous = bar
+        last_index = index
         sl_bar = bar if stop_marks is None else _mark_bar(stop_marks, bar)
         outcome = _bar_outcome(side, last=bar, stop_bar=sl_bar, stop=stop, take=take)
         if outcome is not None:
@@ -388,10 +412,10 @@ def simulate_trade(
             break
     if outcome is None:
         if exit_index >= len(candles):
-            raise IncompletePath("немає свічки time-stop")
+            raise IncompletePath("немає свічки time-stop", last_index=None if strict_path else last_index)
         exit_bar = _as_candle(candles[exit_index])
         if exit_bar.open_time_ms - previous.open_time_ms != bar_ms:
-            raise IncompletePath("дірка перед time-stop")
+            raise IncompletePath("дірка перед time-stop", last_index=None if strict_path else last_index)
         decision = check_time_stop(
             opened_at_ms=entry.open_time_ms,
             now_ms=exit_bar.open_time_ms,
@@ -444,6 +468,144 @@ def simulate_trade(
         funding=funding,
         entry_is_maker=entry_is_maker,
         loss_per_unit=priced.loss_per_unit,
+    )
+
+
+@fixed_context
+def close_broken_path(
+    candles: Sequence[SimCandle],
+    *,
+    entry_index: int,
+    last_index: int,
+    side: PositionSide,
+    atr: Decimal,
+    params: TargetParams | None = None,
+    costs: CostModel | None = None,
+    funding: Sequence[FundingEvent] = (),
+    bar_ms: int = HOUR_MS,
+) -> SimulatedTrade:
+    """Закрити обірваний шлях бюджетом стопа. Викликає бектест, не розмітка.
+
+    Бар'єр на відомому префіксі не спрацював (`IncompletePath`), тож ціни за діркою немає.
+    Вихід — виконання стопа з `CostModel`: `net_per_unit = −loss_per_unit + funding` на
+    `(open входу, open останньої суцільної свічки]`. Пропуск тут завищив би результат.
+    """
+    spec = params if params is not None else TargetParams()
+    model = costs if costs is not None else CostModel()
+    _require_index(entry_index)
+    _require_index(last_index)
+    _require_bar_ms(bar_ms)
+    if type(side) is not PositionSide:
+        raise ValueError("side має бути PositionSide")
+    if type(spec) is not TargetParams or type(model) is not CostModel:
+        raise ValueError("params має бути TargetParams, costs — CostModel")
+    require_decimal("atr", atr, positive=True)
+    if last_index < entry_index or last_index >= len(candles) or entry_index >= len(candles):
+        raise ValueError("last_index має лежати на свічках від входу")
+    prefix = candles[entry_index : last_index + 1]
+    for bar in prefix:
+        _as_candle(bar)
+    if not _contiguous(prefix, bar_ms):
+        raise ValueError("префікс до примусового виходу не суцільний")
+    entry = prefix[0]
+    exit_bar = prefix[-1]
+    stop, take = _barriers(side, entry.open, atr, spec)
+    priced = model.execution(
+        side=side,
+        entry=entry.open,
+        stop=stop,
+        take_profit=take,
+        atr=atr,
+        entry_is_maker=False,
+    )
+    if priced is None or priced.take_profit_fill is None:
+        raise UnusableExit("бар'єри не дають ціни виконання")
+    return _close(
+        model=model,
+        side=side,
+        entry_index=entry_index,
+        exit_index=last_index,
+        entry=entry,
+        exit_bar=exit_bar,
+        reason=ExitReason.DATA_GAP,
+        source=StopPriceSource.LAST,
+        stop=stop,
+        take=take,
+        reference_exit=stop,
+        entry_fill=priced.entry_fill,
+        barrier_exit=priced.stop_fill,
+        atr=atr,
+        funding=funding,
+        entry_is_maker=False,
+        loss_per_unit=priced.loss_per_unit,
+    )
+
+
+@fixed_context
+def close_at_market(
+    candles: Sequence[SimCandle],
+    trade: SimulatedTrade,
+    *,
+    exit_index: int,
+    reference_exit: Decimal,
+    costs: CostModel | None = None,
+    funding: Sequence[FundingEvent] = (),
+) -> SimulatedTrade:
+    """Примусово закрити ще відкриту угоду market (Emergency Stop при `HALTED`). Викликає бектест, не розмітка.
+
+    `trade` — результат `simulate_trade` з тією самою моделлю витрат. `reference_exit` — ціна last на
+    свічці `exit_index`: її `open` або екстремум проти позиції. Вихід — як time-stop: slippage величини
+    входу (`ENTRY`) проти закриття і taker, funding на `(open входу, open свічки виходу]`.
+    Свічка, на якій біржа вже закрила угоду (SL, time-stop, геп), не замінюється: лише свічка до виходу
+    або свічка TP за тінню, де порядок тіні й TP невідомий (песимістично — тінь перша).
+    """
+    model = costs if costs is not None else CostModel()
+    if type(trade) is not SimulatedTrade:
+        raise ValueError("trade має бути SimulatedTrade")
+    if type(model) is not CostModel:
+        raise ValueError("costs має бути CostModel")
+    _require_index(exit_index)
+    require_decimal("reference_exit", reference_exit, positive=True)
+    if trade.exit_reason in (ExitReason.DATA_GAP, ExitReason.EMERGENCY_STOP):
+        raise ValueError(f"угода вже закрита примусово ({trade.exit_reason.value})")
+    if not trade.entry_index <= exit_index <= trade.exit_index or exit_index >= len(candles):
+        raise ValueError("exit_index має лежати між входом і виходом угоди")
+    if exit_index == trade.exit_index and trade.exit_reason is not ExitReason.TAKE_PROFIT:
+        raise ValueError("на цій свічці угода вже закрита біржею (SL або time-stop)")
+    entry = _as_candle(candles[trade.entry_index])
+    exit_bar = _as_candle(candles[exit_index])
+    if entry.open_time_ms != trade.entry_open_time_ms:
+        raise ValueError("свічки не того ряду, що угода")
+    if not exit_bar.low <= reference_exit <= exit_bar.high:
+        raise ValueError("ціна виходу поза свічкою")
+    priced = model.execution(
+        side=trade.side,
+        entry=entry.open,
+        stop=trade.reference_stop,
+        take_profit=trade.reference_take_profit,
+        atr=trade.atr,
+        entry_is_maker=False,
+    )
+    if priced is None or priced.entry_fill != trade.entry_fill or priced.loss_per_unit != trade.loss_per_unit:
+        raise ValueError("модель витрат не та, з якою симульовано угоду")
+    return _close(
+        model=model,
+        side=trade.side,
+        entry_index=trade.entry_index,
+        exit_index=exit_index,
+        entry=entry,
+        exit_bar=exit_bar,
+        reason=ExitReason.EMERGENCY_STOP,
+        source=trade.stop_price_source,
+        stop=trade.reference_stop,
+        take=trade.reference_take_profit,
+        reference_exit=reference_exit,
+        entry_fill=trade.entry_fill,
+        barrier_exit=None,
+        atr=trade.atr,
+        funding=funding,
+        entry_is_maker=False,
+        loss_per_unit=trade.loss_per_unit,
     )
 
 
@@ -701,6 +863,20 @@ def _skip_reason(exc: TradePathError) -> SkipReason:
     if type(exc) is UnusableExit:
         return SkipReason.UNUSABLE_EXIT
     raise exc
+
+
+def barrier_prices(side: PositionSide, entry: Decimal, atr: Decimal, params: TargetParams) -> tuple[Decimal, Decimal]:
+    """SL і TP від опорної ціни і ATR(t−1). Та сама формула, що всередині `simulate_trade`.
+
+    Бектест передає ці рівні в `assess_entry`. Недодатний рівень — `UnusableExit` (угоди немає).
+    """
+    if type(side) is not PositionSide:
+        raise ValueError("side має бути PositionSide")
+    if type(params) is not TargetParams:
+        raise ValueError("params має бути TargetParams")
+    require_decimal("entry", entry, positive=True)
+    require_decimal("atr", atr, positive=True)
+    return _barriers(side, entry, atr, params)
 
 
 def _barriers(side: PositionSide, entry: Decimal, atr: Decimal, params: TargetParams) -> tuple[Decimal, Decimal]:
