@@ -762,6 +762,15 @@ def _ema_tail(values: FloatArray, span: int) -> tuple[float, float]:
     return previous, ema
 
 
+def wilder_atr(high: FloatArray, low: FloatArray, close: FloatArray, period: int = ATR_PERIOD) -> float:
+    """Wilder ATR закритого ряду. Та сама формула, що `atr_pct` у `compute_features`.
+
+    Ряд має закінчуватись останньою свічкою, відомою на момент розрахунку. Для бар'єрів угоди це свічки
+    строго до `open[t]` (`atr_before_entry` у `trade_sim.py`).
+    """
+    return _atr_last(high, low, close, period)
+
+
 def _atr_last(high: FloatArray, low: FloatArray, close: FloatArray, period: int) -> float:
     if close.size < period + 1:
         return math.nan
