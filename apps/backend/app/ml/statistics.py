@@ -1,9 +1,11 @@
 """Блочний bootstrap, DSR, PBO, коридор і Gate G1 (ТЗ §5.2.5, §5.3, §5.7, §5А.10).
 
 DSR (Bailey & López de Prado, 2014) рахується з ряду R торгового символу, не з річного Sharpe
-барів бектесту. Кількість спроб — уся лінія, включно з `FAILED` і `PRUNED`. PBO — CSCV на 16
-блоках тих самих рядів (Bailey, Borwein, López de Prado & Zhu, 2015): частка розбиттів, де
-стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
+барів бектесту. Кількість спроб — уся лінія, включно з `FAILED` і `PRUNED`; розкид Sharpe між
+спробами — лише з рядів, де угод не менше за мінімум G1. PBO — CSCV на 16 блоках за часом
+(Bailey, Borwein, López de Prado & Zhu, 2015): рядок матриці — доба відрізка walk-forward
+кандидата, однакова для всіх спроб; частка розбиттів, де стратегія, найкраща на одній половині
+блоків, на іншій не вища за медіану.
 
 Блочний bootstrap групує угоди за тижнем входу (7 діб від епохи UTC) і з цих блоків набирає
 шлях тієї самої довжини. Останній блок шляху може бути обрізаний. PF і коридор беруть уже
@@ -27,14 +29,15 @@ from pydantic import model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ml.backtest import BacktestTrade
+from app.ml.backtest import BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial
 from app.ml.validation import MIN_TRADES_PER_FOLD, RecordedOpening, SplitLeakError, _lock_line, _open_holdout
 from app.risk.limits import next_consecutive_losses
 from app.risk.numbers import FrozenModel, require_decimal
 
-WEEK_MS: int = 7 * 24 * HOUR_MS
+DAY_MS: int = 24 * HOUR_MS
+WEEK_MS: int = 7 * DAY_MS
 CSCV_BLOCKS: int = 16
 DSR_MIN: Decimal = Decimal("0.95")
 PBO_MAX: Decimal = Decimal("0.5")
@@ -182,9 +185,13 @@ class LiveCorridor(FrozenModel):
 
 
 class FoldOutcome(FrozenModel):
-    """Метрики торгового символу одного фолду. PF — з уже порахованого чистого результату."""
+    """Метрики торгового символу одного фолду. PF — з уже порахованого чистого результату.
+
+    `n_signals` — скільки сигналів отримав прогін (ENTER і SKIP); угод не більше.
+    """
 
     n_trades: int
+    n_signals: int
     total_net_usd: Decimal
     profit_factor: Decimal | None
     below_min_trades: bool
@@ -194,6 +201,8 @@ class FoldOutcome(FrozenModel):
     def _fields(self) -> FoldOutcome:
         if self.n_trades < 0:
             raise ValueError("n_trades від'ємне")
+        if self.n_signals < self.n_trades:
+            raise ValueError("n_signals менше за n_trades: кожна угода — це сигнал")
         require_decimal("total_net_usd", self.total_net_usd)
         require_decimal("cost_factor", self.cost_factor, positive=True)
         if self.profit_factor is not None:
@@ -270,6 +279,42 @@ class GateDecision(FrozenModel):
         return self
 
 
+class TrialSeries(FrozenModel):
+    """Ряд спроби для PBO: R, час входу кожної угоди і відрізок walk-forward, який спроба покрила.
+
+    Відрізок — від початку першого тесту до кінця останнього записаного фолду. Спроба без фолдів
+    (`FAILED`/`PRUNED` з порожнім префіксом) відрізка не має: у PBO не входить, у N для DSR — так.
+    """
+
+    returns: tuple[Decimal, ...]
+    entry_ms: tuple[int, ...]
+    covered_from_ms: int | None
+    covered_to_ms: int | None
+
+    @model_validator(mode="after")
+    def _shape(self) -> TrialSeries:
+        if len(self.returns) != len(self.entry_ms):
+            raise ValueError("довжини R і часу входу різні")
+        for value in self.returns:
+            require_decimal("r", value)
+        if (self.covered_from_ms is None) != (self.covered_to_ms is None):
+            raise ValueError("відрізок спроби має обидві межі або жодної")
+        if self.covered_from_ms is None or self.covered_to_ms is None:
+            if self.returns:
+                raise ValueError("угоди без відрізка walk-forward")
+            return self
+        if self.covered_from_ms < 0 or self.covered_to_ms <= self.covered_from_ms:
+            raise ValueError("відрізок спроби порожній або від'ємний")
+        previous = self.covered_from_ms
+        for entry in self.entry_ms:
+            if entry < self.covered_from_ms or entry >= self.covered_to_ms:
+                raise ValueError("час входу поза відрізком спроби")
+            if entry < previous:
+                raise ValueError("час входу не в порядку фолдів")
+            previous = entry
+        return self
+
+
 @dataclass(frozen=True, slots=True)
 class _PathPf:
     value: Decimal | None
@@ -284,6 +329,37 @@ def parse_oos_results(raw: Sequence[object]) -> tuple[Decimal, ...]:
     for item in raw:
         parsed.append(_decimal_text(item))
     return tuple(parsed)
+
+
+def trial_series_from_journal(
+    oos_results: Sequence[object],
+    oos_entry_ms: Sequence[object],
+    metrics: Mapping[str, Any],
+) -> TrialSeries:
+    """Ряд спроби з журналу. Рядок без часу кожної угоди (до міграції 0005) — відмова, а не пропуск."""
+    returns = parse_oos_results(oos_results)
+    if not isinstance(oos_entry_ms, Sequence) or isinstance(oos_entry_ms, (str, bytes)):
+        raise TypeError("oos_entry_ms має бути послідовністю")
+    entries: list[int] = []
+    for item in oos_entry_ms:
+        if type(item) is not int:
+            raise ValueError("час входу має бути int мс")
+        entries.append(item)
+    if len(entries) != len(returns):
+        raise ValueError("у спроби немає часу входу кожної угоди (рядок до міграції 0005)")
+    folds = metrics.get("folds")
+    if not isinstance(folds, list):
+        raise ValueError("у спроби немає списку фолдів")
+    if not folds:
+        return TrialSeries(returns=returns, entry_ms=tuple(entries), covered_from_ms=None, covered_to_ms=None)
+    first, last = folds[0], folds[-1]
+    if not isinstance(first, Mapping) or not isinstance(last, Mapping):
+        raise ValueError("фолд журналу не об'єкт")
+    start = first.get("test_start_ms")
+    end = last.get("test_end_ms")
+    if type(start) is not int or type(end) is not int:
+        raise ValueError("межі тесту фолду мають бути int мс")
+    return TrialSeries(returns=returns, entry_ms=tuple(entries), covered_from_ms=start, covered_to_ms=end)
 
 
 def r_profit_factor(returns: Sequence[Decimal]) -> Decimal | None:
@@ -392,15 +468,20 @@ def deflated_sharpe_ratio(
     *,
     trial_returns: Sequence[Sequence[Decimal]],
     n_trials: int,
+    variance_min_trades: int = MIN_OOS_TRADES,
 ) -> Decimal | None:
     """Імовірність, що Sharpe спроби вищий за очікуваний максимум з `n_trials` спроб.
 
     `trial_returns` — ряди всіх спроб лінії, включно з порожніми; їхня кількість дорівнює `n_trials`.
-    Менше двох оцінок Sharpe при `n_trials` > 1: дисперсію між спробами взяти нізвідки, тоді
-    підставляється дисперсія однієї оцінки за нульової істинної Sharpe, `1/(T−1)`.
+    Розкид Sharpe між спробами береться лише з рядів, де угод не менше за `variance_min_trades`:
+    ряд із 2–3 угод дає Sharpe у десятки і назавжди обвалив би DSR лінії. Коротші ряди лишаються
+    в N. Менше двох таких оцінок при `n_trials` > 1 — дисперсія однієї оцінки за нульової
+    істинної Sharpe, `1/(T−1)`.
     """
     if type(n_trials) is not int or isinstance(n_trials, bool) or n_trials < 1:
         raise ValueError("n_trials має бути ціле ≥ 1")
+    if type(variance_min_trades) is not int or isinstance(variance_min_trades, bool) or variance_min_trades < 2:
+        raise ValueError("variance_min_trades має бути ціле ≥ 2")
     if not isinstance(trial_returns, Sequence) or isinstance(trial_returns, (str, bytes)):
         raise TypeError("ряди спроб мають бути послідовністю")
     if n_trials != len(trial_returns):
@@ -410,16 +491,18 @@ def deflated_sharpe_ratio(
     if moments is None:
         return None
     sharpe, skew, kurt = moments
-    finite = [value for value in (_sharpe(_float_returns(series)) for series in trial_returns) if value is not None]
+    spread = [
+        value
+        for values in (_float_returns(series) for series in trial_returns)
+        if values.size >= variance_min_trades and (value := _sharpe(values)) is not None
+    ]
     if n_trials == 1:
         variance = 0.0
-    elif len(finite) >= 2:
-        mean_sr = sum(finite) / len(finite)
-        variance = sum((item - mean_sr) ** 2 for item in finite) / (len(finite) - 1)
-    elif len(finite) == 1:
-        variance = 1.0 / (len(candidate) - 1)
+    elif len(spread) >= 2:
+        mean_sr = sum(spread) / len(spread)
+        variance = sum((item - mean_sr) ** 2 for item in spread) / (len(spread) - 1)
     else:
-        return None
+        variance = 1.0 / (len(candidate) - 1)
     benchmark = _selection_benchmark(n_trials, variance)
     probability = _psr(sharpe, benchmark, len(candidate), skew, kurt)
     if probability is None:
@@ -428,35 +511,61 @@ def deflated_sharpe_ratio(
 
 
 def probability_of_backtest_overfitting(
-    trials: Sequence[Sequence[Decimal]],
+    trials: Sequence[TrialSeries],
     *,
     candidate_index: int,
     n_blocks: int = CSCV_BLOCKS,
+    bin_ms: int = DAY_MS,
 ) -> Decimal | None:
-    """PBO методом CSCV. None, якщо кандидат коротший за число блоків або поруч немає другої спроби.
+    """PBO методом CSCV за часом. None, якщо відрізок кандидата коротший за блоки або немає суперника.
 
-    Довжина матриці — кратне `n_blocks` префікса кандидата. Коротша спроба в матрицю не входить,
-    але в лічильнику DSR лишається. Однаковий індекс блоку — це однакове місце в ряді угод, не
-    календар: у журналі немає часу кожної угоди.
+    Рядок матриці — `bin_ms` (доба) від початку відрізка walk-forward кандидата, сума R угод з
+    входом у цю добу; доба без угод — 0. Матриця бере кратну `n_blocks` кількість діб від початку.
+    Входить кожна спроба, що покрила весь відрізок кандидата, хоч би скільки в неї угод; її угоди
+    поза відрізком не беруться. Решта — лише в N для DSR.
     """
     blocks_ok = type(n_blocks) is int and not isinstance(n_blocks, bool)
     if not blocks_ok or not 2 <= n_blocks <= CSCV_BLOCKS or n_blocks % 2 != 0:
         raise ValueError("число блоків CSCV парне від 2 до 16")
+    if type(bin_ms) is not int or isinstance(bin_ms, bool) or bin_ms < 1:
+        raise ValueError("bin_ms має бути int ≥ 1")
     if not isinstance(trials, Sequence) or isinstance(trials, (str, bytes)) or not trials:
         raise ValueError("немає рядів для PBO")
+    _sequence("trials", trials, TrialSeries)
     if type(candidate_index) is not int or isinstance(candidate_index, bool):
         raise ValueError("candidate_index має бути int")
     if candidate_index < 0 or candidate_index >= len(trials):
         raise ValueError("candidate_index поза рядами")
-    candidate = _float_returns(trials[candidate_index])
-    usable = (int(candidate.size) // n_blocks) * n_blocks
+    candidate = trials[candidate_index]
+    if candidate.covered_from_ms is None or candidate.covered_to_ms is None:
+        return None
+    start = candidate.covered_from_ms
+    end = candidate.covered_to_ms
+    usable = (-(-(end - start) // bin_ms) // n_blocks) * n_blocks
     half = n_blocks // 2
     if usable < n_blocks or (usable // n_blocks) * half < 2:
         return None
-    columns = [values[:usable] for series in trials if int((values := _float_returns(series)).size) >= usable]
+    with localcontext(_CONTEXT):
+        columns = [_binned(series, start, bin_ms, usable) for series in trials if _covers(series, start, end)]
     if len(columns) < 2:
         return None
     return _probability(_cscv_fraction(np.column_stack(columns), n_blocks))
+
+
+def fold_outcome_from_report(report: BacktestReport, *, below_min_trades: bool) -> FoldOutcome:
+    """Фолд стресу (чи будь-якого прогону) з `run_backtest`: сигнали — з журналу рішень прогону."""
+    if type(report) is not BacktestReport:
+        raise TypeError("очікувався BacktestReport")
+    if type(below_min_trades) is not bool:
+        raise TypeError("below_min_trades має бути bool")
+    return FoldOutcome(
+        n_trades=report.metrics.n_trades,
+        n_signals=report.n_signals,
+        total_net_usd=report.metrics.total_net_usd,
+        profit_factor=report.metrics.profit_factor,
+        below_min_trades=below_min_trades,
+        cost_factor=report.cost_factor,
+    )
 
 
 def fold_outcomes_from_metrics(metrics: Mapping[str, Any]) -> tuple[FoldOutcome, ...]:
@@ -500,7 +609,7 @@ def evaluate_gate(
 ) -> GateDecision:
     """Gate G1 на walk-forward торгового символу. Hold-out у ці фолди не входить.
 
-    «Не руйнується при подвоєнні витрат» — стрес із `cost_factor` 2, тією самою кількістю угод,
+    «Не руйнується при подвоєнні витрат» — стрес із `cost_factor` 2 на тих самих сигналах (`n_signals`),
     медіана PF ≥ 1 і сумарний чистий результат > 0. Для `meta` фільтр має бути строго кращим за
     правило без фільтра за сумою `total_net_usd`; для `direct` і `rule_only` це порівняння не діє.
     """
@@ -542,7 +651,9 @@ async def open_holdout_after_gate(
 ) -> RecordedOpening:
     """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
 
-    DSR і PBO перераховуються з поточного журналу лінії. Відмова — `GateRejected` з рішенням
+    DSR і PBO перераховуються з поточного журналу лінії. Розкид Sharpe для DSR — з рядів, де угод
+    не менше за `min_oos_trades` G1. PBO — за часом; рядок журналу без часу угод — відмова.
+    Відмова — `GateRejected` з рішенням
     (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
     G1 (пороги, послаблені пороги, стрес, правило без фільтра) і лише тоді — знімок
     `n_trials_line`, `dsr`, `pbo` на експерименті: він завжди збігається з останнім відкриттям
@@ -553,10 +664,6 @@ async def open_holdout_after_gate(
         raise ValueError("trial_id має бути int")
     limits = thresholds if thresholds is not None else GateThresholds()
     experiment, trial, rows = await _load_candidate(session, experiment_id, trial_id)
-    series = [parse_oos_results(row.oos_results) for row in rows]
-    candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
-    dsr = deflated_sharpe_ratio(series[candidate_index], trial_returns=series, n_trials=len(series))
-    pbo = probability_of_backtest_overfitting(series, candidate_index=candidate_index)
     stored = experiment.params.get("validation")
     if not isinstance(stored, dict):
         raise SplitLeakError("в експерименту немає розбивки")
@@ -564,6 +671,16 @@ async def open_holdout_after_gate(
     if type(split_min) is not int or isinstance(split_min, bool) or split_min < 1:
         raise SplitLeakError("у розбивці немає min_trades_per_fold")
     effective = limits.model_copy(update={"min_trades_per_fold": max(limits.min_trades_per_fold, split_min)})
+    series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
+    returns = [item.returns for item in series]
+    candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
+    dsr = deflated_sharpe_ratio(
+        returns[candidate_index],
+        trial_returns=returns,
+        n_trials=len(series),
+        variance_min_trades=max(2, effective.min_oos_trades),
+    )
+    pbo = probability_of_backtest_overfitting(series, candidate_index=candidate_index)
     decision = evaluate_gate(
         label_type=experiment.label_type,
         folds=fold_outcomes_from_metrics(trial.metrics),
@@ -670,7 +787,8 @@ def _stress_holds(
         return False
     if any(item.cost_factor != thresholds.stress_cost_factor for item in stress):
         return False
-    if any(item.n_trades != base.n_trades for item, base in zip(stress, folds, strict=True)):
+    # Ті самі входи, дорожче виконання: сигнали ті самі, а угод ліміти (cooldown) можуть пропустити.
+    if any(item.n_signals != base.n_signals for item, base in zip(stress, folds, strict=True)):
         return False
     median, unbounded = _median_pf(stress)
     if not unbounded and (median is None or median < thresholds.stress_median_pf_min):
@@ -729,13 +847,17 @@ def _fold_outcome(fold: object) -> FoldOutcome:
         raise ValueError("у фолду немає метрик")
     profit_factor = metrics.get("profit_factor")
     n_trades = metrics.get("n_trades")
+    n_signals = trading.get("n_signals")
     below = fold.get("below_min_trades")
     if type(n_trades) is not int or isinstance(n_trades, bool) or n_trades < 0:
         raise ValueError("n_trades фолду має бути невід'ємний int")
+    if type(n_signals) is not int or isinstance(n_signals, bool) or n_signals < 0:
+        raise ValueError("n_signals фолду має бути невід'ємний int")
     if type(below) is not bool:
         raise ValueError("below_min_trades має бути bool")
     return FoldOutcome(
         n_trades=n_trades,
+        n_signals=n_signals,
         total_net_usd=_decimal_text(metrics.get("total_net_usd")),
         profit_factor=None if profit_factor is None else _decimal_text(profit_factor),
         below_min_trades=below,
@@ -764,6 +886,22 @@ async def _load_candidate(
     if trial.state != "COMPLETE":
         raise ValueError("Gate G1 оцінює лише COMPLETE")
     return experiment, trial, rows
+
+
+def _covers(series: TrialSeries, start: int, end: int) -> bool:
+    if series.covered_from_ms is None or series.covered_to_ms is None:
+        return False
+    return series.covered_from_ms <= start and series.covered_to_ms >= end
+
+
+def _binned(series: TrialSeries, start: int, bin_ms: int, n_bins: int) -> np.ndarray:
+    """Сума R за добу входу; сума — у Decimal, у float переходить лише результат."""
+    sums = [Decimal(0)] * n_bins
+    for value, entry in zip(series.returns, series.entry_ms, strict=True):
+        index = (entry - start) // bin_ms
+        if 0 <= index < n_bins:
+            sums[index] += value
+    return np.asarray([float(value) for value in sums], dtype=np.float64)
 
 
 def _week_blocks(trades: Sequence[BacktestTrade]) -> tuple[tuple[Decimal, ...], ...]:

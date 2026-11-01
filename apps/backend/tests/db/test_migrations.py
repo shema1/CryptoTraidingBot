@@ -45,6 +45,12 @@ PREMIUM_CHECKS_0004 = {
     "ck_premium_index_high_ge_close": "CHECK ((high >= close))",
     "ck_premium_index_low_le_close": "CHECK ((low <= close))",
 }
+# 0005 (T2.6): час входу кожної угоди спроби поруч з `oos_results` — для PBO за часом.
+TRIAL_ENTRY_SQL = (
+    "SELECT conname FROM pg_constraint WHERE conrelid = 'experiment_trials'::regclass"
+    " AND conname LIKE '%oos_entry_ms%' ORDER BY conname"
+)
+TRIAL_ENTRY_CHECKS = ["ck_experiment_trials_oos_entry_ms_len", "ck_experiment_trials_oos_entry_ms_non_negative"]
 
 
 async def _scalars(url: URL, sql: str) -> list[object]:
@@ -115,6 +121,38 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
     assert await _public_tables(migrated_db) == expected
     assert await _functions(migrated_db) >= FUNCTIONS
     assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0004
+    assert await _scalars(migrated_db, TRIAL_ENTRY_SQL) == TRIAL_ENTRY_CHECKS
+
+    # 0005 (T2.6): відкат прибирає `experiment_trials.oos_entry_ms` разом з її CHECK.
+    await run_alembic(migrated_db, "downgrade", "-1")
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0004"]
+    assert await _scalars(migrated_db, TRIAL_ENTRY_SQL) == []
+    entry_column = await _scalars(
+        migrated_db,
+        "SELECT column_name FROM information_schema.columns"
+        " WHERE table_name = 'experiment_trials' AND column_name = 'oos_entry_ms'",
+    )
+    assert entry_column == []
+    # Спроба з угодами до 0005 часу не має: CHECK довжини лишається NOT VALID, рядок — як був.
+    await _execute(
+        migrated_db,
+        "INSERT INTO experiments (id, research_line, symbols, timeframe, label_type, primary_strategy, params,"
+        " seed, data_from_ms, data_to_ms, created_at_ms) VALUES ('exp-old', 'BTC/USDT:USDT', ARRAY['BTC/USDT:USDT'],"
+        " '1h', 'meta', '{}', '{}', 1, 0, 3600000, 0)",
+    )
+    await _execute(
+        migrated_db,
+        "INSERT INTO experiment_trials (experiment_id, trial_no, state, params, oos_results, metrics, created_at_ms)"
+        " VALUES ('exp-old', 1, 'COMPLETE', '{}', '[\"1\"]', '{}', 0)",
+    )
+    await run_alembic(migrated_db, "upgrade", "+1")
+    validated = await _scalars(
+        migrated_db,
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'ck_experiment_trials_oos_entry_ms_len'",
+    )
+    assert validated == [False]
+    assert await _scalars(migrated_db, "SELECT cardinality(oos_entry_ms) FROM experiment_trials") == [0]
+    await run_alembic(migrated_db, "downgrade", "-1")
 
     # 0004 (T1.9): open premium не обмежений [low, high]. Відкат повертає старі CHECK і прибирає рядки,
     # які під ними не могли б існувати; узгоджений рядок лишається.
@@ -147,8 +185,9 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
 
     await run_alembic(migrated_db, "upgrade", "head")
     assert await _public_tables(migrated_db) == expected
-    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0004"]
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0005"]
     assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0004
+    assert await _scalars(migrated_db, TRIAL_ENTRY_SQL) == TRIAL_ENTRY_CHECKS
 
 
 @pytest.mark.asyncio

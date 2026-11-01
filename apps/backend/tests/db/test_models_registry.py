@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from sqlalchemy import BigInteger, Date, DateTime, Float, Interval, Numeric, Time
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from app.core.db import MODEL_MODULES, load_models
 
@@ -19,11 +20,15 @@ def test_all_model_modules_are_registered() -> None:
 
 
 def test_time_columns_are_bigint_ms() -> None:
-    """Час — лише BIGINT мілісекунди (ТЗ §15): колонки `*_ms` мають тип BIGINT, інших часових типів немає."""
+    """Час — лише BIGINT мілісекунди (ТЗ §15): колонки `*_ms` мають тип BIGINT, інших часових типів немає.
+
+    Масив часу (`experiment_trials.oos_entry_ms`, T2.6) — лише масив BIGINT.
+    """
     for table in load_models().tables.values():
         for column in table.columns:
             if column.name.endswith("_ms"):
-                assert isinstance(column.type, BigInteger), f"{table.name}.{column.name}: {column.type}"
+                kind = column.type.item_type if isinstance(column.type, ARRAY) else column.type
+                assert isinstance(kind, BigInteger), f"{table.name}.{column.name}: {column.type}"
             assert not isinstance(column.type, DateTime | Date | Time | Interval), f"{table.name}.{column.name}"
 
 

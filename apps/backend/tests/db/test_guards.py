@@ -567,7 +567,15 @@ async def test_experiment_trial_numbers_are_unique(conn: AsyncConnection) -> Non
             data_to_ms=T0 + HOUR_MS,
         )
     )
-    trial = {"experiment_id": "exp-u", "trial_no": 1, "state": "PRUNED", "params": {}, "oos_results": [], "metrics": {}}
+    trial = {
+        "experiment_id": "exp-u",
+        "trial_no": 1,
+        "state": "PRUNED",
+        "params": {},
+        "oos_results": [],
+        "oos_entry_ms": [],
+        "metrics": {},
+    }
     await conn.execute(insert(ExperimentTrial).values(trial))
     await expect_violation(conn, insert(ExperimentTrial).values(trial), "uq_experiment_trials_experiment_id_trial_no")
 

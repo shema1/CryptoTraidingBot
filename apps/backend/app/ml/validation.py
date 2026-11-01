@@ -546,7 +546,8 @@ async def record_trial(
 
     `COMPLETE` містить кожен фолд. Інший стан — лише префікс фолдів, без пропусків:
     не можна залишити в журналі тільки вдалі відрізки. `oos_results` — R торгового символу
-    в порядку фолдів і часу входу, рядком Decimal. Hold-out у ряді немає.
+    в порядку фолдів і часу входу, рядком Decimal; `oos_entry_ms` — час входу кожного з них.
+    Hold-out у ряді немає.
     """
     if state not in TRIAL_STATES:
         raise ValueError("невідомий стан спроби")
@@ -561,10 +562,11 @@ async def record_trial(
     symbols = list(experiment.symbols)
     checked: list[dict[str, Any]] = []
     series: list[str] = []
+    entries: list[int] = []
     any_last = False
     any_both = False
     for index, record in enumerate(folds):
-        block, fold_r, last, both = _fold_block(
+        block, fold_r, fold_entries, last, both = _fold_block(
             record,
             split=split,
             fold_index=index,
@@ -574,6 +576,7 @@ async def record_trial(
         )
         checked.append(block)
         series.extend(fold_r)
+        entries.extend(fold_entries)
         any_last = any_last or last
         any_both = any_both or both
     line_no = await line_trial_count(session, experiment.research_line) + 1
@@ -599,6 +602,7 @@ async def record_trial(
                 state=state,
                 params=trial_params,
                 oos_results=series,
+                oos_entry_ms=entries,
                 metrics=metrics,
                 created_at_ms=now_ms(),
             )
@@ -875,7 +879,7 @@ def _fold_block(
     symbols: Sequence[str],
     seed: int,
     research_line: str,
-) -> tuple[dict[str, Any], list[str], bool, bool]:
+) -> tuple[dict[str, Any], list[str], list[int], bool, bool]:
     got = [report.symbol for report in record.reports]
     if len(got) != len(set(got)) or set(got) != set(symbols):
         raise ValueError("прогін фолду має бути рівно по символах експерименту")
@@ -894,6 +898,7 @@ def _fold_block(
         raise ValueError("немає прогону торгового символу")
     ordered = sorted(trading.trades, key=lambda trade: (trade.entry_open_time_ms, trade.entry_index))
     series = [_decimal(trade.r_multiple) for trade in ordered]
+    entries = [trade.entry_open_time_ms for trade in ordered]
     last_trade = any(
         trade.stop_price_source is StopPriceSource.LAST for report in record.reports for trade in report.trades
     )
@@ -911,7 +916,7 @@ def _fold_block(
         "all_symbols": _pool(record.reports),
         "labels": {"train": _label_json(record.train_labels), "test": _label_json(record.test_labels)},
     }
-    return block, series, any_last, any_both
+    return block, series, entries, any_last, any_both
 
 
 def _report_matches_trades(report: BacktestReport) -> None:
@@ -919,6 +924,9 @@ def _report_matches_trades(report: BacktestReport) -> None:
     metrics = report.metrics
     if metrics.n_trades != len(trades):
         raise ValueError("n_trades не збігається з журналом угод")
+    # Кожна угода — один ENTER: без рішень журнал не знав би, скільки сигналів отримав фолд.
+    if sum(1 for decision in report.decisions if decision.decision == "ENTER") != len(trades):
+        raise ValueError("рішень ENTER не стільки, скільки угод")
     incomplete = sum(1 for trade in trades if trade.exit_reason is ExitReason.DATA_GAP)
     gaps = sum(1 for trade in trades if trade.funding_gap)
     if metrics.n_incomplete != incomplete:
@@ -976,7 +984,7 @@ def _pool(reports: Sequence[BacktestReport]) -> dict[str, Any]:
 
 
 def _report_json(report: BacktestReport) -> dict[str, Any]:
-    return {"symbol": report.symbol, "metrics": _metrics_json(report.metrics)}
+    return {"symbol": report.symbol, "n_signals": report.n_signals, "metrics": _metrics_json(report.metrics)}
 
 
 def _metrics_json(metrics: BacktestMetrics) -> dict[str, Any]:

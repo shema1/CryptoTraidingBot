@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app.exchange.types import PositionSide
-from app.ml.backtest import BacktestMetrics, BacktestReport, BacktestTrade
+from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
 from app.ml.statistics import FoldOutcome, GateRejected, GateThresholds, open_holdout_after_gate
 from app.ml.trade_sim import ExitReason, StopPriceSource
@@ -34,9 +34,10 @@ _LABELS = LabelStats(n_labels=2, n_last_stop=0, n_both_reached_tp=0)
 
 
 def _split() -> ResearchSplit:
+    # 47 добових фолдів: PBO ділить відрізок walk-forward на 16 блоків по добі.
     return build_split(
         data_from_ms=0,
-        data_to_ms=500 * HOUR,
+        data_to_ms=1500 * HOUR,
         horizon_bars=4,
         count_trades=lambda _start, _end: 1,
         min_train_ms=48 * HOUR,
@@ -65,7 +66,19 @@ def _trade(entry_ms: int, r_multiple: Decimal, *, entry_index: int) -> BacktestT
     )
 
 
+def _decision(trade: BacktestTrade, decision: str) -> BacktestDecision:
+    return BacktestDecision(
+        ts_ms=trade.entry_open_time_ms,
+        entry_index=trade.entry_index,
+        stage="RISK",
+        decision=decision,
+        reason_code=None if decision == "ENTER" else "RISK_COOLDOWN",
+        side=trade.side,
+    )
+
+
 def _report(symbol: str, trades: tuple[BacktestTrade, ...]) -> BacktestReport:
+    """Кожна угода — рішення ENTER; ще один сигнал фолду відкинуто cooldown."""
     total = sum((trade.net_usd for trade in trades), Decimal(0))
     wins = sum(1 for trade in trades if trade.net_usd > 0)
     loss = sum((-trade.net_usd for trade in trades if trade.net_usd < 0), Decimal(0))
@@ -75,7 +88,7 @@ def _report(symbol: str, trades: tuple[BacktestTrade, ...]) -> BacktestReport:
         seed=7,
         cost_factor=Decimal("1"),
         trades=trades,
-        decisions=(),
+        decisions=(*(_decision(trade, "ENTER") for trade in trades), _decision(trades[-1], "SKIP")),
         metrics=BacktestMetrics(
             n_trades=len(trades),
             total_r=total,
@@ -125,8 +138,10 @@ def _records(split: ResearchSplit, series: tuple[Decimal, ...]) -> list[FoldReco
 
 def _stress(split: ResearchSplit) -> tuple[FoldOutcome, ...]:
     return tuple(
+        # Подвоєні витрати увімкнули cooldown: виконано одну угоду з тих самих трьох сигналів.
         FoldOutcome(
-            n_trades=2,
+            n_trades=1,
+            n_signals=3,
             total_net_usd=Decimal("1"),
             profit_factor=Decimal("1.1"),
             below_min_trades=False,
@@ -180,6 +195,8 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
         assert stored is not None
         assert stored.oos_results == [format(value, "f") for value in strong_r]
         assert "9" not in stored.oos_results
+        assert stored.oos_entry_ms == [fold.test_start_ms + offset * HOUR for fold in split.folds for offset in (0, 1)]
+        assert stored.metrics["folds"][0]["trading"]["n_signals"] == 3
         with pytest.raises(GateRejected) as caught:
             await open_holdout_after_gate(
                 session,
@@ -283,7 +300,8 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
         assert result["unfiltered_total_net"] == "0"
         assert len(result["stress"]) == len(split.folds)
         assert result["stress"][0] == {
-            "n_trades": 2,
+            "n_trades": 1,
+            "n_signals": 3,
             "total_net_usd": "1",
             "profit_factor": "1.1",
             "below_min_trades": False,

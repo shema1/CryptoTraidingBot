@@ -422,7 +422,15 @@ async def _append_only_rows(conn: AsyncConnection) -> dict[str, tuple[Any, Any]]
     trial = await ok(
         conn,
         insert(ExperimentTrial)
-        .values(experiment_id="exp-0001", trial_no=1, state="COMPLETE", params={}, oos_results=[0.1], metrics={})
+        .values(
+            experiment_id="exp-0001",
+            trial_no=1,
+            state="COMPLETE",
+            params={},
+            oos_results=["0.1"],
+            oos_entry_ms=[T0],
+            metrics={},
+        )
         .returning(ExperimentTrial.id),
     )
     risk = await ok(
@@ -490,6 +498,45 @@ async def test_holdout_opened_at_most_twice(conn: AsyncConnection) -> None:
         insert(HoldoutOpening).values(opening_no=2, **common),
         "uq_holdout_openings_window_opening_no",
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "constraint"),
+    [
+        # Час входу — на кожен R (PBO за часом, T2.6); не від'ємний.
+        ({"oos_entry_ms": []}, "ck_experiment_trials_oos_entry_ms_len"),
+        ({"oos_entry_ms": [T0, T0]}, "ck_experiment_trials_oos_entry_ms_len"),
+        ({"oos_results": {"r": "1"}}, "ck_experiment_trials_oos_entry_ms_len"),
+        ({"oos_entry_ms": [-1]}, "ck_experiment_trials_oos_entry_ms_non_negative"),
+    ],
+)
+async def test_trial_entry_times_match_results(
+    conn: AsyncConnection, overrides: dict[str, Any], constraint: str
+) -> None:
+    await conn.execute(
+        insert(Experiment).values(
+            id="exp-t",
+            research_line=SYMBOL,
+            symbols=[SYMBOL],
+            timeframe="1h",
+            label_type="meta",
+            primary_strategy={},
+            params={},
+            seed=1,
+            data_from_ms=T0,
+            data_to_ms=T0 + HOUR_MS,
+        )
+    )
+    trial = {
+        "experiment_id": "exp-t",
+        "state": "COMPLETE",
+        "params": {},
+        "oos_results": ["1"],
+        "oos_entry_ms": [T0],
+        "metrics": {},
+    }
+    await conn.execute(insert(ExperimentTrial).values(trial_no=1, **trial))
+    await expect_violation(conn, insert(ExperimentTrial).values(trial_no=2, **{**trial, **overrides}), constraint)
 
 
 @pytest.mark.parametrize(

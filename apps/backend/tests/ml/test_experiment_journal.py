@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from app.core.clock import FakeClock, use_clock
 from app.exchange.types import PositionSide
-from app.ml.backtest import BacktestMetrics, BacktestReport, BacktestTrade
+from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
 from app.ml.trade_sim import ExitReason, StopPriceSource
 from app.ml.validation import (
@@ -106,6 +106,33 @@ def _metrics(trades: tuple[BacktestTrade, ...], *, n_unusable: int = 0) -> Backt
     )
 
 
+def _decisions(trades: tuple[BacktestTrade, ...], *, skipped: int) -> tuple[BacktestDecision, ...]:
+    """Як у бектесті: кожна угода — один ENTER, кожен відкинутий сигнал — один SKIP."""
+    entered = tuple(
+        BacktestDecision(
+            ts_ms=trade.entry_open_time_ms,
+            entry_index=trade.entry_index,
+            stage="RISK",
+            decision="ENTER",
+            reason_code=None,
+            side=trade.side,
+        )
+        for trade in trades
+    )
+    skips = tuple(
+        BacktestDecision(
+            ts_ms=trades[0].entry_open_time_ms if trades else 0,
+            entry_index=0,
+            stage="RISK",
+            decision="SKIP",
+            reason_code="RISK_COOLDOWN",
+            side=PositionSide.LONG,
+        )
+        for _ in range(skipped)
+    )
+    return entered + skips
+
+
 def _report(
     symbol: str,
     trades: tuple[BacktestTrade, ...],
@@ -113,13 +140,15 @@ def _report(
     seed: int = 7,
     cost_factor: Decimal = Decimal("1"),
     n_unusable: int = 0,
+    skipped: int = 0,
+    decisions: tuple[BacktestDecision, ...] | None = None,
 ) -> BacktestReport:
     return BacktestReport(
         symbol=symbol,
         seed=seed,
         cost_factor=cost_factor,
         trades=trades,
-        decisions=(),
+        decisions=_decisions(trades, skipped=skipped) if decisions is None else decisions,
         metrics=_metrics(trades, n_unusable=n_unusable),
     )
 
@@ -142,7 +171,7 @@ def _records(split: ResearchSplit, *, seed: int = 7, cost_factor: Decimal = Deci
         records.append(
             FoldRecord(
                 reports=(
-                    _report(BTC, (btc_trade,), seed=seed, cost_factor=cost_factor),
+                    _report(BTC, (btc_trade,), seed=seed, cost_factor=cost_factor, skipped=1 if index == 0 else 0),
                     _report(ETH, (eth_trade,), seed=seed, cost_factor=cost_factor, n_unusable=1),
                 ),
                 train_labels=LabelStats(n_labels=4, n_last_stop=1, n_both_reached_tp=0),
@@ -200,7 +229,11 @@ async def test_every_attempt_is_stored_and_the_line_counter_never_resets(conn: A
         assert row.oos_results[0] == "-1.5"
         assert row.oos_results[1:] == ["1"] * (len(split.folds) - 1)
         assert "-0.5" not in row.oos_results
+        # Час входу кожної угоди — поруч із R, у тому самому порядку (для PBO за часом).
+        assert row.oos_entry_ms == [fold.test_start_ms for fold in split.folds]
         fold0 = row.metrics["folds"][0]
+        assert fold0["trading"]["n_signals"] == 2
+        assert row.metrics["folds"][1]["trading"]["n_signals"] == 1
         assert fold0["trading"]["symbol"] == BTC
         assert fold0["trading"]["metrics"]["n_incomplete"] == 1
         assert fold0["trading"]["metrics"]["n_funding_gaps"] == 1
@@ -219,6 +252,7 @@ async def test_every_attempt_is_stored_and_the_line_counter_never_resets(conn: A
         empty = (await session.execute(failed_row)).scalar_one()
         assert empty.state == "FAILED"
         assert empty.oos_results == []
+        assert empty.oos_entry_ms == []
         assert empty.metrics["folds"] == []
 
 
@@ -293,6 +327,32 @@ async def test_a_trial_cannot_hide_a_fold_or_touch_the_holdout(conn: AsyncConnec
                 state="COMPLETE",
                 params={},
                 folds=too_long,
+            )
+
+
+async def test_every_trade_has_its_enter_decision(conn: AsyncConnection) -> None:
+    # Без рішень журнал не знав би, скільки сигналів отримав фолд, і стрес G1 не мав би з чим звірятись.
+    split = _split()
+    async with AsyncSession(bind=conn) as session:
+        experiment_id = await _experiment(session, split)
+        silent = _records(split)
+        start = split.folds[0].test_start_ms
+        silent[0] = FoldRecord(
+            reports=(
+                _report(BTC, (_trade(start, Decimal("1"), Decimal("1")),), decisions=()),
+                _report(ETH, (_trade(start, Decimal("1"), Decimal("1")),)),
+            ),
+            train_labels=LabelStats(n_labels=0, n_last_stop=0, n_both_reached_tp=0),
+            test_labels=LabelStats(n_labels=0, n_last_stop=0, n_both_reached_tp=0),
+        )
+        with pytest.raises(ValueError, match="ENTER"):
+            await record_trial(
+                session,
+                experiment_id=experiment_id,
+                split=split,
+                state="COMPLETE",
+                params={},
+                folds=silent,
             )
 
 

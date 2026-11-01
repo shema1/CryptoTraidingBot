@@ -217,6 +217,11 @@ class BacktestReport(FrozenModel):
     decisions: tuple[BacktestDecision, ...]
     metrics: BacktestMetrics
 
+    @property
+    def n_signals(self) -> int:
+        """Скільки сигналів отримав прогін: кожен дає рівно одне рішення ENTER або SKIP (CLOSE — вихід)."""
+        return sum(1 for decision in self.decisions if decision.decision != "CLOSE")
+
 
 class _Open:
     """Позиція, яку ще не реалізовано. `cash_base` — гаманець до цієї угоди, без її PnL.

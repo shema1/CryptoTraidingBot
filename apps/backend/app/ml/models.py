@@ -15,7 +15,17 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, Identity, Index, SmallInteger, Text, UniqueConstraint, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Identity,
+    Index,
+    SmallInteger,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -118,13 +128,26 @@ class Experiment(Base):
 
 
 class ExperimentTrial(Base):
-    """Одна спроба (append-only). `oos_results` — ряд out-of-sample результатів (для DSR і PBO)."""
+    """Одна спроба (append-only). `oos_results` — ряд out-of-sample результатів (для DSR і PBO).
+
+    `oos_entry_ms` — час входу кожної угоди того самого ряду: PBO ділить відрізок walk-forward
+    на блоки за часом, а не за номером угоди (T2.6, міграція 0005).
+    """
 
     __tablename__ = "experiment_trials"
     __table_args__ = (
         enum_check("state", TRIAL_STATES),
         CheckConstraint("trial_no >= 1", name="trial_no_positive"),
         UniqueConstraint("experiment_id", "trial_no"),
+        CheckConstraint(
+            "CASE WHEN jsonb_typeof(oos_results) = 'array'"
+            " THEN cardinality(oos_entry_ms) = jsonb_array_length(oos_results) ELSE false END",
+            name="oos_entry_ms_len",
+        ),
+        CheckConstraint(
+            "0 <= ALL (oos_entry_ms) AND array_position(oos_entry_ms, NULL) IS NULL",
+            name="oos_entry_ms_non_negative",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Identity(always=True), primary_key=True)
@@ -133,6 +156,7 @@ class ExperimentTrial(Base):
     state: Mapped[str] = mapped_column(Text)
     params: Mapped[dict[str, Any]]
     oos_results: Mapped[list[Any]]
+    oos_entry_ms: Mapped[list[int]] = mapped_column(ARRAY(BigInteger))
     metrics: Mapped[dict[str, Any]]
     created_at_ms: Mapped[CreatedMs]
 

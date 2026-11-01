@@ -14,20 +14,23 @@ from hypothesis import strategies as st
 import app.ml.statistics as ml_statistics
 import app.ml.validation as ml_validation
 from app.exchange.types import PositionSide
-from app.ml.backtest import BacktestTrade
+from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
 from app.ml.statistics import (
+    DAY_MS,
     WEEK_MS,
     BlockBootstrapPf,
     FoldOutcome,
     GateDecision,
     GateThresholds,
+    TrialSeries,
     _norm_cdf,
     _norm_ppf,
     block_bootstrap_pf,
     corridor_payload,
     deflated_sharpe_ratio,
     evaluate_gate,
+    fold_outcome_from_report,
     fold_outcomes_from_metrics,
     live_corridor,
     loosened_thresholds,
@@ -36,6 +39,7 @@ from app.ml.statistics import (
     probability_of_backtest_overfitting,
     r_profit_factor,
     return_moments,
+    trial_series_from_journal,
 )
 from app.ml.trade_sim import ExitReason, StopPriceSource
 
@@ -77,15 +81,69 @@ def _fold(
     pf: str | None,
     *,
     n_trades: int = 20,
+    n_signals: int | None = None,
     below: bool = False,
     cost: str = "1",
 ) -> FoldOutcome:
+    # За замовчуванням п'ять сигналів фолду відкинуто лімітами: сигналів більше, ніж угод.
     return FoldOutcome(
         n_trades=n_trades,
+        n_signals=n_trades + 5 if n_signals is None else n_signals,
         total_net_usd=Decimal(net),
         profit_factor=None if pf is None else Decimal(pf),
         below_min_trades=below,
         cost_factor=Decimal(cost),
+    )
+
+
+def _daily(values: tuple[Decimal, ...], *, days: int | None = None) -> TrialSeries:
+    """Одна угода на добу з першої доби; відрізок walk-forward — `days` діб (за замовчуванням — скільки угод)."""
+    span = len(values) if days is None else days
+    return TrialSeries(
+        returns=values,
+        entry_ms=tuple(index * DAY_MS for index in range(len(values))),
+        covered_from_ms=0,
+        covered_to_ms=span * DAY_MS,
+    )
+
+
+def _decision(entry_index: int, decision: str) -> BacktestDecision:
+    return BacktestDecision(
+        ts_ms=entry_index * HOUR_MS,
+        entry_index=entry_index,
+        stage="RISK" if decision != "CLOSE" else "RESULT",
+        decision=decision,
+        reason_code={"ENTER": None, "SKIP": "RISK_COOLDOWN", "CLOSE": "TAKE_PROFIT"}[decision],
+        side=PositionSide.LONG,
+    )
+
+
+def _report(trades: tuple[BacktestTrade, ...], decisions: tuple[BacktestDecision, ...]) -> BacktestReport:
+    total = sum((trade.net_usd for trade in trades), Decimal(0))
+    profit = sum((trade.net_usd for trade in trades if trade.net_usd > 0), Decimal(0))
+    loss = sum((-trade.net_usd for trade in trades if trade.net_usd < 0), Decimal(0))
+    return BacktestReport(
+        symbol="BTC/USDT:USDT",
+        seed=1,
+        cost_factor=Decimal("2"),
+        trades=trades,
+        decisions=decisions,
+        metrics=BacktestMetrics(
+            n_trades=len(trades),
+            total_r=sum((trade.r_multiple for trade in trades), Decimal(0)),
+            total_net_usd=total,
+            profit_factor=None if loss == 0 else profit / loss,
+            max_drawdown_pct=Decimal("1"),
+            hit_rate=None,
+            sharpe=None,
+            max_consecutive_losses=1,
+            n_incomplete=0,
+            n_unusable=0,
+            n_funding_gaps=0,
+            ending_equity=Decimal("100"),
+            peak_equity=Decimal("100"),
+            halted=False,
+        ),
     )
 
 
@@ -235,11 +293,35 @@ def test_more_attempts_lower_the_deflated_sharpe_and_a_constant_series_is_undefi
     assert with_gap is not None
     assert with_gap < alone
     assert deflated_sharpe_ratio((Decimal("1"),) * 8, trial_returns=((Decimal("1"),) * 8,), n_trials=1) is None
-    # Дві однакові оцінки Sharpe дають нульову дисперсію між спробами: порожня невдача DSR не знижує.
-    copied = deflated_sharpe_ratio(positive, trial_returns=(positive, positive, ()), n_trials=3)
-    assert copied == alone
+    # Дві однакові оцінки Sharpe (обидві з ≥ 100 угод) дають нульову дисперсію між спробами:
+    # порожня невдача DSR не знижує.
+    long_positive = (Decimal("1"), Decimal("-0.2")) * 50
+    long_alone = deflated_sharpe_ratio(long_positive, trial_returns=(long_positive,), n_trials=1)
+    copied = deflated_sharpe_ratio(long_positive, trial_returns=(long_positive, long_positive, ()), n_trials=3)
+    assert copied is not None
+    assert copied == long_alone
     with pytest.raises(ValueError, match="кількості рядів"):
         deflated_sharpe_ratio(positive, trial_returns=(positive,), n_trials=3)
+    with pytest.raises(ValueError, match="variance_min_trades"):
+        deflated_sharpe_ratio(positive, trial_returns=(positive,), n_trials=1, variance_min_trades=1)
+
+
+def test_short_trials_count_in_n_but_do_not_set_the_spread() -> None:
+    rng = np.random.default_rng(5)
+    edge = _decimals(list(rng.normal(0.35, 1, size=400)), places=4)
+    others = tuple(_decimals(list(rng.normal(0, 1, size=400)), places=4) for _ in range(20))
+    # Обрізана спроба з трьох виграшів: Sharpe ≈ 77 на угоду.
+    short = (Decimal("1.95"), Decimal("2.0"), Decimal("1.98"))
+    base = deflated_sharpe_ratio(edge, trial_returns=(edge, *others), n_trials=21)
+    crowded = deflated_sharpe_ratio(edge, trial_returns=(edge, *others, short), n_trials=22)
+    assert base is not None
+    assert crowded is not None
+    # Спроба лишається в N (DSR трохи нижчий), але розкид між спробами не роздуває.
+    assert Decimal("0.95") <= crowded < base
+    # Якби розкид брав і три угоди, одна така спроба назавжди обвалила б DSR лінії.
+    collapsed = deflated_sharpe_ratio(edge, trial_returns=(edge, *others, short), n_trials=22, variance_min_trades=2)
+    assert collapsed is not None
+    assert collapsed < Decimal("0.05")
 
 
 def test_random_trials_deflate_and_a_real_edge_does_not() -> None:
@@ -277,7 +359,7 @@ def test_normal_quantile_matches_a_known_value() -> None:
 
 def test_pbo_of_a_half_sample_reversal_is_one_and_noise_is_near_one_half() -> None:
     overfit = probability_of_backtest_overfitting(
-        ((Decimal("1"), Decimal("1"), Decimal("-1"), Decimal("-1")), (Decimal("0"),) * 4),
+        (_daily((Decimal("1"), Decimal("1"), Decimal("-1"), Decimal("-1"))), _daily((Decimal("0"),) * 4)),
         candidate_index=0,
         n_blocks=2,
     )
@@ -286,7 +368,7 @@ def test_pbo_of_a_half_sample_reversal_is_one_and_noise_is_near_one_half() -> No
     estimates: list[Decimal] = []
     for seed in range(8):
         rng = np.random.default_rng(seed)
-        noise = tuple(_decimals(list(rng.normal(0, 1, size=16 * 16))) for _ in range(10))
+        noise = tuple(_daily(_decimals(list(rng.normal(0, 1, size=16 * 16)))) for _ in range(10))
         estimate = probability_of_backtest_overfitting(noise, candidate_index=0)
         assert estimate is not None
         estimates.append(estimate)
@@ -294,8 +376,8 @@ def test_pbo_of_a_half_sample_reversal_is_one_and_noise_is_near_one_half() -> No
     assert Decimal("0.45") < random_pbo < Decimal("0.65")
 
     rng = np.random.default_rng(11)
-    edge = _decimals(list(rng.normal(0.8, 1, size=16 * 12)))
-    rest = tuple(_decimals(list(rng.normal(0, 1, size=16 * 12))) for _ in range(5))
+    edge = _daily(_decimals(list(rng.normal(0.8, 1, size=16 * 12))))
+    rest = tuple(_daily(_decimals(list(rng.normal(0, 1, size=16 * 12)))) for _ in range(5))
     skilled = probability_of_backtest_overfitting((edge, *rest), candidate_index=0)
     assert skilled is not None
     assert skilled < Decimal("0.2")
@@ -330,16 +412,17 @@ def test_pbo_matches_a_direct_cscv_with_ties(monkeypatch: pytest.MonkeyPatch) ->
     # Копія дає нічию і на in-sample, і на out-of-sample.
     columns.append(columns[2])
     expected = _reference_pbo(columns, 12)
-    assert probability_of_backtest_overfitting(tuple(columns), candidate_index=0, n_blocks=12) == expected
+    trials = tuple(_daily(column) for column in columns)
+    assert probability_of_backtest_overfitting(trials, candidate_index=0, n_blocks=12) == expected
     # Порція з одного розбиття: межі порцій не змінюють результат.
     monkeypatch.setattr(ml_statistics, "_CSCV_CELLS", 1)
-    assert probability_of_backtest_overfitting(tuple(columns), candidate_index=0, n_blocks=12) == expected
+    assert probability_of_backtest_overfitting(trials, candidate_index=0, n_blocks=12) == expected
 
 
 def test_pbo_memory_does_not_grow_with_the_number_of_splits() -> None:
     # 12870 розбиттів × 8 блоків × 200 спроб у float64 одним масивом — 165 МБ.
     rng = np.random.default_rng(19)
-    trials = tuple(_decimals(list(rng.normal(0, 1, size=16 * 20)), places=4) for _ in range(200))
+    trials = tuple(_daily(_decimals(list(rng.normal(0, 1, size=16 * 20)), places=4)) for _ in range(200))
     tracemalloc.start()
     try:
         estimate = probability_of_backtest_overfitting(trials, candidate_index=0)
@@ -348,6 +431,105 @@ def test_pbo_memory_does_not_grow_with_the_number_of_splits() -> None:
         tracemalloc.stop()
     assert estimate is not None
     assert peak < 32 * 1024 * 1024
+
+
+def test_pbo_rows_are_days_and_a_sparse_trial_still_competes() -> None:
+    rng = np.random.default_rng(23)
+    days = 16 * 6
+    dense = _daily(_decimals(list(rng.normal(0.2, 1, size=days)), places=4))
+    noise = tuple(_daily(_decimals(list(rng.normal(0, 1, size=days)), places=4)) for _ in range(4))
+    # Рідка спроба: 30 угод у випадкові дні (дві — в одну добу) на тому самому відрізку walk-forward.
+    picked = sorted(int(day) for day in rng.choice(days, size=29, replace=False))
+    picked = sorted([*picked, picked[10]])
+    sparse_r = _decimals(list(rng.normal(0.1, 1, size=len(picked))), places=4)
+    sparse = TrialSeries(
+        returns=sparse_r,
+        entry_ms=tuple(day * DAY_MS + 5 * HOUR_MS for day in picked),
+        covered_from_ms=0,
+        covered_to_ms=days * DAY_MS,
+    )
+    per_day = [Decimal(0)] * days
+    for day, value in zip(picked, sparse_r, strict=True):
+        per_day[day] += value
+    expected = _reference_pbo([dense.returns, tuple(per_day), *(item.returns for item in noise)], 16)
+    trials = (dense, sparse, *noise)
+    assert probability_of_backtest_overfitting(trials, candidate_index=0) == expected
+    # Рядок — доба, а не номер угоди: який ряд кандидат, коли відрізок спільний, — не важить.
+    assert probability_of_backtest_overfitting(trials, candidate_index=1) == expected
+
+
+def test_pbo_leaves_out_trials_that_did_not_cover_the_candidate_span() -> None:
+    rng = np.random.default_rng(29)
+    whole = _daily(_decimals(list(rng.normal(0, 1, size=64)), places=4))
+    first_half = _daily(whole.returns[:32])
+    # Половина відрізка не змагається на всьому відрізку кандидата: одна стратегія — None.
+    assert probability_of_backtest_overfitting((whole, first_half), candidate_index=0) is None
+    # Кандидат на половині: довша спроба покриває її, і її угоди поза відрізком не беруться.
+    assert probability_of_backtest_overfitting((whole, first_half), candidate_index=1) == _reference_pbo(
+        [whole.returns[:32], first_half.returns], 16
+    )
+    empty = TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
+    assert probability_of_backtest_overfitting((whole, empty), candidate_index=0) is None
+
+
+def test_trial_series_from_the_journal_needs_entry_times() -> None:
+    folds = {
+        "folds": [
+            {"test_start_ms": 0, "test_end_ms": 2 * DAY_MS},
+            {"test_start_ms": 2 * DAY_MS, "test_end_ms": 5 * DAY_MS},
+        ]
+    }
+    series = trial_series_from_journal(["1.5", "-1"], [HOUR_MS, 3 * DAY_MS], folds)
+    assert series.returns == (Decimal("1.5"), Decimal("-1"))
+    assert series.entry_ms == (HOUR_MS, 3 * DAY_MS)
+    assert (series.covered_from_ms, series.covered_to_ms) == (0, 5 * DAY_MS)
+    empty = trial_series_from_journal([], [], {"folds": []})
+    assert (empty.covered_from_ms, empty.covered_to_ms) == (None, None)
+    # Рядок без часу угод (до міграції 0005) у PBO не входить мовчки: відмова.
+    with pytest.raises(ValueError, match="час"):
+        trial_series_from_journal(["1"], [], folds)
+    with pytest.raises(ValueError, match="поза"):
+        TrialSeries(returns=(Decimal("1"),), entry_ms=(6 * DAY_MS,), covered_from_ms=0, covered_to_ms=5 * DAY_MS)
+    with pytest.raises(ValueError, match="порядку"):
+        TrialSeries(
+            returns=(Decimal("1"), Decimal("1")),
+            entry_ms=(DAY_MS, 0),
+            covered_from_ms=0,
+            covered_to_ms=5 * DAY_MS,
+        )
+
+
+def test_stress_compares_signals_not_executed_trades() -> None:
+    # Подвоєні витрати можуть увімкнути cooldown і пропустити вхід: угод менше, сигнали ті самі.
+    fewer = tuple(_fold("4", "1.05", n_trades=18, n_signals=25, cost="2") for _ in range(5))
+    assert _gate(stress=fewer).passed is True
+    other = tuple(_fold("4", "1.05", n_signals=24, cost="2") for _ in range(5))
+    assert _gate(stress=other).reasons == ("G1_STRESS",)
+    with pytest.raises(ValueError, match="n_signals"):
+        _fold("1", "1.1", n_trades=5, n_signals=4)
+
+
+def test_fold_outcome_from_a_report_counts_every_signal() -> None:
+    trades = (_trade(0, Decimal("2")), _trade(3 * HOUR_MS, Decimal("-1"), entry_index=3))
+    decisions = (
+        _decision(0, "ENTER"),
+        _decision(1, "SKIP"),
+        _decision(1, "CLOSE"),
+        _decision(3, "ENTER"),
+        _decision(4, "SKIP"),
+        _decision(4, "CLOSE"),
+    )
+    report = _report(trades, decisions)
+    assert report.n_signals == 4
+    outcome = fold_outcome_from_report(report, below_min_trades=False)
+    assert outcome == FoldOutcome(
+        n_trades=2,
+        n_signals=4,
+        total_net_usd=Decimal("1"),
+        profit_factor=Decimal("2"),
+        below_min_trades=False,
+        cost_factor=Decimal("2"),
+    )
 
 
 def test_no_public_opening_bypasses_the_gate() -> None:
@@ -381,13 +563,29 @@ def test_journal_r_strings_reject_floats() -> None:
                 {
                     "below_min_trades": False,
                     "cost_factor": "2",
-                    "trading": {"metrics": {"n_trades": 3, "total_net_usd": "-1.5", "profit_factor": "1.25"}},
+                    "trading": {
+                        "n_signals": 4,
+                        "metrics": {"n_trades": 3, "total_net_usd": "-1.5", "profit_factor": "1.25"},
+                    },
                 }
             ]
         }
     )
     assert parsed[0].profit_factor == Decimal("1.25")
     assert parsed[0].cost_factor == Decimal("2")
+    assert parsed[0].n_signals == 4
+    with pytest.raises(ValueError, match="n_signals"):
+        fold_outcomes_from_metrics(
+            {
+                "folds": [
+                    {
+                        "below_min_trades": False,
+                        "cost_factor": "1",
+                        "trading": {"metrics": {"n_trades": 3, "total_net_usd": "1", "profit_factor": None}},
+                    }
+                ]
+            }
+        )
     with pytest.raises(ValueError, match="рядок Decimal"):
         fold_outcomes_from_metrics(
             {
@@ -395,7 +593,10 @@ def test_journal_r_strings_reject_floats() -> None:
                     {
                         "below_min_trades": False,
                         "cost_factor": 1,
-                        "trading": {"metrics": {"n_trades": 3, "total_net_usd": "1", "profit_factor": None}},
+                        "trading": {
+                            "n_signals": 3,
+                            "metrics": {"n_trades": 3, "total_net_usd": "1", "profit_factor": None},
+                        },
                     }
                 ]
             }
