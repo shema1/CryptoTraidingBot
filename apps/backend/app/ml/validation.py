@@ -13,8 +13,8 @@ Hold-out — останні 15–20% історії. Його рядки не п
 цієї лінії; він не скидається. На лінії один запечатаний hold-out: інший експеримент не бере
 його у walk-forward і не оголошує вже бачений відрізок чистим. Зсув — новий експеримент, чий
 hold-out починається не раніше за кінець запечатаного; старе вікно тоді стає walk-forward.
-`open_holdout` відкриває лише hold-out свого експерименту і не перевіряє Gate G1 — це робить T2.6
-до виклику.
+Публічного відкриття hold-out тут немає: `_open_holdout` викликає лише
+`statistics.open_holdout_after_gate` після Gate G1. Зсув новим експериментом G1 не потребує.
 """
 
 from __future__ import annotations
@@ -463,7 +463,7 @@ async def create_experiment(
 
     Hold-out — запечатаний на лінії або новіший: початок не раніше за кінець запечатаного.
     Новіший відпускає старий у walk-forward (зсув, ТЗ §5А.10) і нічого не відкриває.
-    `n_trials_line`, DSR і PBO лишаються порожніми до знімка в T2.6.
+    `n_trials_line`, DSR і PBO лишаються порожніми, доки `statistics.open_holdout_after_gate` не відкриє hold-out.
     """
     line = _symbols(research_line, symbols)
     if label_type not in LABEL_TYPES:
@@ -613,7 +613,7 @@ async def record_trial(
     )
 
 
-async def open_holdout(
+async def _open_holdout(
     session: AsyncSession,
     *,
     research_line: str,
@@ -627,7 +627,8 @@ async def open_holdout(
 
     Вікно має збігатися з hold-out експерименту: інше — `SplitLeakError`, і лінію воно не
     запечатує. Якщо новіший експеримент уже зсунув hold-out, старе вікно — walk-forward,
-    і відкрити його не можна (`HoldoutNotNewerError`). Gate G1 тут не перевіряється.
+    і відкрити його не можна (`HoldoutNotNewerError`). Gate G1 тут не перевіряється, тому
+    функція приватна: викликає її лише `statistics.open_holdout_after_gate`.
     """
     if not _SYMBOL.fullmatch(research_line):
         raise ValueError("символ лінії не канонічний")

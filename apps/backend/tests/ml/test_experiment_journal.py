@@ -23,12 +23,12 @@ from app.ml.validation import (
     LabelStats,
     ResearchSplit,
     SplitLeakError,
+    _open_holdout,
     _opening_no,
     build_split,
     create_experiment,
     holdout_was_opened,
     line_trial_count,
-    open_holdout,
     record_trial,
     validation_payload,
 )
@@ -316,7 +316,7 @@ async def test_another_experiment_cannot_use_a_different_holdout(conn: AsyncConn
 
 
 async def _open(session: AsyncSession, split: ResearchSplit, experiment_id: str, model: str) -> int:
-    opened = await open_holdout(
+    opened = await _open_holdout(
         session,
         research_line=BTC,
         holdout_from_ms=split.holdout_from_ms,
@@ -395,7 +395,7 @@ async def test_only_the_experiment_holdout_can_be_opened(conn: AsyncConnection) 
         )
         for start, end in foreign:
             with pytest.raises(SplitLeakError, match="цього експерименту"):
-                await open_holdout(
+                await _open_holdout(
                     session,
                     research_line=BTC,
                     holdout_from_ms=start,
@@ -416,7 +416,7 @@ async def test_holdout_opens_twice_and_a_new_window_must_be_newer(conn: AsyncCon
     async with AsyncSession(bind=conn) as session:
         experiment_id = await _experiment(session, split)
         with use_clock(FakeClock(T0)):
-            first = await open_holdout(
+            first = await _open_holdout(
                 session,
                 research_line=BTC,
                 holdout_from_ms=split.holdout_from_ms,
@@ -431,7 +431,7 @@ async def test_holdout_opens_twice_and_a_new_window_must_be_newer(conn: AsyncCon
         assert opened.opened_at_ms == T0
         assert opened.result == {"net_pf": "1.2"}
         assert await holdout_was_opened(session, experiment_id)
-        second = await open_holdout(
+        second = await _open_holdout(
             session,
             research_line=BTC,
             holdout_from_ms=split.holdout_from_ms,
@@ -441,7 +441,7 @@ async def test_holdout_opens_twice_and_a_new_window_must_be_newer(conn: AsyncCon
         )
         assert second.opening_no == 2
         with pytest.raises(HoldoutLimitError):
-            await open_holdout(
+            await _open_holdout(
                 session,
                 research_line=BTC,
                 holdout_from_ms=split.holdout_from_ms,
@@ -450,7 +450,7 @@ async def test_holdout_opens_twice_and_a_new_window_must_be_newer(conn: AsyncCon
                 model_version=model,
             )
         with pytest.raises(SplitLeakError, match="цього експерименту"):
-            await open_holdout(
+            await _open_holdout(
                 session,
                 research_line=BTC,
                 holdout_from_ms=split.holdout_from_ms - HOUR,
@@ -462,7 +462,7 @@ async def test_holdout_opens_twice_and_a_new_window_must_be_newer(conn: AsyncCon
         shifted_id = await _experiment(session, newer, seed=8)
         assert await _open(session, newer, shifted_id, model) == 1
         with pytest.raises(HoldoutNotNewerError):
-            await open_holdout(
+            await _open_holdout(
                 session,
                 research_line=BTC,
                 holdout_from_ms=split.holdout_from_ms,
@@ -497,10 +497,10 @@ async def test_integrity_error_on_the_opening_limit_is_translated(
             "experiment_id": experiment_id,
             "model_version": model,
         }
-        await open_holdout(session, **window)
-        await open_holdout(session, **window)
+        await _open_holdout(session, **window)
+        await _open_holdout(session, **window)
         with pytest.raises(HoldoutLimitError) as caught:
-            await open_holdout(session, **window)
+            await _open_holdout(session, **window)
         assert isinstance(caught.value.__cause__, IntegrityError)
 
 
@@ -509,7 +509,7 @@ async def test_a_missing_model_is_not_reported_as_the_opening_limit(conn: AsyncC
     async with AsyncSession(bind=conn) as session:
         experiment_id = await _experiment(session, split)
         with pytest.raises(IntegrityError):
-            await open_holdout(
+            await _open_holdout(
                 session,
                 research_line=BTC,
                 holdout_from_ms=split.holdout_from_ms,
