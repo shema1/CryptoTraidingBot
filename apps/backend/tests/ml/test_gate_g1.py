@@ -164,6 +164,11 @@ async def _line(session: AsyncSession, split: ResearchSplit, *, research_line: s
     )
 
 
+async def _model(conn: AsyncConnection, experiment_id: str) -> str:
+    """Модель рецепта цього експерименту: meta, BTC, 1h — як у `_line`."""
+    return await make_model(conn, experiment_id=experiment_id)
+
+
 async def _strong_and_junk(session: AsyncSession, split: ResearchSplit) -> tuple[str, int, int]:
     strong_r, junk_r = _paths(len(split.folds) * 2)
     experiment_id = await _line(session, split)
@@ -202,7 +207,7 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
                 session,
                 experiment_id=experiment_id,
                 trial_id=strong_id,
-                model_version=await make_model(conn),
+                model_version=await _model(conn, experiment_id),
                 stress=_stress(split),
                 unfiltered_total_net=Decimal("0"),
             )
@@ -214,19 +219,19 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
         assert decision.dsr >= Decimal("0.95")
         assert decision.pbo is not None
         assert decision.pbo < Decimal("0.5")
-        # Суворіший поріг угод G1 не звужує розкид Sharpe для DSR: DSR той самий.
-        with pytest.raises(GateRejected) as stricter:
+        # Інший поріг угод G1 (тут слабший — 50 замість 100) не змінює розкид Sharpe для DSR: DSR той самий.
+        with pytest.raises(GateRejected) as other:
             await open_holdout_after_gate(
                 session,
                 experiment_id=experiment_id,
                 trial_id=strong_id,
-                model_version=await make_model(conn),
+                model_version=await _model(conn, experiment_id),
                 stress=_stress(split),
                 unfiltered_total_net=Decimal("0"),
                 thresholds=GateThresholds(min_oos_trades=50),
             )
-        assert "G1_MIN_TRADES_TOTAL" not in stricter.value.decision.reasons
-        assert stricter.value.decision.dsr == decision.dsr
+        assert "G1_MIN_TRADES_TOTAL" not in other.value.decision.reasons
+        assert other.value.decision.dsr == decision.dsr
         # Знімок без відкриття не пишеться: інакше експеримент показував би DSR спроби, що hold-out не відкривала.
         experiment = await session.get(Experiment, experiment_id)
         assert experiment is not None
@@ -240,10 +245,11 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
 async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnection) -> None:
     split = _split()
     _strong_r, junk_r = _paths(len(split.folds) * 2)
-    model = await make_model(conn)
     async with AsyncSession(bind=conn) as session:
         experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
-        # Невдала і обрізана спроби цього експерименту — у N; обрізана не покрила відрізок і в PBO не йде.
+        model = await _model(conn, experiment_id)
+        # Невдала і обрізана спроби цього експерименту — у N. Обрізана покрила 3 доби: у жодному
+        # розбитті PBO в неї немає двох діб в обох половинах, тож вона не змагається.
         await record_trial(session, experiment_id=experiment_id, split=split, state="FAILED", params={"name": "failed"})
         await record_trial(
             session,
@@ -301,8 +307,9 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
         assert result["dsr_spread_trials"] == 3
         assert result["dsr_spread_floor"] is False
         assert Decimal(result["dsr_benchmark_sharpe"]) > 0
-        # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 47 (кратно 16).
+        # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 47 (кратно 16), усі розбиття.
         assert result["pbo_strategies"] == 3
+        assert result["pbo_splits"] == 12870
         start = split.folds[0].test_start_ms
         assert (result["pbo_span_from_ms"], result["pbo_span_to_ms"]) == (start, start + 32 * 24 * HOUR)
 
@@ -313,7 +320,6 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
     shifted = _split(min_train_ms=24 * HOUR)
     _old_r, junk_r = _paths(len(old_split.folds) * 2)
     strong_r, _junk = _paths(len(shifted.folds) * 2)
-    model = await make_model(conn)
     async with AsyncSession(bind=conn) as session:
         old = await _line(session, old_split)
         for name, series in (("junk", junk_r), ("mirror", tuple(-value for value in junk_r))):
@@ -326,6 +332,7 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
                 folds=_records(old_split, series),
             )
         moved = await _line(session, shifted)
+        model = await _model(conn, moved)
         candidate = await record_trial(
             session,
             experiment_id=moved,
@@ -346,17 +353,17 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
         result = row.result
         assert result is not None
-        # Старі спроби лишаються суперниками: спільний відрізок починається там, де старий walk-forward.
+        # Відрізок PBO — walk-forward кандидата; старі спроби змагаються на добах, які покрили.
         assert result["pbo_strategies"] == 3
-        assert result["pbo_span_from_ms"] == old_split.folds[0].test_start_ms
+        assert result["pbo_span_from_ms"] == shifted.folds[0].test_start_ms
 
 
 async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConnection) -> None:
     split = _split()
     loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
-    model = await make_model(conn)
     async with AsyncSession(bind=conn) as session:
         experiment_id, strong_id, junk_id = await _strong_and_junk(session, split)
+        model = await _model(conn, experiment_id)
         opened = await open_holdout_after_gate(
             session,
             experiment_id=experiment_id,
@@ -390,9 +397,9 @@ async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConn
 
 async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> None:
     split = _split()
-    model = await make_model(conn)
     async with AsyncSession(bind=conn) as session:
         experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        model = await _model(conn, experiment_id)
         opened = await open_holdout_after_gate(
             session,
             experiment_id=experiment_id,
@@ -434,6 +441,45 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
             "below_min_trades": False,
             "cost_factor": "2",
         }
+
+
+async def test_opening_model_must_belong_to_the_experiment(conn: AsyncConnection) -> None:
+    # Інакше meta-модель, відкрита через експеримент, оголошений `direct`, обійшла б порівняння з правилом.
+    split = _split()
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        sibling = await _line(session, split)
+        cases: tuple[tuple[dict[str, object], str], ...] = (
+            ({}, "експерименту"),
+            ({"experiment_id": sibling}, "експерименту"),
+            ({"experiment_id": experiment_id, "label_type": "direct"}, "label_type"),
+            ({"experiment_id": experiment_id, "trade_symbol": ETH}, "символ"),
+            ({"experiment_id": experiment_id, "timeframe": "4h"}, "таймфрейм"),
+        )
+        for overrides, message in cases:
+            with pytest.raises(ValueError, match=message):
+                await open_holdout_after_gate(
+                    session,
+                    experiment_id=experiment_id,
+                    trial_id=strong_id,
+                    model_version=await make_model(conn, **overrides),
+                    stress=_stress(split),
+                    unfiltered_total_net=Decimal("0"),
+                    thresholds=loose,
+                )
+        with pytest.raises(ValueError, match="немає"):
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=strong_id,
+                model_version="m-missing",
+                stress=_stress(split),
+                unfiltered_total_net=Decimal("0"),
+                thresholds=loose,
+            )
+        openings = select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == BTC)
+        assert (await session.execute(openings)).scalar_one() == 0
 
 
 async def test_incomplete_or_foreign_trial_does_not_snapshot(conn: AsyncConnection) -> None:

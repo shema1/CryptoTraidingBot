@@ -3,9 +3,9 @@
 DSR (Bailey & López de Prado, 2014) рахується з ряду R торгового символу, не з річного Sharpe
 барів бектесту. Кількість спроб — уся лінія, включно з `FAILED` і `PRUNED`; розкид Sharpe між
 спробами — з рядів ≥ `DSR_SPREAD_MIN_TRADES` угод і не менший за `1/(T−1)` кандидата. PBO — CSCV
-на 16 блоках за часом (Bailey, Borwein, López de Prado & Zhu, 2015): рядок матриці — доба
-перетину відрізків walk-forward усіх COMPLETE-спроб лінії, однакова для всіх; частка розбиттів,
-де стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
+на 16 блоках за часом (Bailey, Borwein, López de Prado & Zhu, 2015) з пропусками: рядок матриці —
+доба walk-forward кандидата; кожна спроба лінії змагається на добах, які покрила (рішення 0014);
+частка розбиттів, де стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
 
 Блочний bootstrap групує угоди за тижнем входу (7 діб від епохи UTC) і з цих блоків набирає
 шлях тієї самої довжини. Останній блок шляху може бути обрізаний. PF і коридор беруть уже
@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.backtest import BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
-from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial
+from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact
 from app.ml.validation import MIN_TRADES_PER_FOLD, RecordedOpening, SplitLeakError, _lock_line, _open_holdout
 from app.risk.limits import next_consecutive_losses
 from app.risk.numbers import FrozenModel, require_decimal
@@ -304,24 +304,26 @@ class DsrEstimate(FrozenModel):
 
 
 class PboEstimate(FrozenModel):
-    """PBO і з чого він порахований: стратегій у матриці і відрізок діб (`[span_from_ms, span_to_ms)`).
+    """PBO і з чого він порахований.
 
-    Відрізок — перетин відрізків усіх COMPLETE-спроб, обрізаний до кратної блокам кількості діб.
-    Якщо перетин коротший за 2 доби на блок, відрізка немає і PBO не рахується.
+    `span_*` — walk-forward кандидата, обрізаний до кратної блокам кількості діб; коротший за 2 доби
+    на блок — відрізка немає і PBO не рахується. `n_strategies` — спроб, що змагались хоч в одному
+    розбитті; `n_splits` — розбиттів, де змагались щонайменше дві.
     """
 
     pbo: Decimal | None
     n_strategies: int
+    n_splits: int
     span_from_ms: int | None
     span_to_ms: int | None
 
     @model_validator(mode="after")
     def _span(self) -> PboEstimate:
-        if self.n_strategies < 0:
-            raise ValueError("кількість стратегій PBO від'ємна")
+        if self.n_strategies < 0 or self.n_splits < 0:
+            raise ValueError("лічильники PBO від'ємні")
         if (self.span_from_ms is None) != (self.span_to_ms is None):
             raise ValueError("відрізок PBO має обидві межі або жодної")
-        if self.pbo is not None and self.n_strategies < 2:
+        if self.pbo is not None and (self.n_strategies < 2 or self.n_splits < 1):
             raise ValueError("PBO без суперника")
         return self
 
@@ -330,15 +332,13 @@ class TrialSeries(FrozenModel):
     """Ряд спроби для PBO: R, час входу кожної угоди і відрізок walk-forward, який спроба покрила.
 
     Відрізок — від початку першого тесту до кінця останнього записаного фолду. Спроба без фолдів
-    (`FAILED`/`PRUNED` з порожнім префіксом) відрізка не має: у PBO не входить, у N для DSR — так.
-    `complete` — стан `COMPLETE`: лише такі спроби задають спільний відрізок PBO.
+    (`FAILED`/`PRUNED` з порожнім префіксом) відрізка не має: у PBO не змагається, у N для DSR — так.
     """
 
     returns: tuple[Decimal, ...]
     entry_ms: tuple[int, ...]
     covered_from_ms: int | None
     covered_to_ms: int | None
-    complete: bool = True
 
     @model_validator(mode="after")
     def _shape(self) -> TrialSeries:
@@ -349,8 +349,6 @@ class TrialSeries(FrozenModel):
         if (self.covered_from_ms is None) != (self.covered_to_ms is None):
             raise ValueError("відрізок спроби має обидві межі або жодної")
         if self.covered_from_ms is None or self.covered_to_ms is None:
-            if self.complete:
-                raise ValueError("COMPLETE-спроба без відрізка walk-forward")
             if self.returns:
                 raise ValueError("угоди без відрізка walk-forward")
             return self
@@ -386,13 +384,8 @@ def trial_series_from_journal(
     oos_results: Sequence[object],
     oos_entry_ms: Sequence[object],
     metrics: Mapping[str, Any],
-    *,
-    state: str,
 ) -> TrialSeries:
     """Ряд спроби з журналу. Рядок без часу кожної угоди (до міграції 0005) — відмова, а не пропуск."""
-    if state not in TRIAL_STATES:
-        raise ValueError("невідомий стан спроби")
-    complete = state == "COMPLETE"
     returns = parse_oos_results(oos_results)
     if not isinstance(oos_entry_ms, Sequence) or isinstance(oos_entry_ms, (str, bytes)):
         raise TypeError("oos_entry_ms має бути послідовністю")
@@ -412,7 +405,6 @@ def trial_series_from_journal(
             entry_ms=tuple(entries),
             covered_from_ms=None,
             covered_to_ms=None,
-            complete=complete,
         )
     first, last = folds[0], folds[-1]
     if not isinstance(first, Mapping) or not isinstance(last, Mapping):
@@ -426,7 +418,6 @@ def trial_series_from_journal(
         entry_ms=tuple(entries),
         covered_from_ms=start,
         covered_to_ms=end,
-        complete=complete,
     )
 
 
@@ -608,17 +599,18 @@ def deflated_sharpe_ratio(
 def pbo_estimate(
     trials: Sequence[TrialSeries],
     *,
+    candidate_index: int,
     n_blocks: int = CSCV_BLOCKS,
     bin_ms: int = DAY_MS,
 ) -> PboEstimate:
-    """PBO методом CSCV за часом і з чого він. `pbo` — None, якщо перетин короткий або немає суперника.
+    """PBO методом CSCV за часом з пропусками і з чого він (рішення 0014).
 
-    Відрізок — перетин відрізків walk-forward усіх COMPLETE-спроб лінії: кандидат не може вибрати
-    суперників зміною геометрії розбивки. Рядок матриці — `bin_ms` (доба) від початку перетину,
-    сума R угод з входом у цю добу; доба без угод — 0. Беруться повні доби, кратні `n_blocks`, і не
-    менше двох на блок. Змагається кожна спроба (будь-якого стану), що покрила цей відрізок; її
-    угоди поза ним не беруться. Обрізана спроба відрізок не звужує і, не покривши його, лишається
-    лише в N для DSR.
+    Відрізок — walk-forward кандидата, повні доби, кратні `n_blocks`, не менше двох на блок. Рядок
+    матриці — доба (`bin_ms`), значення — сума R угод з входом у неї. Змагається кожна спроба лінії,
+    будь-якого стану і геометрії, на добах, які повністю покрила; решта діб у неї — пропуски, а не
+    нулі. У розбитті спроба змагається, лише якщо має щонайменше дві доби в кожній половині. Тож
+    жодна спроба не звужує вікно і не виключає суперників. `pbo` — None, якщо відрізка немає або
+    ні в одному розбитті не змагались двоє.
     """
     blocks_ok = type(n_blocks) is int and not isinstance(n_blocks, bool)
     if not blocks_ok or not 2 <= n_blocks <= CSCV_BLOCKS or n_blocks % 2 != 0:
@@ -628,27 +620,31 @@ def pbo_estimate(
     if not isinstance(trials, Sequence) or isinstance(trials, (str, bytes)) or not trials:
         raise ValueError("немає рядів для PBO")
     _sequence("trials", trials, TrialSeries)
-    empty = PboEstimate(pbo=None, n_strategies=0, span_from_ms=None, span_to_ms=None)
-    spans = [
-        (series.covered_from_ms, series.covered_to_ms)
-        for series in trials
-        if series.complete and series.covered_from_ms is not None and series.covered_to_ms is not None
-    ]
-    if not spans:
+    if type(candidate_index) is not int or isinstance(candidate_index, bool):
+        raise ValueError("candidate_index має бути int")
+    if candidate_index < 0 or candidate_index >= len(trials):
+        raise ValueError("candidate_index поза рядами")
+    candidate = trials[candidate_index]
+    empty = PboEstimate(pbo=None, n_strategies=0, n_splits=0, span_from_ms=None, span_to_ms=None)
+    if candidate.covered_from_ms is None or candidate.covered_to_ms is None:
         return empty
-    start = max(span[0] for span in spans)
-    end = min(span[1] for span in spans)
-    usable = (max(0, end - start) // bin_ms // n_blocks) * n_blocks
+    start = candidate.covered_from_ms
+    usable = ((candidate.covered_to_ms - start) // bin_ms // n_blocks) * n_blocks
     if usable < 2 * n_blocks:
         return empty
     span_to = start + usable * bin_ms
     with localcontext(_CONTEXT):
-        columns = [_binned(series, start, bin_ms, usable) for series in trials if _covers(series, start, span_to)]
-    if len(columns) < 2:
-        return PboEstimate(pbo=None, n_strategies=len(columns), span_from_ms=start, span_to_ms=span_to)
+        binned = [_binned(series, start, bin_ms, usable) for series in trials]
+    kept = [(values, present) for values, present in binned if present.any()]
+    fraction, n_strategies, n_splits = _cscv_fraction(
+        np.column_stack([values for values, _present in kept]),
+        np.column_stack([present for _values, present in kept]),
+        n_blocks,
+    )
     return PboEstimate(
-        pbo=_probability(_cscv_fraction(np.column_stack(columns), n_blocks)),
-        n_strategies=len(columns),
+        pbo=None if fraction is None else _probability(fraction),
+        n_strategies=n_strategies,
+        n_splits=n_splits,
         span_from_ms=start,
         span_to_ms=span_to,
     )
@@ -657,11 +653,12 @@ def pbo_estimate(
 def probability_of_backtest_overfitting(
     trials: Sequence[TrialSeries],
     *,
+    candidate_index: int,
     n_blocks: int = CSCV_BLOCKS,
     bin_ms: int = DAY_MS,
 ) -> Decimal | None:
     """Лише PBO з `pbo_estimate`."""
-    return pbo_estimate(trials, n_blocks=n_blocks, bin_ms=bin_ms).pbo
+    return pbo_estimate(trials, candidate_index=candidate_index, n_blocks=n_blocks, bin_ms=bin_ms).pbo
 
 
 def fold_outcome_from_report(report: BacktestReport, *, below_min_trades: bool) -> FoldOutcome:
@@ -764,9 +761,11 @@ async def open_holdout_after_gate(
     """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
 
     DSR і PBO перераховуються з поточного журналу лінії. Розкид Sharpe для DSR — з рядів, де угод
-    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1), і не менший за `1/(T−1)`. PBO — за часом, на
-    перетині відрізків усіх COMPLETE-спроб лінії; рядок журналу без часу угод — відмова. Запис
-    відкриття показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій і відрізок PBO.
+    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1), і не менший за `1/(T−1)`. PBO — за часом на
+    walk-forward кандидата, з пропусками; рядок журналу без часу угод — відмова. Запис відкриття
+    показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій, розбиттів і відрізок PBO.
+    Модель відкриття має належати цьому експерименту (`experiment_id`, `label_type`, символ,
+    таймфрейм): інакше тип експерименту вирішував би, чи порівнювати ML-фільтр з правилом.
     Відмова — `GateRejected` з рішенням
     (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
     G1 (пороги, послаблені пороги, стрес, правило без фільтра) і лише тоді — знімок
@@ -778,6 +777,7 @@ async def open_holdout_after_gate(
         raise ValueError("trial_id має бути int")
     limits = thresholds if thresholds is not None else GateThresholds()
     experiment, trial, rows = await _load_candidate(session, experiment_id, trial_id)
+    await _check_model(session, model_version, experiment)
     stored = experiment.params.get("validation")
     if not isinstance(stored, dict):
         raise SplitLeakError("в експерименту немає розбивки")
@@ -785,13 +785,11 @@ async def open_holdout_after_gate(
     if type(split_min) is not int or isinstance(split_min, bool) or split_min < 1:
         raise SplitLeakError("у розбивці немає min_trades_per_fold")
     effective = limits.model_copy(update={"min_trades_per_fold": max(limits.min_trades_per_fold, split_min)})
-    series = [
-        trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics, state=row.state) for row in rows
-    ]
+    series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
     returns = [item.returns for item in series]
     candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
     dsr_detail = deflated_sharpe(returns[candidate_index], trial_returns=returns, n_trials=len(series))
-    pbo_detail = pbo_estimate(series)
+    pbo_detail = pbo_estimate(series, candidate_index=candidate_index)
     dsr = dsr_detail.dsr
     pbo = pbo_detail.pbo
     decision = evaluate_gate(
@@ -825,6 +823,7 @@ async def open_holdout_after_gate(
             "dsr_benchmark_sharpe": dsr_detail.benchmark_sharpe,
             "pbo": pbo,
             "pbo_strategies": pbo_detail.n_strategies,
+            "pbo_splits": pbo_detail.n_splits,
             "pbo_span_from_ms": pbo_detail.span_from_ms,
             "pbo_span_to_ms": pbo_detail.span_to_ms,
             "n_trades": decision.n_trades,
@@ -1007,20 +1006,35 @@ async def _load_candidate(
     return experiment, trial, rows
 
 
-def _covers(series: TrialSeries, start: int, end: int) -> bool:
-    if series.covered_from_ms is None or series.covered_to_ms is None:
-        return False
-    return series.covered_from_ms <= start and series.covered_to_ms >= end
-
-
-def _binned(series: TrialSeries, start: int, bin_ms: int, n_bins: int) -> np.ndarray:
-    """Сума R за добу входу; сума — у Decimal, у float переходить лише результат."""
+def _binned(series: TrialSeries, start: int, bin_ms: int, n_bins: int) -> tuple[np.ndarray, np.ndarray]:
+    """Сума R за добу входу і чи доба цілком у відрізку спроби. Сума — у Decimal, у float — лише результат."""
+    present = np.zeros(n_bins, dtype=bool)
+    if series.covered_from_ms is not None and series.covered_to_ms is not None:
+        first = max(0, -(-(series.covered_from_ms - start) // bin_ms))
+        last = min(n_bins, (series.covered_to_ms - start) // bin_ms)
+        if last > first:
+            present[first:last] = True
     sums = [Decimal(0)] * n_bins
     for value, entry in zip(series.returns, series.entry_ms, strict=True):
         index = (entry - start) // bin_ms
-        if 0 <= index < n_bins:
+        if 0 <= index < n_bins and present[index]:
             sums[index] += value
-    return np.asarray([float(value) for value in sums], dtype=np.float64)
+    return np.asarray([float(value) for value in sums], dtype=np.float64), present
+
+
+async def _check_model(session: AsyncSession, model_version: str, experiment: Experiment) -> None:
+    """Модель відкриття — рецепт цього експерименту. Інакше відмова до будь-якого запису."""
+    model = await session.get(ModelArtifact, model_version)
+    if model is None:
+        raise ValueError("моделі немає в журналі моделей")
+    if model.experiment_id != experiment.id:
+        raise ValueError("модель не належить цьому експерименту")
+    if model.label_type != experiment.label_type:
+        raise ValueError("label_type моделі не збігається з експериментом")
+    if model.trade_symbol != experiment.research_line:
+        raise ValueError("торговий символ моделі не збігається з лінією")
+    if model.timeframe != experiment.timeframe:
+        raise ValueError("таймфрейм моделі не збігається з експериментом")
 
 
 def _week_blocks(trades: Sequence[BacktestTrade]) -> tuple[tuple[Decimal, ...], ...]:
@@ -1209,41 +1223,66 @@ def _psr(sharpe: float, benchmark: float, n_obs: int, skew: float, kurtosis: flo
     return _norm_cdf(z_score)
 
 
-def _cscv_fraction(matrix: np.ndarray, n_blocks: int) -> float:
-    """Частка розбиттів, де найкращий in-sample на out-of-sample не вищий за медіану.
+def _cscv_fraction(matrix: np.ndarray, present: np.ndarray, n_blocks: int) -> tuple[float | None, int, int]:
+    """Частка розбиттів, де найкращий in-sample на out-of-sample не вищий за медіану, з пропусками.
 
+    У розбитті змагаються спроби, що мають щонайменше дві доби в кожній половині; ранг і ω — серед
+    них. Розбиття, де змагається менше двох, не рахується. Повертає частку (None — жодного розбиття),
+    скільки спроб змагались хоч раз і скільки розбиттів пораховано. Без пропусків — звичайний CSCV.
     Розбиття йдуть порціями по `_CSCV_CELLS` чисел: масив «розбиття × половина блоків × спроби»
     цілком займав би гігабайти на сотнях спроб лінії.
     """
     row_count, n_strategies = matrix.shape
     block_size = row_count // n_blocks
-    blocks = matrix[: block_size * n_blocks].reshape(n_blocks, block_size, n_strategies)
-    block_sum = blocks.sum(axis=1)
-    block_sq = np.square(blocks).sum(axis=1)
+    rows = block_size * n_blocks
+    values = np.where(present[:rows], matrix[:rows], 0.0).reshape(n_blocks, block_size, n_strategies)
+    block_sum = values.sum(axis=1)
+    block_sq = np.square(values).sum(axis=1)
+    block_count = present[:rows].reshape(n_blocks, block_size, n_strategies).sum(axis=1).astype(np.float64)
     total_sum = block_sum.sum(axis=0)
     total_sq = block_sq.sum(axis=0)
+    total_count = block_count.sum(axis=0)
     half = n_blocks // 2
-    count = half * block_size
     chosen = np.asarray(list(combinations(range(n_blocks), half)), dtype=np.int64)
     step = max(1, _CSCV_CELLS // (half * n_strategies))
     bad = 0
+    evaluated = 0
+    competed = np.zeros(n_strategies, dtype=bool)
     for start in range(0, int(chosen.shape[0]), step):
         part = chosen[start : start + step]
-        in_sample_sum = block_sum[part].sum(axis=1)
-        in_sample_sq = block_sq[part].sum(axis=1)
-        in_sample = _sharpe_rows(in_sample_sum, in_sample_sq, count)
-        out_of_sample = _sharpe_rows(total_sum - in_sample_sum, total_sq - in_sample_sq, count)
-        best = np.argmax(in_sample, axis=1)
+        in_sum = block_sum[part].sum(axis=1)
+        in_sq = block_sq[part].sum(axis=1)
+        in_count = block_count[part].sum(axis=1)
+        out_count = total_count - in_count
+        valid = (in_count >= 2) & (out_count >= 2)
+        rivals = valid.sum(axis=1)
+        counted = rivals >= 2
+        if not counted.any():
+            continue
+        valid = valid[counted]
+        in_sample = _sharpe_rows(in_sum[counted], in_sq[counted], in_count[counted])
+        out_of_sample = _sharpe_rows(
+            (total_sum - in_sum)[counted],
+            (total_sq - in_sq)[counted],
+            out_count[counted],
+        )
+        best = np.nanargmax(np.where(valid, in_sample, np.nan), axis=1)
         picked = out_of_sample[np.arange(best.size), best][:, None]
-        # Середній ранг обраної (1 — найгірша; нічия ділить місця порівну).
-        below = np.count_nonzero(out_of_sample < picked, axis=1)
-        tied = np.count_nonzero(out_of_sample == picked, axis=1)
+        # Середній ранг обраної серед суперників розбиття (1 — найгірша; нічия ділить місця порівну).
+        below = np.count_nonzero(valid & (out_of_sample < picked), axis=1)
+        tied = np.count_nonzero(valid & (out_of_sample == picked), axis=1)
         ranks = below + (tied + 1) / 2
-        bad += int(np.count_nonzero(ranks / (n_strategies + 1) <= 0.5))
-    return bad / int(chosen.shape[0])
+        bad += int(np.count_nonzero(ranks / (rivals[counted] + 1) <= 0.5))
+        evaluated += int(best.size)
+        competed |= valid.any(axis=0)
+    if evaluated == 0:
+        return None, int(competed.sum()), 0
+    return bad / evaluated, int(competed.sum()), evaluated
 
 
-def _sharpe_rows(sum_: np.ndarray, sum_sq: np.ndarray, count: int) -> np.ndarray:
+def _sharpe_rows(sum_: np.ndarray, sum_sq: np.ndarray, count: np.ndarray) -> np.ndarray:
+    """Sharpe за сумами. Де діб менше двох, значення не має сенсу — викликач його маскує."""
+    count = np.maximum(count, 2.0)
     mean = sum_ / count
     variance = (sum_sq - (sum_ * sum_) / count) / (count - 1)
     variance = np.maximum(variance, 0.0)
