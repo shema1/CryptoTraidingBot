@@ -302,13 +302,17 @@ def test_more_attempts_lower_the_deflated_sharpe_and_a_constant_series_is_undefi
     assert with_gap is not None
     assert with_gap < alone
     assert deflated_sharpe_ratio((Decimal("1"),) * 8, trial_returns=((Decimal("1"),) * 8,), n_trials=1) is None
-    # Дві однакові оцінки Sharpe (обидві з ≥ 100 угод) дають нульову дисперсію між спробами:
-    # порожня невдача DSR не знижує.
+    # Копія кандидата дає нульовий розкид між спробами, але розкид не буває меншим за 1/(T−1):
+    # N і далі знижує DSR, копією його не вимкнути.
     long_positive = (Decimal("1"), Decimal("-0.2")) * 50
     long_alone = deflated_sharpe_ratio(long_positive, trial_returns=(long_positive,), n_trials=1)
-    copied = deflated_sharpe_ratio(long_positive, trial_returns=(long_positive, long_positive, ()), n_trials=3)
-    assert copied is not None
-    assert copied == long_alone
+    copied = deflated_sharpe(long_positive, trial_returns=(long_positive, long_positive, ()), n_trials=3)
+    assert long_alone is not None
+    assert copied.dsr is not None
+    assert copied.dsr < long_alone
+    assert copied.spread_floor is True
+    floor_only = deflated_sharpe(long_positive, trial_returns=(long_positive, ()), n_trials=2)
+    assert floor_only.spread_floor is True
     with pytest.raises(ValueError, match="кількості рядів"):
         deflated_sharpe_ratio(positive, trial_returns=(positive,), n_trials=3)
     with pytest.raises(ValueError, match="variance_min_trades"):
@@ -339,8 +343,27 @@ def test_short_trials_count_in_n_but_do_not_set_the_spread() -> None:
     assert estimate.benchmark_sharpe is not None
     assert estimate.benchmark_sharpe > 0
     # Поріг розкиду — константа, а не `min_oos_trades` G1: суворіший поріг G1 не має звужувати розкид.
-    assert DSR_SPREAD_MIN_TRADES == 100
+    assert DSR_SPREAD_MIN_TRADES == 30
     assert "dsr_spread_min_trades" not in GateThresholds.model_fields
+
+
+def test_copies_and_short_trials_cannot_switch_off_the_trial_count() -> None:
+    rng = np.random.default_rng(1)
+    candidate = _decimals(list(rng.normal(0.25, 1, size=400)), places=4)
+    # 98 спроб по 20 угод (коротші за поріг розкиду) і копія кандидата: без нижньої межі розкид — 0.
+    short = tuple(_decimals(list(rng.normal(0, 1, size=20)), places=4) for _ in range(98))
+    gamed = deflated_sharpe(candidate, trial_returns=(candidate, candidate, *short), n_trials=100)
+    assert gamed.spread_floor is True
+    assert gamed.dsr is not None
+    # З N = 100 і Sharpe ≈ 0.25 на угоду G1 не проходить: поріг — очікуваний максимум 100 спроб.
+    assert gamed.dsr < Decimal("0.95")
+    alone = deflated_sharpe_ratio(candidate, trial_returns=(candidate,), n_trials=1)
+    assert alone is not None
+    assert alone > Decimal("0.99")
+    # Поріг рядів для розкиду: короткий ряд (20 угод) не входить, ряд з 30 — входить.
+    thirty = _decimals(list(rng.normal(0, 1, size=30)), places=4)
+    counted = deflated_sharpe(candidate, trial_returns=(candidate, thirty, short[0]), n_trials=3)
+    assert counted.n_spread == 2
 
 
 def test_deflated_sharpe_matches_the_paper_example() -> None:
@@ -416,7 +439,6 @@ def test_normal_quantile_matches_a_known_value() -> None:
 def test_pbo_of_a_half_sample_reversal_is_one_and_noise_is_near_one_half() -> None:
     overfit = probability_of_backtest_overfitting(
         (_daily((Decimal("1"), Decimal("1"), Decimal("-1"), Decimal("-1"))), _daily((Decimal("0"),) * 4)),
-        candidate_index=0,
         n_blocks=2,
     )
     assert overfit == Decimal("1")
@@ -425,7 +447,7 @@ def test_pbo_of_a_half_sample_reversal_is_one_and_noise_is_near_one_half() -> No
     for seed in range(8):
         rng = np.random.default_rng(seed)
         noise = tuple(_daily(_decimals(list(rng.normal(0, 1, size=16 * 16)))) for _ in range(10))
-        estimate = probability_of_backtest_overfitting(noise, candidate_index=0)
+        estimate = probability_of_backtest_overfitting(noise)
         assert estimate is not None
         estimates.append(estimate)
     random_pbo = sum(estimates, Decimal(0)) / Decimal(len(estimates))
@@ -434,10 +456,10 @@ def test_pbo_of_a_half_sample_reversal_is_one_and_noise_is_near_one_half() -> No
     rng = np.random.default_rng(11)
     edge = _daily(_decimals(list(rng.normal(0.8, 1, size=16 * 12))))
     rest = tuple(_daily(_decimals(list(rng.normal(0, 1, size=16 * 12)))) for _ in range(5))
-    skilled = probability_of_backtest_overfitting((edge, *rest), candidate_index=0)
+    skilled = probability_of_backtest_overfitting((edge, *rest))
     assert skilled is not None
     assert skilled < Decimal("0.2")
-    assert probability_of_backtest_overfitting((edge,), candidate_index=0) is None
+    assert probability_of_backtest_overfitting((edge,)) is None
 
 
 def _reference_pbo(columns: list[tuple[Decimal, ...]], n_blocks: int) -> Decimal:
@@ -469,10 +491,10 @@ def test_pbo_matches_a_direct_cscv_with_ties(monkeypatch: pytest.MonkeyPatch) ->
     columns.append(columns[2])
     expected = _reference_pbo(columns, 12)
     trials = tuple(_daily(column) for column in columns)
-    assert probability_of_backtest_overfitting(trials, candidate_index=0, n_blocks=12) == expected
+    assert probability_of_backtest_overfitting(trials, n_blocks=12) == expected
     # Порція з одного розбиття: межі порцій не змінюють результат.
     monkeypatch.setattr(ml_statistics, "_CSCV_CELLS", 1)
-    assert probability_of_backtest_overfitting(trials, candidate_index=0, n_blocks=12) == expected
+    assert probability_of_backtest_overfitting(trials, n_blocks=12) == expected
 
 
 def test_pbo_memory_does_not_grow_with_the_number_of_splits() -> None:
@@ -481,7 +503,7 @@ def test_pbo_memory_does_not_grow_with_the_number_of_splits() -> None:
     trials = tuple(_daily(_decimals(list(rng.normal(0, 1, size=16 * 20)), places=4)) for _ in range(200))
     tracemalloc.start()
     try:
-        estimate = probability_of_backtest_overfitting(trials, candidate_index=0)
+        estimate = probability_of_backtest_overfitting(trials)
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -508,32 +530,48 @@ def test_pbo_rows_are_days_and_a_sparse_trial_still_competes() -> None:
     for day, value in zip(picked, sparse_r, strict=True):
         per_day[day] += value
     expected = _reference_pbo([dense.returns, tuple(per_day), *(item.returns for item in noise)], 16)
-    trials = (dense, sparse, *noise)
-    assert probability_of_backtest_overfitting(trials, candidate_index=0) == expected
-    # Рядок — доба, а не номер угоди: який ряд кандидат, коли відрізок спільний, — не важить.
-    assert probability_of_backtest_overfitting(trials, candidate_index=1) == expected
+    assert probability_of_backtest_overfitting((dense, sparse, *noise)) == expected
 
 
-def test_pbo_leaves_out_trials_that_did_not_cover_the_candidate_span() -> None:
+def _covering(values: tuple[Decimal, ...], *, from_day: int, complete: bool = True) -> TrialSeries:
+    """Одна угода на добу з доби `from_day`; відрізок — від неї до останньої угоди включно."""
+    return TrialSeries(
+        returns=values,
+        entry_ms=tuple((from_day + index) * DAY_MS for index in range(len(values))),
+        covered_from_ms=from_day * DAY_MS,
+        covered_to_ms=(from_day + len(values)) * DAY_MS,
+        complete=complete,
+    )
+
+
+def test_pbo_uses_the_overlap_of_every_complete_trial() -> None:
     rng = np.random.default_rng(29)
     whole = _daily(_decimals(list(rng.normal(0, 1, size=64)), places=4))
     first_half = _daily(whole.returns[:32])
-    # Половина відрізка не змагається на всьому відрізку кандидата: одна стратегія — None.
-    assert probability_of_backtest_overfitting((whole, first_half), candidate_index=0) is None
-    # Кандидат на половині: довша спроба покриває її, і її угоди поза відрізком не беруться.
-    assert probability_of_backtest_overfitting((whole, first_half), candidate_index=1) == _reference_pbo(
-        [whole.returns[:32], first_half.returns], 16
-    )
-    empty = TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
-    assert probability_of_backtest_overfitting((whole, empty), candidate_index=0) is None
-    # Деталі для запису відкриття: скільки стратегій змагались і на якому відрізку.
-    alone = pbo_estimate((whole, first_half), candidate_index=0)
-    assert (alone.pbo, alone.n_strategies, alone.span_from_ms, alone.span_to_ms) == (None, 1, 0, 64 * DAY_MS)
-    paired = pbo_estimate((whole, first_half), candidate_index=1)
-    assert paired.pbo is not None
+    # Відрізок — перетин відрізків усіх COMPLETE-спроб; угоди поза ним не беруться.
+    paired = pbo_estimate((whole, first_half))
+    assert paired.pbo == _reference_pbo([whole.returns[:32], first_half.returns], 16)
     assert (paired.n_strategies, paired.span_from_ms, paired.span_to_ms) == (2, 0, 32 * DAY_MS)
-    nothing = pbo_estimate((empty, whole), candidate_index=0)
-    assert (nothing.pbo, nothing.n_strategies, nothing.span_from_ms, nothing.span_to_ms) == (None, 0, None, None)
+    # Кандидат зі зсунутою на добу геометрією не виключає суперників: усі на спільних 48 добах.
+    shifted = _covering(_decimals(list(rng.normal(0, 1, size=64)), places=4), from_day=1)
+    moved = pbo_estimate((whole, shifted))
+    assert moved.pbo is not None
+    assert (moved.n_strategies, moved.span_from_ms, moved.span_to_ms) == (2, DAY_MS, 49 * DAY_MS)
+    # Обрізана спроба (не COMPLETE) відрізок не звужує; а якщо покрила весь перетин — змагається.
+    pruned_short = _covering(whole.returns[:10], from_day=0, complete=False)
+    assert pbo_estimate((whole, first_half, pruned_short)) == paired
+    pruned_full = _covering(whole.returns, from_day=0, complete=False)
+    assert pbo_estimate((whole, first_half, pruned_full)).n_strategies == 3
+    empty = TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None, complete=False)
+    assert pbo_estimate((whole, first_half, empty)) == paired
+    # Перетин коротший за 2 доби на блок (32 доби) — PBO не рахується, G1 відмовляє.
+    tiny = _covering(whole.returns[:20], from_day=0)
+    short = pbo_estimate((whole, tiny))
+    assert (short.pbo, short.n_strategies, short.span_from_ms, short.span_to_ms) == (None, 0, None, None)
+    alone = pbo_estimate((whole,))
+    assert (alone.pbo, alone.n_strategies, alone.span_from_ms, alone.span_to_ms) == (None, 1, 0, 64 * DAY_MS)
+    with pytest.raises(ValueError, match="COMPLETE"):
+        TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
 
 
 def test_trial_series_from_the_journal_needs_entry_times() -> None:
@@ -543,15 +581,17 @@ def test_trial_series_from_the_journal_needs_entry_times() -> None:
             {"test_start_ms": 2 * DAY_MS, "test_end_ms": 5 * DAY_MS},
         ]
     }
-    series = trial_series_from_journal(["1.5", "-1"], [HOUR_MS, 3 * DAY_MS], folds)
+    series = trial_series_from_journal(["1.5", "-1"], [HOUR_MS, 3 * DAY_MS], folds, state="COMPLETE")
     assert series.returns == (Decimal("1.5"), Decimal("-1"))
     assert series.entry_ms == (HOUR_MS, 3 * DAY_MS)
     assert (series.covered_from_ms, series.covered_to_ms) == (0, 5 * DAY_MS)
-    empty = trial_series_from_journal([], [], {"folds": []})
+    empty = trial_series_from_journal([], [], {"folds": []}, state="FAILED")
+    assert empty.complete is False
+    assert series.complete is True
     assert (empty.covered_from_ms, empty.covered_to_ms) == (None, None)
     # Рядок без часу угод (до міграції 0005) у PBO не входить мовчки: відмова.
     with pytest.raises(ValueError, match="час"):
-        trial_series_from_journal(["1"], [], folds)
+        trial_series_from_journal(["1"], [], folds, state="COMPLETE")
     with pytest.raises(ValueError, match="поза"):
         TrialSeries(returns=(Decimal("1"),), entry_ms=(6 * DAY_MS,), covered_from_ms=0, covered_to_ms=5 * DAY_MS)
     with pytest.raises(ValueError, match="порядку"):

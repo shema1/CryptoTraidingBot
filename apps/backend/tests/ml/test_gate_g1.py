@@ -33,14 +33,14 @@ HOUR = HOUR_MS
 _LABELS = LabelStats(n_labels=2, n_last_stop=0, n_both_reached_tp=0)
 
 
-def _split() -> ResearchSplit:
+def _split(*, min_train_ms: int = 48 * HOUR) -> ResearchSplit:
     # 47 добових фолдів: PBO ділить відрізок walk-forward на 16 блоків по добі.
     return build_split(
         data_from_ms=0,
         data_to_ms=1500 * HOUR,
         horizon_bars=4,
         count_trades=lambda _start, _end: 1,
-        min_train_ms=48 * HOUR,
+        min_train_ms=min_train_ms,
         test_segment_ms=24 * HOUR,
         test_segment_extended_ms=48 * HOUR,
         min_trades_per_fold=1,
@@ -297,13 +297,58 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
         result = row.result
         assert result is not None
         assert result["n_trials_line"] == 5
-        # У розкиді DSR жодного ряду ≥ 100 угод (по 94): розкид — 1/(T−1) кандидата.
-        assert result["dsr_spread_trials"] == 0
+        # Розкид DSR — з рядів ≥ 30 угод: кандидат, junk і сусідня спроба (по 94); обрізана (6) — ні.
+        assert result["dsr_spread_trials"] == 3
+        assert result["dsr_spread_floor"] is False
         assert Decimal(result["dsr_benchmark_sharpe"]) > 0
         # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 47 (кратно 16).
         assert result["pbo_strategies"] == 3
         start = split.folds[0].test_start_ms
         assert (result["pbo_span_from_ms"], result["pbo_span_to_ms"]) == (start, start + 32 * 24 * HOUR)
+
+
+async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> None:
+    old_split = _split()
+    # Той самий запечатаний hold-out, але walk-forward починається на добу раніше.
+    shifted = _split(min_train_ms=24 * HOUR)
+    _old_r, junk_r = _paths(len(old_split.folds) * 2)
+    strong_r, _junk = _paths(len(shifted.folds) * 2)
+    model = await make_model(conn)
+    async with AsyncSession(bind=conn) as session:
+        old = await _line(session, old_split)
+        for name, series in (("junk", junk_r), ("mirror", tuple(-value for value in junk_r))):
+            await record_trial(
+                session,
+                experiment_id=old,
+                split=old_split,
+                state="COMPLETE",
+                params={"name": name},
+                folds=_records(old_split, series),
+            )
+        moved = await _line(session, shifted)
+        candidate = await record_trial(
+            session,
+            experiment_id=moved,
+            split=shifted,
+            state="COMPLETE",
+            params={"name": "strong"},
+            folds=_records(shifted, strong_r),
+        )
+        opened = await open_holdout_after_gate(
+            session,
+            experiment_id=moved,
+            trial_id=candidate.trial_id,
+            model_version=model,
+            stress=_stress(shifted),
+            unfiltered_total_net=Decimal("0"),
+            thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
+        )
+        row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
+        result = row.result
+        assert result is not None
+        # Старі спроби лишаються суперниками: спільний відрізок починається там, де старий walk-forward.
+        assert result["pbo_strategies"] == 3
+        assert result["pbo_span_from_ms"] == old_split.folds[0].test_start_ms
 
 
 async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConnection) -> None:

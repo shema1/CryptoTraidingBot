@@ -2,10 +2,10 @@
 
 DSR (Bailey & López de Prado, 2014) рахується з ряду R торгового символу, не з річного Sharpe
 барів бектесту. Кількість спроб — уся лінія, включно з `FAILED` і `PRUNED`; розкид Sharpe між
-спробами — лише з рядів, де угод не менше за мінімум G1. PBO — CSCV на 16 блоках за часом
-(Bailey, Borwein, López de Prado & Zhu, 2015): рядок матриці — доба відрізка walk-forward
-кандидата, однакова для всіх спроб; частка розбиттів, де стратегія, найкраща на одній половині
-блоків, на іншій не вища за медіану.
+спробами — з рядів ≥ `DSR_SPREAD_MIN_TRADES` угод і не менший за `1/(T−1)` кандидата. PBO — CSCV
+на 16 блоках за часом (Bailey, Borwein, López de Prado & Zhu, 2015): рядок матриці — доба
+перетину відрізків walk-forward усіх COMPLETE-спроб лінії, однакова для всіх; частка розбиттів,
+де стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
 
 Блочний bootstrap групує угоди за тижнем входу (7 діб від епохи UTC) і з цих блоків набирає
 шлях тієї самої довжини. Останній блок шляху може бути обрізаний. PF і коридор беруть уже
@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.backtest import BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
-from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial
+from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial
 from app.ml.validation import MIN_TRADES_PER_FOLD, RecordedOpening, SplitLeakError, _lock_line, _open_holdout
 from app.risk.limits import next_consecutive_losses
 from app.risk.numbers import FrozenModel, require_decimal
@@ -45,8 +45,9 @@ MEDIAN_PF_MIN: Decimal = Decimal("1.15")
 PROFITABLE_FOLD_SHARE: Decimal = Decimal("0.70")
 MIN_OOS_TRADES: int = 100
 # Розкид Sharpe між спробами для DSR — з рядів, де угод не менше. Константа, а не `min_oos_trades` G1:
-# суворіший поріг G1 лишав би менше рядів, менший розкид і вищий DSR.
-DSR_SPREAD_MIN_TRADES: int = 100
+# суворіший поріг G1 лишав би менше рядів, менший розкид і вищий DSR. Ряд із 2–3 угод дає Sharpe
+# у десятки і назавжди роздув би розкид лінії; короткі ряди лишаються в N.
+DSR_SPREAD_MIN_TRADES: int = 30
 STRESS_MEDIAN_PF_MIN: Decimal = Decimal("1")
 STRESS_COST_FACTOR: Decimal = Decimal("2")
 BASE_COST_FACTOR: Decimal = Decimal("1")
@@ -283,11 +284,16 @@ class GateDecision(FrozenModel):
 
 
 class DsrEstimate(FrozenModel):
-    """DSR і з чого він порахований. `n_spread` — рядів у розкиді Sharpe; `benchmark_sharpe` — SR*."""
+    """DSR і з чого він порахований.
+
+    `n_spread` — рядів у розкиді Sharpe; `spread_floor` — розкид підняли до `1/(T−1)` кандидата
+    (рядів менше двох або вони надто схожі); `benchmark_sharpe` — SR*, очікуваний максимум з N спроб.
+    """
 
     dsr: Decimal | None
     n_trials: int
     n_spread: int
+    spread_floor: bool
     benchmark_sharpe: Decimal | None
 
     @model_validator(mode="after")
@@ -298,7 +304,11 @@ class DsrEstimate(FrozenModel):
 
 
 class PboEstimate(FrozenModel):
-    """PBO і з чого він порахований: стратегій у матриці і відрізок діб (`[span_from_ms, span_to_ms)`)."""
+    """PBO і з чого він порахований: стратегій у матриці і відрізок діб (`[span_from_ms, span_to_ms)`).
+
+    Відрізок — перетин відрізків усіх COMPLETE-спроб, обрізаний до кратної блокам кількості діб.
+    Якщо перетин коротший за 2 доби на блок, відрізка немає і PBO не рахується.
+    """
 
     pbo: Decimal | None
     n_strategies: int
@@ -321,12 +331,14 @@ class TrialSeries(FrozenModel):
 
     Відрізок — від початку першого тесту до кінця останнього записаного фолду. Спроба без фолдів
     (`FAILED`/`PRUNED` з порожнім префіксом) відрізка не має: у PBO не входить, у N для DSR — так.
+    `complete` — стан `COMPLETE`: лише такі спроби задають спільний відрізок PBO.
     """
 
     returns: tuple[Decimal, ...]
     entry_ms: tuple[int, ...]
     covered_from_ms: int | None
     covered_to_ms: int | None
+    complete: bool = True
 
     @model_validator(mode="after")
     def _shape(self) -> TrialSeries:
@@ -337,6 +349,8 @@ class TrialSeries(FrozenModel):
         if (self.covered_from_ms is None) != (self.covered_to_ms is None):
             raise ValueError("відрізок спроби має обидві межі або жодної")
         if self.covered_from_ms is None or self.covered_to_ms is None:
+            if self.complete:
+                raise ValueError("COMPLETE-спроба без відрізка walk-forward")
             if self.returns:
                 raise ValueError("угоди без відрізка walk-forward")
             return self
@@ -372,8 +386,13 @@ def trial_series_from_journal(
     oos_results: Sequence[object],
     oos_entry_ms: Sequence[object],
     metrics: Mapping[str, Any],
+    *,
+    state: str,
 ) -> TrialSeries:
     """Ряд спроби з журналу. Рядок без часу кожної угоди (до міграції 0005) — відмова, а не пропуск."""
+    if state not in TRIAL_STATES:
+        raise ValueError("невідомий стан спроби")
+    complete = state == "COMPLETE"
     returns = parse_oos_results(oos_results)
     if not isinstance(oos_entry_ms, Sequence) or isinstance(oos_entry_ms, (str, bytes)):
         raise TypeError("oos_entry_ms має бути послідовністю")
@@ -388,7 +407,13 @@ def trial_series_from_journal(
     if not isinstance(folds, list):
         raise ValueError("у спроби немає списку фолдів")
     if not folds:
-        return TrialSeries(returns=returns, entry_ms=tuple(entries), covered_from_ms=None, covered_to_ms=None)
+        return TrialSeries(
+            returns=returns,
+            entry_ms=tuple(entries),
+            covered_from_ms=None,
+            covered_to_ms=None,
+            complete=complete,
+        )
     first, last = folds[0], folds[-1]
     if not isinstance(first, Mapping) or not isinstance(last, Mapping):
         raise ValueError("фолд журналу не об'єкт")
@@ -396,7 +421,13 @@ def trial_series_from_journal(
     end = last.get("test_end_ms")
     if type(start) is not int or type(end) is not int:
         raise ValueError("межі тесту фолду мають бути int мс")
-    return TrialSeries(returns=returns, entry_ms=tuple(entries), covered_from_ms=start, covered_to_ms=end)
+    return TrialSeries(
+        returns=returns,
+        entry_ms=tuple(entries),
+        covered_from_ms=start,
+        covered_to_ms=end,
+        complete=complete,
+    )
 
 
 def r_profit_factor(returns: Sequence[Decimal]) -> Decimal | None:
@@ -512,8 +543,8 @@ def deflated_sharpe(
     `trial_returns` — ряди всіх спроб лінії, включно з порожніми; їхня кількість дорівнює `n_trials`.
     Розкид Sharpe між спробами береться лише з рядів, де угод не менше за `variance_min_trades`:
     ряд із 2–3 угод дає Sharpe у десятки і назавжди обвалив би DSR лінії. Коротші ряди лишаються
-    в N. Менше двох таких оцінок при `n_trials` > 1 — дисперсія однієї оцінки за нульової
-    істинної Sharpe, `1/(T−1)`.
+    в N. Розкид не менший за `1/(T−1)` кандидата — розкид однієї оцінки за нульової істинної
+    Sharpe: інакше копія кандидата чи кластер майже однакових спроб робили б N зайвим.
     """
     if type(n_trials) is not int or isinstance(n_trials, bool) or n_trials < 1:
         raise ValueError("n_trials має бути ціле ≥ 1")
@@ -531,21 +562,29 @@ def deflated_sharpe(
     ]
     moments = _moments(candidate)
     if moments is None:
-        return DsrEstimate(dsr=None, n_trials=n_trials, n_spread=len(spread), benchmark_sharpe=None)
+        return DsrEstimate(
+            dsr=None,
+            n_trials=n_trials,
+            n_spread=len(spread),
+            spread_floor=False,
+            benchmark_sharpe=None,
+        )
     sharpe, skew, kurt = moments
-    if n_trials == 1:
-        variance = 0.0
-    elif len(spread) >= 2:
+    floor = 1.0 / (len(candidate) - 1)
+    observed = 0.0
+    if len(spread) >= 2:
         mean_sr = sum(spread) / len(spread)
-        variance = sum((item - mean_sr) ** 2 for item in spread) / (len(spread) - 1)
-    else:
-        variance = 1.0 / (len(candidate) - 1)
+        observed = sum((item - mean_sr) ** 2 for item in spread) / (len(spread) - 1)
+    # Одна спроба — вибору немає: SR* = 0 за будь-якого розкиду.
+    floored = n_trials > 1 and observed < floor
+    variance = floor if floored else observed
     benchmark = _selection_benchmark(n_trials, variance)
     probability = _psr(sharpe, benchmark, len(candidate), skew, kurt)
     return DsrEstimate(
         dsr=None if probability is None else _probability(probability),
         n_trials=n_trials,
         n_spread=len(spread),
+        spread_floor=floored,
         benchmark_sharpe=_moment_decimal(benchmark),
     )
 
@@ -569,16 +608,17 @@ def deflated_sharpe_ratio(
 def pbo_estimate(
     trials: Sequence[TrialSeries],
     *,
-    candidate_index: int,
     n_blocks: int = CSCV_BLOCKS,
     bin_ms: int = DAY_MS,
 ) -> PboEstimate:
-    """PBO методом CSCV за часом і з чого він. `pbo` — None, якщо відрізок коротший за блоки або немає суперника.
+    """PBO методом CSCV за часом і з чого він. `pbo` — None, якщо перетин короткий або немає суперника.
 
-    Рядок матриці — `bin_ms` (доба) від початку відрізка walk-forward кандидата, сума R угод з
-    входом у цю добу; доба без угод — 0. Матриця бере кратну `n_blocks` кількість діб від початку.
-    Входить кожна спроба, що покрила весь відрізок кандидата, хоч би скільки в неї угод; її угоди
-    поза відрізком не беруться. Решта — лише в N для DSR.
+    Відрізок — перетин відрізків walk-forward усіх COMPLETE-спроб лінії: кандидат не може вибрати
+    суперників зміною геометрії розбивки. Рядок матриці — `bin_ms` (доба) від початку перетину,
+    сума R угод з входом у цю добу; доба без угод — 0. Беруться повні доби, кратні `n_blocks`, і не
+    менше двох на блок. Змагається кожна спроба (будь-якого стану), що покрила цей відрізок; її
+    угоди поза ним не беруться. Обрізана спроба відрізок не звужує і, не покривши його, лишається
+    лише в N для DSR.
     """
     blocks_ok = type(n_blocks) is int and not isinstance(n_blocks, bool)
     if not blocks_ok or not 2 <= n_blocks <= CSCV_BLOCKS or n_blocks % 2 != 0:
@@ -588,23 +628,22 @@ def pbo_estimate(
     if not isinstance(trials, Sequence) or isinstance(trials, (str, bytes)) or not trials:
         raise ValueError("немає рядів для PBO")
     _sequence("trials", trials, TrialSeries)
-    if type(candidate_index) is not int or isinstance(candidate_index, bool):
-        raise ValueError("candidate_index має бути int")
-    if candidate_index < 0 or candidate_index >= len(trials):
-        raise ValueError("candidate_index поза рядами")
-    candidate = trials[candidate_index]
     empty = PboEstimate(pbo=None, n_strategies=0, span_from_ms=None, span_to_ms=None)
-    if candidate.covered_from_ms is None or candidate.covered_to_ms is None:
+    spans = [
+        (series.covered_from_ms, series.covered_to_ms)
+        for series in trials
+        if series.complete and series.covered_from_ms is not None and series.covered_to_ms is not None
+    ]
+    if not spans:
         return empty
-    start = candidate.covered_from_ms
-    end = candidate.covered_to_ms
-    usable = (-(-(end - start) // bin_ms) // n_blocks) * n_blocks
-    half = n_blocks // 2
-    if usable < n_blocks or (usable // n_blocks) * half < 2:
+    start = max(span[0] for span in spans)
+    end = min(span[1] for span in spans)
+    usable = (max(0, end - start) // bin_ms // n_blocks) * n_blocks
+    if usable < 2 * n_blocks:
         return empty
-    with localcontext(_CONTEXT):
-        columns = [_binned(series, start, bin_ms, usable) for series in trials if _covers(series, start, end)]
     span_to = start + usable * bin_ms
+    with localcontext(_CONTEXT):
+        columns = [_binned(series, start, bin_ms, usable) for series in trials if _covers(series, start, span_to)]
     if len(columns) < 2:
         return PboEstimate(pbo=None, n_strategies=len(columns), span_from_ms=start, span_to_ms=span_to)
     return PboEstimate(
@@ -618,12 +657,11 @@ def pbo_estimate(
 def probability_of_backtest_overfitting(
     trials: Sequence[TrialSeries],
     *,
-    candidate_index: int,
     n_blocks: int = CSCV_BLOCKS,
     bin_ms: int = DAY_MS,
 ) -> Decimal | None:
     """Лише PBO з `pbo_estimate`."""
-    return pbo_estimate(trials, candidate_index=candidate_index, n_blocks=n_blocks, bin_ms=bin_ms).pbo
+    return pbo_estimate(trials, n_blocks=n_blocks, bin_ms=bin_ms).pbo
 
 
 def fold_outcome_from_report(report: BacktestReport, *, below_min_trades: bool) -> FoldOutcome:
@@ -726,8 +764,9 @@ async def open_holdout_after_gate(
     """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
 
     DSR і PBO перераховуються з поточного журналу лінії. Розкид Sharpe для DSR — з рядів, де угод
-    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1). PBO — за часом; рядок журналу без часу угод —
-    відмова. Запис відкриття показує, з чого вони: рядів у розкиді, SR*, стратегій і відрізок PBO.
+    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1), і не менший за `1/(T−1)`. PBO — за часом, на
+    перетині відрізків усіх COMPLETE-спроб лінії; рядок журналу без часу угод — відмова. Запис
+    відкриття показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій і відрізок PBO.
     Відмова — `GateRejected` з рішенням
     (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
     G1 (пороги, послаблені пороги, стрес, правило без фільтра) і лише тоді — знімок
@@ -746,11 +785,13 @@ async def open_holdout_after_gate(
     if type(split_min) is not int or isinstance(split_min, bool) or split_min < 1:
         raise SplitLeakError("у розбивці немає min_trades_per_fold")
     effective = limits.model_copy(update={"min_trades_per_fold": max(limits.min_trades_per_fold, split_min)})
-    series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
+    series = [
+        trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics, state=row.state) for row in rows
+    ]
     returns = [item.returns for item in series]
     candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
     dsr_detail = deflated_sharpe(returns[candidate_index], trial_returns=returns, n_trials=len(series))
-    pbo_detail = pbo_estimate(series, candidate_index=candidate_index)
+    pbo_detail = pbo_estimate(series)
     dsr = dsr_detail.dsr
     pbo = pbo_detail.pbo
     decision = evaluate_gate(
@@ -780,6 +821,7 @@ async def open_holdout_after_gate(
             "n_trials_line": len(series),
             "dsr": dsr,
             "dsr_spread_trials": dsr_detail.n_spread,
+            "dsr_spread_floor": dsr_detail.spread_floor,
             "dsr_benchmark_sharpe": dsr_detail.benchmark_sharpe,
             "pbo": pbo,
             "pbo_strategies": pbo_detail.n_strategies,
