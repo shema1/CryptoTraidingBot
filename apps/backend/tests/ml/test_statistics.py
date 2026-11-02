@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import tracemalloc
 from decimal import Decimal
 from itertools import combinations
+from statistics import NormalDist
 
 import numpy as np
 import pytest
@@ -18,6 +20,7 @@ from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, B
 from app.ml.features import HOUR_MS
 from app.ml.statistics import (
     DAY_MS,
+    DSR_SPREAD_MIN_TRADES,
     WEEK_MS,
     BlockBootstrapPf,
     FoldOutcome,
@@ -26,8 +29,13 @@ from app.ml.statistics import (
     TrialSeries,
     _norm_cdf,
     _norm_ppf,
+    _PathPf,
+    _pf_percentile,
+    _psr,
+    _selection_benchmark,
     block_bootstrap_pf,
     corridor_payload,
+    deflated_sharpe,
     deflated_sharpe_ratio,
     evaluate_gate,
     fold_outcome_from_report,
@@ -36,6 +44,7 @@ from app.ml.statistics import (
     loosened_thresholds,
     loss_streak,
     parse_oos_results,
+    pbo_estimate,
     probability_of_backtest_overfitting,
     r_profit_factor,
     return_moments,
@@ -322,6 +331,53 @@ def test_short_trials_count_in_n_but_do_not_set_the_spread() -> None:
     collapsed = deflated_sharpe_ratio(edge, trial_returns=(edge, *others, short), n_trials=22, variance_min_trades=2)
     assert collapsed is not None
     assert collapsed < Decimal("0.05")
+    # Деталі для запису відкриття: розкид — з 21 ряду, коротка спроба лише в N.
+    estimate = deflated_sharpe(edge, trial_returns=(edge, *others, short), n_trials=22)
+    assert estimate.dsr == crowded
+    assert estimate.n_trials == 22
+    assert estimate.n_spread == 21
+    assert estimate.benchmark_sharpe is not None
+    assert estimate.benchmark_sharpe > 0
+    # Поріг розкиду — константа, а не `min_oos_trades` G1: суворіший поріг G1 не має звужувати розкид.
+    assert DSR_SPREAD_MIN_TRADES == 100
+    assert "dsr_spread_min_trades" not in GateThresholds.model_fields
+
+
+def test_deflated_sharpe_matches_the_paper_example() -> None:
+    # Bailey & López de Prado (2014), числовий приклад: річний SR 2.5 за 1250 днів, N = 100,
+    # V[SR] = 1/2 річних, асиметрія −3, сирий ексцес 10 → SR₀ ≈ 0.1132 на день, DSR ≈ 0.9004.
+    daily = 2.5 / math.sqrt(250)
+    benchmark = _selection_benchmark(100, 0.5 / 250)
+    assert abs(benchmark - 0.1132) < 5e-5
+    probability = _psr(daily, benchmark, 1250, -3.0, 10.0)
+    assert probability is not None
+    assert abs(probability - 0.9004) < 5e-5
+    # Незалежні Φ і Φ⁻¹ зі stdlib дають той самий поріг.
+    normal = NormalDist()
+    euler = 0.5772156649015329
+    expected = math.sqrt(0.5 / 250) * (
+        (1 - euler) * normal.inv_cdf(1 - 1 / 100) + euler * normal.inv_cdf(1 - 1 / (100 * math.e))
+    )
+    assert abs(benchmark - expected) < 1e-8
+    # Знаки поправок: права асиметрія підвищує PSR, товсті хвости знижують.
+    right = _psr(0.1, 0.0, 400, 1.0, 3.0)
+    left = _psr(0.1, 0.0, 400, -1.0, 3.0)
+    thin = _psr(0.1, 0.0, 400, 0.0, 3.0)
+    fat = _psr(0.1, 0.0, 400, 0.0, 9.0)
+    assert right is not None
+    assert left is not None
+    assert thin is not None
+    assert fat is not None
+    assert right > left
+    assert thin > fat
+
+
+def test_pf_lower_bound_takes_the_finite_neighbour() -> None:
+    # 5% шляхів зі збитками: нижня межа на стику скінченного і нескінченного — скінченна, не «без збитків».
+    samples = [_PathPf(Decimal("0.5"), False)] * 50 + [_PathPf(None, True)] * 950
+    assert _pf_percentile(samples, Decimal("0.05"), lower=True) == _PathPf(Decimal("0.5"), False)
+    assert _pf_percentile(samples, Decimal("0.05"), lower=False) == _PathPf(None, True)
+    assert _pf_percentile(samples, Decimal("0.95"), lower=False) == _PathPf(None, True)
 
 
 def test_random_trials_deflate_and_a_real_edge_does_not() -> None:
@@ -470,6 +526,14 @@ def test_pbo_leaves_out_trials_that_did_not_cover_the_candidate_span() -> None:
     )
     empty = TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
     assert probability_of_backtest_overfitting((whole, empty), candidate_index=0) is None
+    # Деталі для запису відкриття: скільки стратегій змагались і на якому відрізку.
+    alone = pbo_estimate((whole, first_half), candidate_index=0)
+    assert (alone.pbo, alone.n_strategies, alone.span_from_ms, alone.span_to_ms) == (None, 1, 0, 64 * DAY_MS)
+    paired = pbo_estimate((whole, first_half), candidate_index=1)
+    assert paired.pbo is not None
+    assert (paired.n_strategies, paired.span_from_ms, paired.span_to_ms) == (2, 0, 32 * DAY_MS)
+    nothing = pbo_estimate((empty, whole), candidate_index=0)
+    assert (nothing.pbo, nothing.n_strategies, nothing.span_from_ms, nothing.span_to_ms) == (None, 0, None, None)
 
 
 def test_trial_series_from_the_journal_needs_entry_times() -> None:
@@ -642,7 +706,7 @@ def test_gate_passes_on_the_boundary_and_names_every_miss() -> None:
     assert _gate(dsr=None, pbo=None).reasons == ("G1_DSR", "G1_PBO")
 
 
-def test_gate_thresholds_reject_a_looser_fold_minimum_than_the_caller_sets() -> None:
+def test_gate_uses_the_thresholds_the_caller_passes() -> None:
     loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=5)
     folds = tuple(_fold("2", "1.20", n_trades=5) for _ in range(2))
     stress = tuple(_fold("1", "1.10", n_trades=5, cost="2") for _ in range(2))

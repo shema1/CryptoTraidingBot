@@ -44,6 +44,9 @@ PBO_MAX: Decimal = Decimal("0.5")
 MEDIAN_PF_MIN: Decimal = Decimal("1.15")
 PROFITABLE_FOLD_SHARE: Decimal = Decimal("0.70")
 MIN_OOS_TRADES: int = 100
+# Розкид Sharpe між спробами для DSR — з рядів, де угод не менше. Константа, а не `min_oos_trades` G1:
+# суворіший поріг G1 лишав би менше рядів, менший розкид і вищий DSR.
+DSR_SPREAD_MIN_TRADES: int = 100
 STRESS_MEDIAN_PF_MIN: Decimal = Decimal("1")
 STRESS_COST_FACTOR: Decimal = Decimal("2")
 BASE_COST_FACTOR: Decimal = Decimal("1")
@@ -279,6 +282,40 @@ class GateDecision(FrozenModel):
         return self
 
 
+class DsrEstimate(FrozenModel):
+    """DSR і з чого він порахований. `n_spread` — рядів у розкиді Sharpe; `benchmark_sharpe` — SR*."""
+
+    dsr: Decimal | None
+    n_trials: int
+    n_spread: int
+    benchmark_sharpe: Decimal | None
+
+    @model_validator(mode="after")
+    def _counts(self) -> DsrEstimate:
+        if self.n_trials < 1 or self.n_spread < 0 or self.n_spread > self.n_trials:
+            raise ValueError("лічильники DSR")
+        return self
+
+
+class PboEstimate(FrozenModel):
+    """PBO і з чого він порахований: стратегій у матриці і відрізок діб (`[span_from_ms, span_to_ms)`)."""
+
+    pbo: Decimal | None
+    n_strategies: int
+    span_from_ms: int | None
+    span_to_ms: int | None
+
+    @model_validator(mode="after")
+    def _span(self) -> PboEstimate:
+        if self.n_strategies < 0:
+            raise ValueError("кількість стратегій PBO від'ємна")
+        if (self.span_from_ms is None) != (self.span_to_ms is None):
+            raise ValueError("відрізок PBO має обидві межі або жодної")
+        if self.pbo is not None and self.n_strategies < 2:
+            raise ValueError("PBO без суперника")
+        return self
+
+
 class TrialSeries(FrozenModel):
     """Ряд спроби для PBO: R, час входу кожної угоди і відрізок walk-forward, який спроба покрила.
 
@@ -400,8 +437,8 @@ def block_bootstrap_pf(
         samples = [_classify(path) for path in paths]
         low_q = (Decimal(1) - confidence) / 2
         high_q = Decimal(1) - low_q
-        lower = _pf_percentile(samples, low_q)
-        upper = _pf_percentile(samples, high_q)
+        lower = _pf_percentile(samples, low_q, lower=True)
+        upper = _pf_percentile(samples, high_q, lower=False)
         observed = _classify(observed_returns)
         has_loss = any(value < 0 for value in observed_returns)
         return BlockBootstrapPf(
@@ -463,14 +500,14 @@ def return_moments(returns: Sequence[Decimal]) -> ReturnMoments | None:
     )
 
 
-def deflated_sharpe_ratio(
+def deflated_sharpe(
     returns: Sequence[Decimal],
     *,
     trial_returns: Sequence[Sequence[Decimal]],
     n_trials: int,
-    variance_min_trades: int = MIN_OOS_TRADES,
-) -> Decimal | None:
-    """Імовірність, що Sharpe спроби вищий за очікуваний максимум з `n_trials` спроб.
+    variance_min_trades: int = DSR_SPREAD_MIN_TRADES,
+) -> DsrEstimate:
+    """Імовірність, що Sharpe спроби вищий за очікуваний максимум з `n_trials` спроб, і з чого вона.
 
     `trial_returns` — ряди всіх спроб лінії, включно з порожніми; їхня кількість дорівнює `n_trials`.
     Розкид Sharpe між спробами береться лише з рядів, де угод не менше за `variance_min_trades`:
@@ -487,15 +524,15 @@ def deflated_sharpe_ratio(
     if n_trials != len(trial_returns):
         raise ValueError("n_trials має дорівнювати кількості рядів")
     candidate = _float_returns(returns)
-    moments = _moments(candidate)
-    if moments is None:
-        return None
-    sharpe, skew, kurt = moments
     spread = [
         value
         for values in (_float_returns(series) for series in trial_returns)
         if values.size >= variance_min_trades and (value := _sharpe(values)) is not None
     ]
+    moments = _moments(candidate)
+    if moments is None:
+        return DsrEstimate(dsr=None, n_trials=n_trials, n_spread=len(spread), benchmark_sharpe=None)
+    sharpe, skew, kurt = moments
     if n_trials == 1:
         variance = 0.0
     elif len(spread) >= 2:
@@ -505,19 +542,38 @@ def deflated_sharpe_ratio(
         variance = 1.0 / (len(candidate) - 1)
     benchmark = _selection_benchmark(n_trials, variance)
     probability = _psr(sharpe, benchmark, len(candidate), skew, kurt)
-    if probability is None:
-        return None
-    return _probability(probability)
+    return DsrEstimate(
+        dsr=None if probability is None else _probability(probability),
+        n_trials=n_trials,
+        n_spread=len(spread),
+        benchmark_sharpe=_moment_decimal(benchmark),
+    )
 
 
-def probability_of_backtest_overfitting(
+def deflated_sharpe_ratio(
+    returns: Sequence[Decimal],
+    *,
+    trial_returns: Sequence[Sequence[Decimal]],
+    n_trials: int,
+    variance_min_trades: int = DSR_SPREAD_MIN_TRADES,
+) -> Decimal | None:
+    """Лише DSR з `deflated_sharpe`."""
+    return deflated_sharpe(
+        returns,
+        trial_returns=trial_returns,
+        n_trials=n_trials,
+        variance_min_trades=variance_min_trades,
+    ).dsr
+
+
+def pbo_estimate(
     trials: Sequence[TrialSeries],
     *,
     candidate_index: int,
     n_blocks: int = CSCV_BLOCKS,
     bin_ms: int = DAY_MS,
-) -> Decimal | None:
-    """PBO методом CSCV за часом. None, якщо відрізок кандидата коротший за блоки або немає суперника.
+) -> PboEstimate:
+    """PBO методом CSCV за часом і з чого він. `pbo` — None, якщо відрізок коротший за блоки або немає суперника.
 
     Рядок матриці — `bin_ms` (доба) від початку відрізка walk-forward кандидата, сума R угод з
     входом у цю добу; доба без угод — 0. Матриця бере кратну `n_blocks` кількість діб від початку.
@@ -537,19 +593,37 @@ def probability_of_backtest_overfitting(
     if candidate_index < 0 or candidate_index >= len(trials):
         raise ValueError("candidate_index поза рядами")
     candidate = trials[candidate_index]
+    empty = PboEstimate(pbo=None, n_strategies=0, span_from_ms=None, span_to_ms=None)
     if candidate.covered_from_ms is None or candidate.covered_to_ms is None:
-        return None
+        return empty
     start = candidate.covered_from_ms
     end = candidate.covered_to_ms
     usable = (-(-(end - start) // bin_ms) // n_blocks) * n_blocks
     half = n_blocks // 2
     if usable < n_blocks or (usable // n_blocks) * half < 2:
-        return None
+        return empty
     with localcontext(_CONTEXT):
         columns = [_binned(series, start, bin_ms, usable) for series in trials if _covers(series, start, end)]
+    span_to = start + usable * bin_ms
     if len(columns) < 2:
-        return None
-    return _probability(_cscv_fraction(np.column_stack(columns), n_blocks))
+        return PboEstimate(pbo=None, n_strategies=len(columns), span_from_ms=start, span_to_ms=span_to)
+    return PboEstimate(
+        pbo=_probability(_cscv_fraction(np.column_stack(columns), n_blocks)),
+        n_strategies=len(columns),
+        span_from_ms=start,
+        span_to_ms=span_to,
+    )
+
+
+def probability_of_backtest_overfitting(
+    trials: Sequence[TrialSeries],
+    *,
+    candidate_index: int,
+    n_blocks: int = CSCV_BLOCKS,
+    bin_ms: int = DAY_MS,
+) -> Decimal | None:
+    """Лише PBO з `pbo_estimate`."""
+    return pbo_estimate(trials, candidate_index=candidate_index, n_blocks=n_blocks, bin_ms=bin_ms).pbo
 
 
 def fold_outcome_from_report(report: BacktestReport, *, below_min_trades: bool) -> FoldOutcome:
@@ -652,7 +726,8 @@ async def open_holdout_after_gate(
     """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
 
     DSR і PBO перераховуються з поточного журналу лінії. Розкид Sharpe для DSR — з рядів, де угод
-    не менше за `min_oos_trades` G1. PBO — за часом; рядок журналу без часу угод — відмова.
+    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1). PBO — за часом; рядок журналу без часу угод —
+    відмова. Запис відкриття показує, з чого вони: рядів у розкиді, SR*, стратегій і відрізок PBO.
     Відмова — `GateRejected` з рішенням
     (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
     G1 (пороги, послаблені пороги, стрес, правило без фільтра) і лише тоді — знімок
@@ -674,13 +749,10 @@ async def open_holdout_after_gate(
     series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
     returns = [item.returns for item in series]
     candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
-    dsr = deflated_sharpe_ratio(
-        returns[candidate_index],
-        trial_returns=returns,
-        n_trials=len(series),
-        variance_min_trades=max(2, effective.min_oos_trades),
-    )
-    pbo = probability_of_backtest_overfitting(series, candidate_index=candidate_index)
+    dsr_detail = deflated_sharpe(returns[candidate_index], trial_returns=returns, n_trials=len(series))
+    pbo_detail = pbo_estimate(series, candidate_index=candidate_index)
+    dsr = dsr_detail.dsr
+    pbo = pbo_detail.pbo
     decision = evaluate_gate(
         label_type=experiment.label_type,
         folds=fold_outcomes_from_metrics(trial.metrics),
@@ -707,7 +779,12 @@ async def open_holdout_after_gate(
             "trial_no": trial.trial_no,
             "n_trials_line": len(series),
             "dsr": dsr,
+            "dsr_spread_trials": dsr_detail.n_spread,
+            "dsr_benchmark_sharpe": dsr_detail.benchmark_sharpe,
             "pbo": pbo,
+            "pbo_strategies": pbo_detail.n_strategies,
+            "pbo_span_from_ms": pbo_detail.span_from_ms,
+            "pbo_span_to_ms": pbo_detail.span_to_ms,
             "n_trades": decision.n_trades,
             "median_pf": decision.median_pf,
             "median_pf_unbounded": decision.median_pf_unbounded,
@@ -980,7 +1057,8 @@ def _classify(returns: Sequence[Decimal]) -> _PathPf:
     return _PathPf(profit / loss, False)
 
 
-def _pf_percentile(samples: Sequence[_PathPf], quantile: Decimal) -> _PathPf:
+def _pf_percentile(samples: Sequence[_PathPf], quantile: Decimal, *, lower: bool) -> _PathPf:
+    """Перцентиль PF з нескінченністю. Між скінченним і нескінченним сусідом нижня межа бере скінченного."""
     ordered = sorted(samples, key=lambda item: (1, Decimal(0)) if item.infinite else (0, item.value or Decimal(0)))
     position = quantile * Decimal(len(ordered) - 1)
     low = int(position)
@@ -988,12 +1066,11 @@ def _pf_percentile(samples: Sequence[_PathPf], quantile: Decimal) -> _PathPf:
     weight = position - Decimal(low)
     left = ordered[low]
     right = ordered[high]
-    if weight == 0 or left.infinite or right.infinite:
-        if weight == 0:
-            return left
-        if left.infinite:
-            return left
-        return _PathPf(None, True)
+    if weight == 0:
+        return left
+    if left.infinite or right.infinite:
+        # Нескінченність стоїть праворуч: якщо нескінченний лише один сусід, то правий.
+        return left if lower else right
     if left.value is None or right.value is None:
         raise ValueError("скінченний PF без значення")
     blended = left.value * (Decimal(1) - weight) + right.value * weight

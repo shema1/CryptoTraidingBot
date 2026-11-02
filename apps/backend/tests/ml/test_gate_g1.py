@@ -151,11 +151,11 @@ def _stress(split: ResearchSplit) -> tuple[FoldOutcome, ...]:
     )
 
 
-async def _line(session: AsyncSession, split: ResearchSplit) -> str:
+async def _line(session: AsyncSession, split: ResearchSplit, *, research_line: str = BTC) -> str:
     return await create_experiment(
         session,
         split=split,
-        research_line=BTC,
+        research_line=research_line,
         symbols=(BTC, ETH),
         label_type="meta",
         primary_strategy={"name": "ema_cross"},
@@ -214,6 +214,19 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
         assert decision.dsr >= Decimal("0.95")
         assert decision.pbo is not None
         assert decision.pbo < Decimal("0.5")
+        # Суворіший поріг угод G1 не звужує розкид Sharpe для DSR: DSR той самий.
+        with pytest.raises(GateRejected) as stricter:
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=strong_id,
+                model_version=await make_model(conn),
+                stress=_stress(split),
+                unfiltered_total_net=Decimal("0"),
+                thresholds=GateThresholds(min_oos_trades=50),
+            )
+        assert "G1_MIN_TRADES_TOTAL" not in stricter.value.decision.reasons
+        assert stricter.value.decision.dsr == decision.dsr
         # Знімок без відкриття не пишеться: інакше експеримент показував би DSR спроби, що hold-out не відкривала.
         experiment = await session.get(Experiment, experiment_id)
         assert experiment is not None
@@ -222,6 +235,75 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
         assert experiment.pbo is None
         openings = select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == BTC)
         assert (await session.execute(openings)).scalar_one() == 0
+
+
+async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnection) -> None:
+    split = _split()
+    _strong_r, junk_r = _paths(len(split.folds) * 2)
+    model = await make_model(conn)
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        # Невдала і обрізана спроби цього експерименту — у N; обрізана не покрила відрізок і в PBO не йде.
+        await record_trial(session, experiment_id=experiment_id, split=split, state="FAILED", params={"name": "failed"})
+        await record_trial(
+            session,
+            experiment_id=experiment_id,
+            split=split,
+            state="PRUNED",
+            params={"name": "pruned"},
+            folds=_records(split, junk_r)[:3],
+        )
+        # Інший експеримент тієї самої лінії — у N і в PBO.
+        sibling = await _line(session, split)
+        await record_trial(
+            session,
+            experiment_id=sibling,
+            split=split,
+            state="COMPLETE",
+            params={"name": "sibling"},
+            folds=_records(split, junk_r),
+        )
+        # Інша лінія (торговий символ ETH) у N цієї лінії не входить.
+        other_line = await _line(session, split, research_line=ETH)
+        for name in ("eth-1", "eth-2"):
+            await record_trial(
+                session,
+                experiment_id=other_line,
+                split=split,
+                state="COMPLETE",
+                params={"name": name},
+                folds=_records(split, junk_r),
+            )
+        with pytest.raises(GateRejected) as caught:
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=strong_id,
+                model_version=model,
+                stress=_stress(split),
+                unfiltered_total_net=Decimal("0"),
+            )
+        assert caught.value.decision.n_trials == 5
+        opened = await open_holdout_after_gate(
+            session,
+            experiment_id=experiment_id,
+            trial_id=strong_id,
+            model_version=model,
+            stress=_stress(split),
+            unfiltered_total_net=Decimal("0"),
+            thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
+        )
+        row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
+        result = row.result
+        assert result is not None
+        assert result["n_trials_line"] == 5
+        # У розкиді DSR жодного ряду ≥ 100 угод (по 94): розкид — 1/(T−1) кандидата.
+        assert result["dsr_spread_trials"] == 0
+        assert Decimal(result["dsr_benchmark_sharpe"]) > 0
+        # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 47 (кратно 16).
+        assert result["pbo_strategies"] == 3
+        start = split.folds[0].test_start_ms
+        assert (result["pbo_span_from_ms"], result["pbo_span_to_ms"]) == (start, start + 32 * 24 * HOUR)
 
 
 async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConnection) -> None:
