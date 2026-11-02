@@ -39,75 +39,75 @@
 
 ## 2. Зведена таблиця
 
-| ID | Задача | Ризик | Модель / effort | Залежить від |
-|---|---|---|---|---|
-| T0.1 | Каркас монорепозиторію та інструменти якості | R1 | sonnet / high | — |
-| T0.2 | Docker Compose: TimescaleDB | R1 | sonnet / medium | T0.1 |
-| T0.3 | Конфіг, логування з маскуванням, `clock` | R2 | opus / high | T0.1 |
-| T0.4 | Схема БД і базові міграції (ТЗ §15) | R2 | opus / xhigh | T0.2, T0.3 |
-| T0.6 | Single-instance advisory lock | R3 | fable / xhigh | T0.4 |
-| T0.7 | Каркас FastAPI і безпека локального API | R2 | opus / high | T0.3 |
-| T1.1 | Доменні типи, інтерфейс `ExchangeAdapter`, `FakeExchangeAdapter` | R3 | fable / xhigh | T0.3 |
-| T1.2 | Централізований rate limiter з пріоритетами | R2 | opus / xhigh | T1.1 |
-| T1.3 | Bybit: публічні дані та `fetch_time` | R2 | opus / high | T1.1, T1.2 |
-| T1.4 | Backfill свічок і funding | R2 | opus / high | T0.4, T1.3 |
-| T1.5 | Виявлення прогалин (`data_gaps`) | R2 | opus / high | T1.4 |
-| T1.6 | Синхронізація та стрибки часу | R2 | opus / high | T1.3 |
-| T1.7 | Кеш `instruments` і округлення | R3 | fable / xhigh | T1.3 |
-| T1.8 | Воркер задач (`jobs`) | R1 | sonnet / high | T0.4 |
-| T1.9 | Backfill даних деривативів | R2 | opus / high | T1.4 |
-| T1.10 | Колектор ліквідацій (запустити якомога раніше) | R1 | sonnet / high | T0.4, T1.3 |
-| T2.1 | `compute_features()` + буфер (1h, 4h/1d, деривативи, кілька символів) | R2 | opus / xhigh | T1.5, T1.9 |
-| T2.2 | Модель витрат, `calc_position_size()`, ліміти `risk/limits.py` | R3 | fable / xhigh | T1.7 |
-| T2.3 | Симулятор угоди, розмітка і ваги унікальності | R2 | opus / xhigh | T2.1, T2.2, T1.9 |
-| T2.4 | Бектестер (виконання і ліміти = live) | R2 | opus / xhigh | T2.3 |
-| T2.5 | Валідація: walk-forward, embargo, hold-out, журнал спроб | R2 | opus / xhigh | T2.4 |
-| T2.6 | Статистика: блочний bootstrap, DSR, PBO, коридор, Gate G1 | R2 | opus / xhigh | T2.5 |
-| T2.7 | Бейзлайни і первинна стратегія | R2 | opus / high | T2.4, T2.5 |
-| T2.8 | Meta-модель LightGBM і метрики | R2 | opus / high | T2.6, T2.7 |
-| T2.9 | Калібрування і правило очікуваної вигоди | R2 | opus / high | T2.8 |
-| T2.10 | Optuna як задача воркера | R1 | sonnet / high | T1.8, T2.8 |
-| T2.11 | Артефакти, відтворюваність, статуси, перенавчання рецепта | R3 | fable / xhigh | T2.9 |
-| T2.12 | Дослідницький цикл моделі (з людиною) | R2 | opus / high | T2.6–T2.11 |
-| T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
-| T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
-| T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
-| T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
-| T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
-| T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
-| T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
-| T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
-| T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
-| T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
-| T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
-| T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
-| T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
-| T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
-| T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
-| T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
-| T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
-| T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
-| T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
-| T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
-| T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
-| T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
-| T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
-| T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
-| T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
-| T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
-| T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
-| T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
-| T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
-| T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
-| T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
-| T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
-| T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
-| T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
-| T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
-| T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
-| T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
-| T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
-| T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
+| № | ID | Задача | Ризик | Модель / effort | Залежить від |
+|---|---|---|---|---|---|
+| 1 | T0.1 | Каркас монорепозиторію та інструменти якості | R1 | sonnet / high | — |
+| 2 | T0.2 | Docker Compose: TimescaleDB | R1 | sonnet / medium | T0.1 |
+| 3 | T0.3 | Конфіг, логування з маскуванням, `clock` | R2 | opus / high | T0.1 |
+| 4 | T0.4 | Схема БД і базові міграції (ТЗ §15) | R2 | opus / xhigh | T0.2, T0.3 |
+| 5 | T0.6 | Single-instance advisory lock | R3 | fable / xhigh | T0.4 |
+| 6 | T0.7 | Каркас FastAPI і безпека локального API | R2 | opus / high | T0.3 |
+| 7 | T1.1 | Доменні типи, інтерфейс `ExchangeAdapter`, `FakeExchangeAdapter` | R3 | fable / xhigh | T0.3 |
+| 8 | T1.2 | Централізований rate limiter з пріоритетами | R2 | opus / xhigh | T1.1 |
+| 9 | T1.3 | Bybit: публічні дані та `fetch_time` | R2 | opus / high | T1.1, T1.2 |
+| 10 | T1.4 | Backfill свічок і funding | R2 | opus / high | T0.4, T1.3 |
+| 11 | T1.5 | Виявлення прогалин (`data_gaps`) | R2 | opus / high | T1.4 |
+| 12 | T1.6 | Синхронізація та стрибки часу | R2 | opus / high | T1.3 |
+| 13 | T1.7 | Кеш `instruments` і округлення | R3 | fable / xhigh | T1.3 |
+| 14 | T1.8 | Воркер задач (`jobs`) | R1 | sonnet / high | T0.4 |
+| 15 | T1.9 | Backfill даних деривативів | R2 | opus / high | T1.4 |
+| 16 | T1.10 | Колектор ліквідацій (запустити якомога раніше) | R1 | sonnet / high | T0.4, T1.3 |
+| 17 | T2.1 | `compute_features()` + буфер (1h, 4h/1d, деривативи, кілька символів) | R2 | opus / xhigh | T1.5, T1.9 |
+| 18 | T2.2 | Модель витрат, `calc_position_size()`, ліміти `risk/limits.py` | R3 | fable / xhigh | T1.7 |
+| 19 | T2.3 | Симулятор угоди, розмітка і ваги унікальності | R2 | opus / xhigh | T2.1, T2.2, T1.9 |
+| 20 | T2.4 | Бектестер (виконання і ліміти = live) | R2 | opus / xhigh | T2.3 |
+| 21 | T2.5 | Валідація: walk-forward, embargo, hold-out, журнал спроб | R2 | opus / xhigh | T2.4 |
+| 22 | T2.6 | Статистика: блочний bootstrap, DSR, PBO, коридор, Gate G1 | R2 | opus / xhigh | T2.5 |
+| 23 | T2.7 | Бейзлайни і первинна стратегія | R2 | opus / high | T2.4, T2.5 |
+| 24 | T2.8 | Meta-модель LightGBM і метрики | R2 | opus / high | T2.6, T2.7 |
+| 25 | T2.9 | Калібрування і правило очікуваної вигоди | R2 | opus / high | T2.8 |
+| 26 | T2.10 | Optuna як задача воркера | R1 | sonnet / high | T1.8, T2.8 |
+| 27 | T2.11 | Артефакти, відтворюваність, статуси, перенавчання рецепта | R3 | fable / xhigh | T2.9 |
+| 28 | T2.12 | Дослідницький цикл моделі (з людиною) | R2 | opus / high | T2.6–T2.11 |
+| 29 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
+| 30 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
+| 31 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
+| 32 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
+| 33 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
+| 34 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
+| 35 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
+| 36 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
+| 37 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
+| 38 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
+| 39 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
+| 40 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
+| 41 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
+| 42 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
+| 43 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
+| 44 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
+| 45 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
+| 46 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
+| 47 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
+| 48 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
+| 49 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
+| 50 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
+| 51 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
+| 52 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
+| 53 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
+| 54 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
+| 55 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
+| 56 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
+| 57 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
+| 58 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
+| 59 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
+| 60 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
+| 61 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
+| 62 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
+| 63 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
+| 64 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
+| 65 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
+| 66 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
+| 67 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
 
 ---
 
