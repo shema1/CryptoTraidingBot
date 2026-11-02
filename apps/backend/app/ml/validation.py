@@ -30,11 +30,12 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.models import AUDIT_ACTION_TRIAL_INVALIDATE, AuditLog
 from app.core.clock import now_ms
 from app.core.db import SYMBOL_RE
 from app.ml.backtest import BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
-from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial, HoldoutOpening
+from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial, HoldoutOpening, TrialInvalidation
 from app.ml.trade_sim import DirectSample, ExitReason, MetaSample, StopPriceSource
 from app.risk.numbers import FrozenModel
 
@@ -505,6 +506,48 @@ async def create_experiment(
         else:
             return experiment_id
     raise RuntimeError("не вдалося виділити id експерименту")
+
+
+async def invalidate_trial(
+    session: AsyncSession,
+    *,
+    trial_id: int,
+    audit_id: int,
+    reason: str,
+) -> int:
+    """Позначити спробу недійсною (рішення 0015). Лише людина і назавжди; повертає id позначки.
+
+    Потрібен підтверджений запис `audit_log` з дією `trial.invalidate` і `target` = id спроби (його ж вимагає
+    тригер БД). Спроба лишається в журналі і в N для DSR, але не входить у розкид Sharpe і в PBO; відкриття
+    hold-out називає її в `result.invalidated_trials`. Друга позначка тієї самої спроби — відмова.
+    """
+    if type(trial_id) is not int or type(audit_id) is not int:
+        raise ValueError("trial_id і audit_id мають бути int")
+    if type(reason) is not str or not reason.strip():
+        raise ValueError("потрібна причина позначки")
+    trial = await session.get(ExperimentTrial, trial_id)
+    if trial is None:
+        raise ValueError("спроби немає в журналі")
+    experiment = await _experiment(session, trial.experiment_id)
+    await _lock_line(session, experiment.research_line)
+    audit = await session.get(AuditLog, audit_id)
+    if (
+        audit is None
+        or not audit.confirmed
+        or audit.action != AUDIT_ACTION_TRIAL_INVALIDATE
+        or audit.target != str(trial_id)
+    ):
+        raise ValueError("потрібен підтверджений запис audit_log trial.invalidate для цієї спроби")
+    existing = await session.execute(select(TrialInvalidation.id).where(TrialInvalidation.trial_id == trial_id))
+    if existing.scalar_one_or_none() is not None:
+        raise ValueError("спробу вже позначено недійсною")
+    async with session.begin_nested():
+        inserted = await session.execute(
+            insert(TrialInvalidation)
+            .values(trial_id=trial_id, confirmed_audit_id=audit_id, reason=reason, created_at_ms=now_ms())
+            .returning(TrialInvalidation.id)
+        )
+        return int(inserted.scalar_one())
 
 
 async def line_trial_count(session: AsyncSession, research_line: str) -> int:

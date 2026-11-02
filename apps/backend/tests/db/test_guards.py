@@ -12,11 +12,16 @@ from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from app.api.models import AUDIT_ACTION_EMERGENCY_RELEASE, AUDIT_ACTION_MODEL_APPROVE, AUDIT_ACTION_RISK_LOOSEN
+from app.api.models import (
+    AUDIT_ACTION_EMERGENCY_RELEASE,
+    AUDIT_ACTION_MODEL_APPROVE,
+    AUDIT_ACTION_RISK_LOOSEN,
+    AUDIT_ACTION_TRIAL_INVALIDATE,
+)
 from app.data.models import Candle, DataGap
 from app.exchange.models import Instrument
 from app.jobs.models import Job
-from app.ml.models import Experiment, ExperimentTrial, ModelArtifact
+from app.ml.models import Experiment, ExperimentTrial, ModelArtifact, TrialInvalidation
 from app.risk.models import EmergencyRun, EmergencyStep, EquitySnapshot, LedgerEntry, RiskConfig, RiskEvent
 from app.trading.models import Bot, DecisionLog, Fill, Order, Position, Signal
 from tests.db.factories import (
@@ -627,3 +632,69 @@ async def test_stopped_bot_accepts_exits_and_positions_but_not_entries(conn: Asy
     await expect_violation(conn, insert(Order).values(order_values(account, "demo", bot)), "is STOPPED")
     await make_order(conn, account, "demo", bot, origin="BOT", reduce_only=True, side="SELL")
     await conn.execute(insert(Position).values(position_values(bot, account)))
+
+
+# ---------------------------------------------------------------- T2.6: позначка недійсної спроби
+
+
+async def _trial(conn: AsyncConnection) -> int:
+    await conn.execute(
+        insert(Experiment).values(
+            id="exp-inv",
+            research_line=SYMBOL,
+            symbols=[SYMBOL],
+            timeframe="1h",
+            label_type="meta",
+            primary_strategy={},
+            params={},
+            seed=1,
+            data_from_ms=T0,
+            data_to_ms=T0 + HOUR_MS,
+        )
+    )
+    trial = {
+        "experiment_id": "exp-inv",
+        "trial_no": 1,
+        "state": "COMPLETE",
+        "params": {},
+        "oos_results": [],
+        "oos_entry_ms": [],
+        "metrics": {},
+    }
+    return await ok(conn, insert(ExperimentTrial).values(trial).returning(ExperimentTrial.id))  # type: ignore[no-any-return]
+
+
+@pytest.mark.parametrize(
+    ("action", "target", "confirmed"),
+    [
+        (AUDIT_ACTION_MODEL_APPROVE, "own", True),  # інша дія
+        (AUDIT_ACTION_TRIAL_INVALIDATE, "other", True),  # інша спроба
+        (AUDIT_ACTION_TRIAL_INVALIDATE, "own", False),  # не підтверджено людиною
+        (AUDIT_ACTION_TRIAL_INVALIDATE, None, True),  # без цілі
+    ],
+)
+async def test_trial_invalidation_needs_matching_confirmed_audit(
+    conn: AsyncConnection, action: str, target: str | None, confirmed: bool
+) -> None:
+    trial = await _trial(conn)
+    resolved = {"own": str(trial), "other": str(trial + 1), None: None}[target]
+    audit = await make_audit(conn, action, target=resolved, confirmed=confirmed)
+    stmt = insert(TrialInvalidation).values(trial_id=trial, confirmed_audit_id=audit, reason="витік")
+    await expect_violation(conn, stmt, "with action trial.invalidate for the same trial")
+
+
+async def test_one_invalidation_per_trial_with_a_reason(conn: AsyncConnection) -> None:
+    trial = await _trial(conn)
+    audit = await make_audit(conn, AUDIT_ACTION_TRIAL_INVALIDATE, target=str(trial))
+    await expect_violation(
+        conn,
+        insert(TrialInvalidation).values(trial_id=trial, confirmed_audit_id=audit, reason=""),
+        "ck_trial_invalidations_reason_not_empty",
+    )
+    await conn.execute(insert(TrialInvalidation).values(trial_id=trial, confirmed_audit_id=audit, reason="витік"))
+    again = await make_audit(conn, AUDIT_ACTION_TRIAL_INVALIDATE, target=str(trial))
+    await expect_violation(
+        conn,
+        insert(TrialInvalidation).values(trial_id=trial, confirmed_audit_id=again, reason="ще раз"),
+        "uq_trial_invalidations_trial_id",
+    )

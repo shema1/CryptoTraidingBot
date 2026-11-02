@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.backtest import BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
-from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact
+from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact, TrialInvalidation
 from app.ml.validation import MIN_TRADES_PER_FOLD, RecordedOpening, SplitLeakError, _lock_line, _open_holdout
 from app.risk.limits import next_consecutive_losses
 from app.risk.numbers import FrozenModel, require_decimal
@@ -362,6 +362,10 @@ class TrialSeries(FrozenModel):
                 raise ValueError("час входу не в порядку фолдів")
             previous = entry
         return self
+
+
+# Ряд без угод і відрізка: так у PBO і в розкиді DSR виглядає позначена недійсною спроба.
+_NO_SERIES = TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,8 +768,10 @@ async def open_holdout_after_gate(
     не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1), і не менший за `1/(T−1)`. PBO — за часом на
     walk-forward кандидата, з пропусками; рядок журналу без часу угод — відмова. Запис відкриття
     показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій, розбиттів і відрізок PBO.
-    Модель відкриття має належати цьому експерименту (`experiment_id`, `label_type`, символ,
-    таймфрейм): інакше тип експерименту вирішував би, чи порівнювати ML-фільтр з правилом.
+    Позначені недійсними спроби (рішення 0015) лишаються в N, але не входять у розкид DSR і в PBO;
+    кандидатом вони не бувають, а запис відкриття їх називає. Модель відкриття має належати цьому
+    експерименту (`experiment_id`, `label_type`, символ, таймфрейм): інакше тип експерименту вирішував
+    би, чи порівнювати ML-фільтр з правилом.
     Відмова — `GateRejected` з рішенням
     (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
     G1 (пороги, послаблені пороги, стрес, правило без фільтра) і лише тоді — знімок
@@ -778,6 +784,9 @@ async def open_holdout_after_gate(
     limits = thresholds if thresholds is not None else GateThresholds()
     experiment, trial, rows = await _load_candidate(session, experiment_id, trial_id)
     await _check_model(session, model_version, experiment)
+    invalid = await _invalidations(session, [row.id for row in rows])
+    if trial.id in invalid:
+        raise ValueError("спроба позначена недійсною і не буває кандидатом")
     stored = experiment.params.get("validation")
     if not isinstance(stored, dict):
         raise SplitLeakError("в експерименту немає розбивки")
@@ -786,10 +795,12 @@ async def open_holdout_after_gate(
         raise SplitLeakError("у розбивці немає min_trades_per_fold")
     effective = limits.model_copy(update={"min_trades_per_fold": max(limits.min_trades_per_fold, split_min)})
     series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
-    returns = [item.returns for item in series]
+    # Недійсна спроба лишається в N, але без Sharpe і без відрізка: ні розкиду DSR, ні PBO.
+    returns = [() if row.id in invalid else item.returns for row, item in zip(rows, series, strict=True)]
+    competing = [_NO_SERIES if row.id in invalid else item for row, item in zip(rows, series, strict=True)]
     candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
     dsr_detail = deflated_sharpe(returns[candidate_index], trial_returns=returns, n_trials=len(series))
-    pbo_detail = pbo_estimate(series, candidate_index=candidate_index)
+    pbo_detail = pbo_estimate(competing, candidate_index=candidate_index)
     dsr = dsr_detail.dsr
     pbo = pbo_detail.pbo
     decision = evaluate_gate(
@@ -834,6 +845,10 @@ async def open_holdout_after_gate(
             "stress": [item.model_dump() for item in stress],
             "thresholds": effective.model_dump(),
             "loosened": list(loosened_thresholds(effective)),
+            "invalidated_trials": [
+                {"trial_id": trial_id, "audit_id": mark.confirmed_audit_id, "reason": mark.reason}
+                for trial_id, mark in sorted(invalid.items())
+            ],
         },
     )
     # Після відкриття: відмова `_open_holdout` (ліміт, зсув) не лишає знімка без рядка відкриття.
@@ -1020,6 +1035,13 @@ def _binned(series: TrialSeries, start: int, bin_ms: int, n_bins: int) -> tuple[
         if 0 <= index < n_bins and present[index]:
             sums[index] += value
     return np.asarray([float(value) for value in sums], dtype=np.float64), present
+
+
+async def _invalidations(session: AsyncSession, trial_ids: Sequence[int]) -> dict[int, TrialInvalidation]:
+    if not trial_ids:
+        return {}
+    stmt = select(TrialInvalidation).where(TrialInvalidation.trial_id.in_(trial_ids))
+    return {mark.trial_id: mark for mark in (await session.execute(stmt)).scalars()}
 
 
 async def _check_model(session: AsyncSession, model_version: str, experiment: Experiment) -> None:

@@ -35,7 +35,7 @@
 | `ErrorCode`, `ErrorResponse`, `ApiError`, `install_error_handlers` | `errors.py` | єдиний формат помилок |
 | `router`, `HealthResponse`, `HEALTH_DB_TIMEOUT_MS` | `system.py` | `GET /system/health` |
 | `AuditLog`, `ApiIdempotencyKey` | `models.py` | таблиці `audit_log`, `api_idempotency_keys` |
-| `AUDIT_ACTION_RISK_LOOSEN`, `AUDIT_ACTION_EMERGENCY_RELEASE`, `AUDIT_ACTION_MODEL_APPROVE` | `models.py` | дії, що підтверджують небезпечні зміни (`risk.config.loosen`, `emergency.release`, `model.approve`) |
+| `AUDIT_ACTION_RISK_LOOSEN`, `AUDIT_ACTION_EMERGENCY_RELEASE`, `AUDIT_ACTION_MODEL_APPROVE`, `AUDIT_ACTION_TRIAL_INVALIDATE` | `models.py` | дії, що підтверджують небезпечні зміни (`risk.config.loosen`, `emergency.release`, `model.approve`, `trial.invalidate`) |
 | `AUDIT_ACTION_FORCE_TAKEOVER` | `models.py` | `instance.force_takeover` — ручне перехоплення single-instance lock торгового процесу (пише `app/core/instance_lock.py` до завершення сесії-власника, `actor = cli`, `confirmed = true` після введення `TAKEOVER` у терміналі; ні на що не посилається) |
 
 ## Безпека запиту (порядок middleware, зовні → всередину)
@@ -170,10 +170,11 @@ idempotency_key, request, result) -> id` додає запис у **сесію �
   секретів), `ts_ms`. **Append-only**: UPDATE/DELETE/TRUNCATE відхиляє тригер `ctb_forbid_mutation()`.
 - На записи `audit_log` посилаються небезпечні дії через `confirmed_audit_id`: `risk_config` (послаблення
   лімітів, дія `risk.config.loosen`), `emergency_runs` (вихід з Emergency Stop, `emergency.release`), `models`
-  (`APPROVED`, `model.approve`). Тригер `ctb_require_confirmed_audit()` пропускає лише запис із
-  `confirmed = true`, саме цією дією і тією самою ціллю: `account_id` акаунта (`risk_config`, `emergency_runs`)
-  або `target = model_version` (`models`). Один запис підтверджує лише одну дію (частковий
-  `UNIQUE (confirmed_audit_id)` у кожній із трьох таблиць). `confirmed = true` пише лише API після підтвердження в UI (T6.2)
+  (`APPROVED`, `model.approve`), `trial_invalidations` (позначка спроби ML недійсною, `trial.invalidate`, міграція
+  `0006`, рішення 0015). Тригер `ctb_require_confirmed_audit()` пропускає лише запис із
+  `confirmed = true`, саме цією дією і тією самою ціллю: `account_id` акаунта (`risk_config`, `emergency_runs`),
+  `target = model_version` (`models`) або `target` = id спроби (`trial_invalidations`). Один запис підтверджує лише
+  одну дію (`UNIQUE (confirmed_audit_id)` у кожній із чотирьох таблиць). `confirmed = true` пише лише API після підтвердження в UI (T6.2)
   і торговий процес при ручному перехопленні lock після введення `TAKEOVER` у терміналі (`instance.force_takeover`, T0.6).
 - `api_idempotency_keys` (міграція `0002`, T0.7) — змінюючі запити API: `idempotency_key` (PK, CHECK формату),
   `method` (`POST`/`PUT`/`PATCH`/`DELETE`), `path`, `request_hash` (SHA-256 hex), `owner` (`instance_id` процесу),

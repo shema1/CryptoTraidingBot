@@ -24,7 +24,7 @@ HYPERTABLES = {
     "long_short_ratio",
     "liquidations_hourly",
 }
-APPEND_ONLY = {"order_events", "audit_log", "ledger", "experiment_trials", "risk_config"}
+APPEND_ONLY = {"order_events", "audit_log", "ledger", "experiment_trials", "risk_config", "trial_invalidations"}
 FUNCTIONS = {
     "ctb_unix_now_ms",
     "ctb_forbid_mutation",
@@ -123,6 +123,12 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
     assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0004
     assert await _scalars(migrated_db, TRIAL_ENTRY_SQL) == TRIAL_ENTRY_CHECKS
 
+    # 0006 (T2.6): позначки недійсних спроб. Відкат прибирає таблицю і ціль 'trial' у перевірці підтвердження.
+    await run_alembic(migrated_db, "downgrade", "-1")
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0005"]
+    before_0006 = expected - {"trial_invalidations"}
+    assert await _public_tables(migrated_db) == before_0006
+
     # 0005 (T2.6): відкат прибирає `experiment_trials.oos_entry_ms` разом з її CHECK.
     await run_alembic(migrated_db, "downgrade", "-1")
     assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0004"]
@@ -167,9 +173,9 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
     assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0001
     assert await _scalars(migrated_db, "SELECT ts_ms FROM premium_index") == [3600000]
 
-    # 0003 (T1.7): колонка `instruments.launch_time_ms`. Таблиці ті самі.
+    # 0003 (T1.7): колонка `instruments.launch_time_ms`. Таблиці ті самі, що до 0006.
     await run_alembic(migrated_db, "downgrade", "-1")
-    assert await _public_tables(migrated_db) == expected
+    assert await _public_tables(migrated_db) == before_0006
     assert "ctb_api_idempotency_guard" in await _functions(migrated_db)
     assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0002"]
     launch = await _scalars(
@@ -185,7 +191,7 @@ async def test_upgrade_downgrade_upgrade(migrated_db: URL) -> None:
 
     await run_alembic(migrated_db, "upgrade", "head")
     assert await _public_tables(migrated_db) == expected
-    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0005"]
+    assert await _scalars(migrated_db, "SELECT version_num FROM alembic_version") == ["0006"]
     assert await _premium_range_checks(migrated_db) == PREMIUM_CHECKS_0004
     assert await _scalars(migrated_db, TRIAL_ENTRY_SQL) == TRIAL_ENTRY_CHECKS
 

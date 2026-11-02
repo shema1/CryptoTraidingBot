@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from app.api.models import AUDIT_ACTION_TRIAL_INVALIDATE
 from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
@@ -21,9 +22,10 @@ from app.ml.validation import (
     ResearchSplit,
     build_split,
     create_experiment,
+    invalidate_trial,
     record_trial,
 )
-from tests.db.factories import make_model
+from tests.db.factories import make_audit, make_model
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -432,6 +434,7 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
         assert result["loosened"] == ["min_trades_per_fold", "min_oos_trades"]
         assert result["n_trades"] == len(split.folds) * 2
         assert result["unfiltered_total_net"] == "0"
+        assert result["invalidated_trials"] == []
         assert len(result["stress"]) == len(split.folds)
         assert result["stress"][0] == {
             "n_trades": 1,
@@ -441,6 +444,80 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
             "below_min_trades": False,
             "cost_factor": "2",
         }
+
+
+async def test_invalidated_trial_counts_in_n_but_not_in_spread_or_pbo(conn: AsyncConnection) -> None:
+    split = _split()
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    rng = np.random.default_rng(5)
+    leak_r = tuple(Decimal(f"{value:.4f}") for value in rng.normal(3, 1, size=len(split.folds) * 2))
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        leak = await record_trial(
+            session,
+            experiment_id=experiment_id,
+            split=split,
+            state="COMPLETE",
+            params={"name": "leak"},
+            folds=_records(split, leak_r),
+        )
+        model = await _model(conn, experiment_id)
+        # Спроба з витоком (Sharpe ≈ 3 на угоду) роздуває розкид: G1 для сильного кандидата зачинено.
+        with pytest.raises(GateRejected) as caught:
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=strong_id,
+                model_version=model,
+                stress=_stress(split),
+                unfiltered_total_net=Decimal("0"),
+                thresholds=loose,
+            )
+        assert "G1_DSR" in caught.value.decision.reasons
+        # Позначка — лише з підтвердженим `audit_log` `trial.invalidate` саме для цієї спроби.
+        for target, confirmed in ((str(strong_id), True), (str(leak.trial_id), False)):
+            wrong = await make_audit(conn, AUDIT_ACTION_TRIAL_INVALIDATE, target=target, confirmed=confirmed)
+            with pytest.raises(ValueError, match="audit_log"):
+                await invalidate_trial(session, trial_id=leak.trial_id, audit_id=wrong, reason="витік")
+        with pytest.raises(ValueError, match="причин"):
+            await invalidate_trial(session, trial_id=leak.trial_id, audit_id=wrong, reason=" ")
+        with pytest.raises(ValueError, match="немає"):
+            await invalidate_trial(session, trial_id=leak.trial_id + 1000, audit_id=wrong, reason="витік")
+        audit = await make_audit(conn, AUDIT_ACTION_TRIAL_INVALIDATE, target=str(leak.trial_id))
+        await invalidate_trial(session, trial_id=leak.trial_id, audit_id=audit, reason="витік у фічах")
+        again = await make_audit(conn, AUDIT_ACTION_TRIAL_INVALIDATE, target=str(leak.trial_id))
+        with pytest.raises(ValueError, match="вже"):
+            await invalidate_trial(session, trial_id=leak.trial_id, audit_id=again, reason="ще раз")
+        # Недійсна спроба не буває кандидатом.
+        with pytest.raises(ValueError, match="недійсн"):
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=leak.trial_id,
+                model_version=model,
+                stress=_stress(split),
+                unfiltered_total_net=Decimal("0"),
+                thresholds=loose,
+            )
+        opened = await open_holdout_after_gate(
+            session,
+            experiment_id=experiment_id,
+            trial_id=strong_id,
+            model_version=model,
+            stress=_stress(split),
+            unfiltered_total_net=Decimal("0"),
+            thresholds=loose,
+        )
+        row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
+        result = row.result
+        assert result is not None
+        # У N — так; у розкиді DSR і PBO — ні; запис відкриття її називає.
+        assert result["n_trials_line"] == 3
+        assert result["dsr_spread_trials"] == 2
+        assert result["pbo_strategies"] == 2
+        assert result["invalidated_trials"] == [
+            {"trial_id": leak.trial_id, "audit_id": audit, "reason": "витік у фічах"}
+        ]
 
 
 async def test_opening_model_must_belong_to_the_experiment(conn: AsyncConnection) -> None:

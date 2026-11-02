@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from app.api.models import AuditLog
 from app.data.models import Candle, DataGap, MarkIndexCandle, PremiumIndex
 from app.exchange.models import ExchangeAccount
-from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening, ModelArtifact
+from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening, ModelArtifact, TrialInvalidation
 from app.risk.models import EmergencyRun, LedgerEntry, RiskConfig, SystemState
 from app.trading.models import Bot, Fill, Order, OrderEvent, Position, Signal
 from tests.db.factories import (
@@ -437,12 +437,20 @@ async def _append_only_rows(conn: AsyncConnection) -> dict[str, tuple[Any, Any]]
         conn,
         insert(RiskConfig).values(account_id=account, version=1, params={}, loosening=False).returning(RiskConfig.id),
     )
+    invalidation_audit = await make_audit(conn, "trial.invalidate", target=str(trial))
+    invalidation = await ok(
+        conn,
+        insert(TrialInvalidation)
+        .values(trial_id=trial, confirmed_audit_id=invalidation_audit, reason="витік")
+        .returning(TrialInvalidation.id),
+    )
     return {
         "order_events": (OrderEvent, event),
         "audit_log": (AuditLog, audit),
         "ledger": (LedgerEntry, ledger),
         "experiment_trials": (ExperimentTrial, trial),
         "risk_config": (RiskConfig, risk),
+        "trial_invalidations": (TrialInvalidation, invalidation),
     }
 
 
@@ -452,6 +460,7 @@ APPEND_ONLY_UPDATE_COLUMN = {
     "ledger": "details",
     "experiment_trials": "metrics",
     "risk_config": "confirmed_audit_id",
+    "trial_invalidations": "reason",
 }
 
 

@@ -187,3 +187,25 @@ class HoldoutOpening(Base):
     model_version: Mapped[str] = mapped_column(Text, ForeignKey("models.model_version"))
     result: Mapped[dict[str, Any] | None]
     opened_at_ms: Mapped[CreatedMs]
+
+
+class TrialInvalidation(Base):
+    """Позначка спроби недійсною (T2.6, рішення 0015). Append-only; одна на спробу.
+
+    Лише людина: `confirmed_audit_id` — підтверджений запис `audit_log` з дією `trial.invalidate` і `target` = id
+    спроби (тригер `ctb_require_confirmed_audit`, міграція 0006). Спроба лишається в журналі і в N для DSR, але не
+    входить у розкид Sharpe і в PBO; відкриття hold-out пише позначки лінії в `result.invalidated_trials`.
+    """
+
+    __tablename__ = "trial_invalidations"
+    __table_args__ = (
+        UniqueConstraint("trial_id"),
+        UniqueConstraint("confirmed_audit_id"),
+        CheckConstraint("char_length(btrim(reason)) > 0", name="reason_not_empty"),
+    )
+
+    id: Mapped[int] = mapped_column(Identity(always=True), primary_key=True)
+    trial_id: Mapped[int] = mapped_column(ForeignKey("experiment_trials.id"))
+    confirmed_audit_id: Mapped[int] = mapped_column(ForeignKey("audit_log.id"))
+    reason: Mapped[str] = mapped_column(Text)
+    created_at_ms: Mapped[CreatedMs]
