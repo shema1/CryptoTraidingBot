@@ -14,6 +14,7 @@ from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
 from app.ml.statistics import FoldOutcome, GateRejected, GateThresholds, open_holdout_after_gate
+from app.ml.strategy import ALWAYS_FLAT
 from app.ml.trade_sim import ExitReason, StopPriceSource
 from app.ml.validation import (
     HOUR_MS,
@@ -591,3 +592,45 @@ async def test_incomplete_or_foreign_trial_does_not_snapshot(conn: AsyncConnecti
         assert experiment.n_trials_line is None
         assert experiment.dsr is None
         assert experiment.pbo is None
+
+
+async def test_reference_baseline_counts_in_n_but_not_in_pbo(conn: AsyncConnection) -> None:
+    """«Завжди FLAT» лишається спробою лінії і не змагається в PBO (рішення 0016)."""
+    split = _split()
+    losses = tuple(Decimal("-1") for _ in range(len(split.folds) * 2))
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        baseline = await record_trial(
+            session,
+            experiment_id=experiment_id,
+            split=split,
+            state="COMPLETE",
+            params=ALWAYS_FLAT.trial_params(),
+            folds=_records(split, losses),
+        )
+        model = await _model(conn, experiment_id)
+        with pytest.raises(ValueError, match="бейзлайн"):
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=baseline.trial_id,
+                model_version=model,
+                stress=_stress(split),
+                unfiltered_total_net=Decimal("0"),
+                thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
+            )
+        opened = await open_holdout_after_gate(
+            session,
+            experiment_id=experiment_id,
+            trial_id=strong_id,
+            model_version=model,
+            stress=_stress(split),
+            unfiltered_total_net=Decimal("0"),
+            thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
+        )
+        row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
+        result = row.result
+        assert result is not None
+        assert result["n_trials_line"] == 3
+        assert result["baseline_trials"] == [baseline.trial_id]
+        assert result["pbo_strategies"] == 2

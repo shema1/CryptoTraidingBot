@@ -4,8 +4,9 @@ DSR (Bailey & López de Prado, 2014) рахується з ряду R торго
 барів бектесту. Кількість спроб — уся лінія, включно з `FAILED` і `PRUNED`; розкид Sharpe між
 спробами — з рядів ≥ `DSR_SPREAD_MIN_TRADES` угод і не менший за `1/(T−1)` кандидата. PBO — CSCV
 на 16 блоках за часом (Bailey, Borwein, López de Prado & Zhu, 2015) з пропусками: рядок матриці —
-доба walk-forward кандидата; кожна спроба лінії змагається на добах, які покрила (рішення 0014);
-частка розбиттів, де стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
+доба walk-forward кандидата; кожна спроба лінії змагається на добах, які покрила (рішення 0014),
+крім опорних бейзлайнів T2.7: вони в N, але не в матриці (рішення 0016). Частка розбиттів, де
+стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
 
 Блочний bootstrap групує угоди за тижнем входу (7 діб від епохи UTC) і з цих блоків набирає
 шлях тієї самої довжини. Останній блок шляху може бути обрізаний. PF і коридор беруть уже
@@ -32,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ml.backtest import BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact, TrialInvalidation
+from app.ml.strategy import is_reference_baseline
 from app.ml.validation import MIN_TRADES_PER_FOLD, RecordedOpening, SplitLeakError, _lock_line, _open_holdout
 from app.risk.limits import next_consecutive_losses
 from app.risk.numbers import FrozenModel, require_decimal
@@ -364,8 +366,22 @@ class TrialSeries(FrozenModel):
         return self
 
 
-# Ряд без угод і відрізка: так у PBO і в розкиді DSR виглядає позначена недійсною спроба.
+# Ряд без угод і відрізка: так у PBO виглядає позначена недійсною спроба і опорний бейзлайн.
 _NO_SERIES = TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
+
+
+def pbo_competitor(series: TrialSeries, *, compete: bool) -> TrialSeries:
+    """Ряд для матриці PBO. `compete=False` лишає спробу в списку (і в N), але без відрізка.
+
+    Так само з PBO випадає позначена недійсною спроба. Опорний бейзлайн випадає з тієї ж
+    причини: він покриває відрізок і завжди нижче обраного правила, тож занижує PBO (рішення 0016).
+    Розкид Sharpe для DSR це не чіпає — його рахують з вихідного ряду.
+    """
+    if type(series) is not TrialSeries:
+        raise TypeError("очікувався TrialSeries")
+    if type(compete) is not bool:
+        raise TypeError("compete має бути bool")
+    return series if compete else _NO_SERIES
 
 
 @dataclass(frozen=True, slots=True)
@@ -769,7 +785,9 @@ async def open_holdout_after_gate(
     walk-forward кандидата, з пропусками; рядок журналу без часу угод — відмова. Запис відкриття
     показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій, розбиттів і відрізок PBO.
     Позначені недійсними спроби (рішення 0015) лишаються в N, але не входять у розкид DSR і в PBO;
-    кандидатом вони не бувають, а запис відкриття їх називає. Модель відкриття має належати цьому
+    кандидатом вони не бувають, а запис відкриття їх називає. Опорний бейзлайн (рішення 0016)
+    теж лишається в N і в розкиді DSR, якщо в нього достатньо угод, але в PBO не змагається
+    і кандидатом не буває. Модель відкриття має належати цьому
     експерименту (`experiment_id`, `label_type`, символ, таймфрейм): інакше тип експерименту вирішував
     би, чи порівнювати ML-фільтр з правилом.
     Відмова — `GateRejected` з рішенням
@@ -787,6 +805,8 @@ async def open_holdout_after_gate(
     invalid = await _invalidations(session, [row.id for row in rows])
     if trial.id in invalid:
         raise ValueError("спроба позначена недійсною і не буває кандидатом")
+    if is_reference_baseline(trial.params):
+        raise ValueError("опорний бейзлайн не буває кандидатом Gate G1")
     stored = experiment.params.get("validation")
     if not isinstance(stored, dict):
         raise SplitLeakError("в експерименту немає розбивки")
@@ -795,9 +815,14 @@ async def open_holdout_after_gate(
         raise SplitLeakError("у розбивці немає min_trades_per_fold")
     effective = limits.model_copy(update={"min_trades_per_fold": max(limits.min_trades_per_fold, split_min)})
     series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
-    # Недійсна спроба лишається в N, але без Sharpe і без відрізка: ні розкиду DSR, ні PBO.
+    # Недійсна спроба лишається в N, але без Sharpe і без відрізка. Бейзлайн — у N і в розкиді,
+    # якщо угод достатньо, але без відрізка PBO: інакше він завжди програє і занижує оцінку.
+    baseline = {row.id for row in rows if is_reference_baseline(row.params)}
     returns = [() if row.id in invalid else item.returns for row, item in zip(rows, series, strict=True)]
-    competing = [_NO_SERIES if row.id in invalid else item for row, item in zip(rows, series, strict=True)]
+    competing = [
+        pbo_competitor(item, compete=row.id not in invalid and row.id not in baseline)
+        for row, item in zip(rows, series, strict=True)
+    ]
     candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
     dsr_detail = deflated_sharpe(returns[candidate_index], trial_returns=returns, n_trials=len(series))
     pbo_detail = pbo_estimate(competing, candidate_index=candidate_index)
@@ -849,6 +874,7 @@ async def open_holdout_after_gate(
                 {"trial_id": trial_id, "audit_id": mark.confirmed_audit_id, "reason": mark.reason}
                 for trial_id, mark in sorted(invalid.items())
             ],
+            "baseline_trials": sorted(baseline),
         },
     )
     # Після відкриття: відмова `_open_holdout` (ліміт, зсув) не лишає знімка без рядка відкриття.

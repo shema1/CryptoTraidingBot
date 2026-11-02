@@ -44,6 +44,7 @@ from app.ml.statistics import (
     loosened_thresholds,
     loss_streak,
     parse_oos_results,
+    pbo_competitor,
     pbo_estimate,
     probability_of_backtest_overfitting,
     r_profit_factor,
@@ -510,6 +511,22 @@ def test_pbo_memory_does_not_grow_with_the_number_of_splits() -> None:
         tracemalloc.stop()
     assert estimate is not None
     assert peak < 32 * 1024 * 1024
+
+
+def test_masked_baseline_does_not_change_who_competes_in_pbo() -> None:
+    """Збитковий ряд на весь відрізок змінює склад матриці, доки його не вимкнуто (рішення 0016)."""
+    days = 16 * 4
+    good = _daily(_decimals([0.4] * days, places=1))
+    other = _daily(_decimals([0.0] * days, places=1))
+    loser = _daily(_decimals([-1.0] * days, places=1))
+    plain = pbo_estimate((good, other), candidate_index=0)
+    leaked = pbo_estimate((good, other, loser), candidate_index=0)
+    masked = pbo_estimate((good, other, pbo_competitor(loser, compete=False)), candidate_index=0)
+    assert leaked.n_strategies == 3
+    assert plain.n_strategies == 2
+    assert masked.n_strategies == plain.n_strategies
+    assert masked.pbo == plain.pbo
+    assert masked.n_splits == plain.n_splits
 
 
 def test_pbo_rows_are_days_and_a_sparse_trial_still_competes() -> None:
