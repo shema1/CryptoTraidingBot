@@ -287,6 +287,7 @@ class _Run:
         *,
         path_from: int,
         path_to: int,
+        cost_factor: Decimal = Decimal(1),
     ) -> BacktestReport:
         marks = None if history.mark_candles is None else _slice_time(history.mark_candles, path_from, path_to)
         # Ставка, відома до вікна, лишається: інакше слот funding усередині шляху не має історії.
@@ -304,6 +305,7 @@ class _Run:
             params=self.params,
             mark_candles=marks,
             funding=funding,
+            cost_factor=cost_factor,
         )
 
 
@@ -430,6 +432,70 @@ def executed_trade_count(
         )
 
     return count
+
+
+def backtest_fold_signals(
+    history: SymbolHistory,
+    signals: Sequence[EntrySignal],
+    *,
+    split: ResearchSplit,
+    fold: Fold,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    costs: CostModel | None = None,
+    params: TargetParams | None = None,
+    cost_factor: Decimal = Decimal(1),
+) -> BacktestReport:
+    """Прогін уже обраних сигналів одного фолду тим самим вікном свічок, що `compare_strategies`.
+
+    `entry_index` — позиція у повному ряді `history.candles`, як у `primary_signals`. Шлях починається
+    за `FEATURE_LOOKBACK_BARS` до тесту і закінчується на `test_end + horizon` (після дірки — далі за
+    останнім сигналом), але не заходить у hold-out. `cost_factor` > 1 — стрес тих самих сигналів.
+    """
+    if fold.index >= len(split.folds) or split.folds[fold.index] != fold:
+        raise ValueError("фолд не з цієї розбивки")
+    if split.bar_ms != HOUR_MS:
+        raise ValueError("правила рахуються на свічках 1h")
+    require_decimal("cost_factor", cost_factor, positive=True)
+    run = _run(
+        horizon_bars=split.horizon_bars,
+        limits=limits,
+        initial_equity=initial_equity,
+        maintenance_margin_rate=maintenance_margin_rate,
+        seed=seed,
+        costs=costs,
+        params=params,
+    )
+    candles = history.candles
+    hits: list[_Hit] = []
+    seen: set[int] = set()
+    for signal in signals:
+        if type(signal) is not EntrySignal:
+            raise ValueError("сигнал має бути EntrySignal")
+        if signal.entry_index >= len(candles):
+            raise ValueError("немає свічки сигналу")
+        bar = candles[signal.entry_index]
+        if bar.open_time_ms < fold.test_start_ms or bar.open_time_ms >= fold.test_end_ms:
+            raise ValueError("сигнал поза тестом фолду")
+        if signal.entry_index in seen:
+            raise ValueError("дубль сигналу фолду")
+        seen.add(signal.entry_index)
+        hits.append(_Hit(time_ms=bar.open_time_ms, index=signal.entry_index, side=signal.side))
+    hits.sort(key=lambda hit: (hit.time_ms, hit.index))
+    window = tuple(hits)
+    return _window_report(
+        history,
+        candles,
+        None,
+        run,
+        start_ms=fold.test_start_ms,
+        end_ms=fold.test_end_ms,
+        path_to=_fold_path_end(candles, window, fold, split),
+        allowed=window,
+        cost_factor=cost_factor,
+    )
 
 
 def compare_strategies(
@@ -805,13 +871,14 @@ def _fold_path_end(
 def _window_report(
     history: SymbolHistory,
     candles: Sequence[SimCandle],
-    spec: StrategySpec,
+    spec: StrategySpec | None,
     run: _Run,
     *,
     start_ms: int,
     end_ms: int,
     path_to: int,
     allowed: tuple[_Hit, ...] | None,
+    cost_factor: Decimal = Decimal(1),
 ) -> BacktestReport:
     path_from = start_ms - FEATURE_LOOKBACK_BARS * HOUR_MS
     path = _slice_time(candles, path_from, path_to)
@@ -819,6 +886,8 @@ def _window_report(
         raise ValueError("немає свічок вікна")
     index_of = {bar.open_time_ms: index for index, bar in enumerate(path)}
     if allowed is None:
+        if spec is None:
+            raise ValueError("без списку сигналів потрібне правило")
         allowed = _hits(spec, candles, seed=run.seed, end_ms=end_ms, start_ms=start_ms)
     signals: list[EntrySignal] = []
     for hit in allowed:
@@ -828,7 +897,7 @@ def _window_report(
         if index + run.params.horizon_bars >= len(path):
             continue
         signals.append(EntrySignal(entry_index=index, side=hit.side))
-    return run.report(history, path, tuple(signals), path_from=path_from, path_to=path_to)
+    return run.report(history, path, tuple(signals), path_from=path_from, path_to=path_to, cost_factor=cost_factor)
 
 
 def _labeled(

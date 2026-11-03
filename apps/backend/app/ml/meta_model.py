@@ -1,0 +1,976 @@
+"""Бінарна meta-модель LightGBM (ТЗ §5.1, §5А.3, §5А.9, T2.8).
+
+Первинне правило вже зафіксоване (`StrategySpec` з `PRIMARY_CANDIDATES`). Модель лише оцінює
+ймовірність, що кандидат дійде до TP. Навчання — стандартні параметри LightGBM, без Optuna,
+`device=cpu`. `sample_weight` — `sample_weights` (унікальність × баланс класів); `class_weight`
+класифікатора не вмикається, інакше баланс врахувався б двічі.
+
+Кожен фолд учиться лише на своєму train. Фічі цього фолду рахуються з покриттям train
+(`train_coverage_ms`). Мітка у вектор не входить. Поріг до калібрування (T2.9) — `META_MIN_PROBABILITY`.
+Тестовий кандидат оцінюється й без мітки: дірка в шляху після входу — це майбутнє, і фільтр її не знає.
+Метрики — `run_backtest` на відфільтрованих `EntrySignal`, тим самим вікном, що правило без фільтра.
+Стрес (`cost_factor=2`) лишається на об'єкті прогону і в журнал окремою спробою не пишеться.
+
+`train_meta` синхронний: це навчання, не торговий цикл. `run_meta_experiment` виносить його
+з event loop. Воркер (T2.10) викликає той самий шлях.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
+
+import lightgbm as lgb
+import numpy as np
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.exchange.types import PositionSide
+from app.ml.backtest import BacktestReport, EntrySignal
+from app.ml.features import (
+    HOUR_MS,
+    CandleBar,
+    FeatureRows,
+    SymbolData,
+    TimedValue,
+    compute_features,
+    feature_columns,
+    sources_covering,
+)
+from app.ml.statistics import FoldOutcome, fold_outcome_from_report, total_net
+from app.ml.strategy import (
+    PRIMARY_CANDIDATES,
+    StrategySpec,
+    SymbolHistory,
+    backtest_fold_signals,
+    primary_candidates,
+    primary_signals,
+)
+from app.ml.trade_sim import MetaSample, TargetParams, label_meta, label_span, sample_weights
+from app.ml.validation import (
+    Fold,
+    FoldRecord,
+    LabelStats,
+    MetaFoldRuns,
+    RecordedTrial,
+    ResearchSplit,
+    SampleRow,
+    SplitPurpose,
+    create_experiment,
+    guard_sample_weights,
+    is_test_row,
+    is_train_row,
+    label_diagnostics,
+    record_trial,
+    reject_holdout,
+    require_train_coverage,
+    rows_for,
+    train_coverage_ms,
+)
+from app.risk.costs import CostModel
+from app.risk.limits import RiskLimits
+from app.risk.numbers import FrozenModel, require_decimal
+
+# До правила EV (T2.9). 0.5 — стандартний поріг бінарного класифікатора, не підібраний на історії.
+META_MIN_PROBABILITY: Decimal = Decimal("0.5")
+SIDE_COLUMN: str = "side_long"
+_PROBABILITY_QUANTUM: Decimal = Decimal("0.0000000001")
+_STRESS_COST: Decimal = Decimal(2)
+
+
+class MetaTrainError(RuntimeError):
+    """Фолд не можна навчити. Журнал, якщо експеримент уже створено, отримує `FAILED`."""
+
+    def __init__(self, message: str, *, experiment_id: str | None = None) -> None:
+        super().__init__(message)
+        self.experiment_id = experiment_id
+
+
+def lgbm_journal_params() -> dict[str, Any]:
+    """Стандартний рецепт LightGBM 4.x для бінарної класифікації. Не діапазон Optuna (ТЗ §5А.7).
+
+    `n_jobs=1` і `deterministic` фіксують рецепт між машинами. `class_weight` лишається порожнім:
+    баланс класів уже всередині `sample_weights`. Float у журналі заборонений, тож частки — Decimal.
+    """
+    return {
+        "boosting_type": "gbdt",
+        "num_leaves": 31,
+        "max_depth": -1,
+        "learning_rate": Decimal("0.1"),
+        "n_estimators": 100,
+        "min_child_samples": 20,
+        "min_child_weight": Decimal("0.001"),
+        "subsample": Decimal(1),
+        "subsample_freq": 0,
+        "colsample_bytree": Decimal(1),
+        "reg_alpha": Decimal(0),
+        "reg_lambda": Decimal(0),
+        "min_split_gain": Decimal(0),
+        "deterministic": True,
+        "force_col_wise": True,
+        "n_jobs": 1,
+        "class_weight": None,
+    }
+
+
+def meta_recipe(*, shuffled_labels: bool, min_probability: Decimal) -> dict[str, Any]:
+    """Параметри експерименту без `validation`: її дописує `create_experiment`."""
+    _probability_threshold(min_probability)
+    if type(shuffled_labels) is not bool:
+        raise ValueError("shuffled_labels має бути bool")
+    return {
+        "stage": "meta_model",
+        "algorithm": "lightgbm",
+        "device": "cpu",
+        "objective": "binary",
+        "min_probability": min_probability,
+        "shuffled_labels": shuffled_labels,
+        "extra_columns": [SIDE_COLUMN],
+        "lgbm": lgbm_journal_params(),
+    }
+
+
+def keep(probability: Decimal, *, min_probability: Decimal = META_MIN_PROBABILITY) -> bool:
+    """Чи залишити кандидата. Поріг імовірності TP до калібрування; live-поріг EV ставитиме T2.9."""
+    require_decimal("probability", probability)
+    _probability_threshold(min_probability)
+    if probability < 0 or probability > 1:
+        raise ValueError("ймовірність поза [0, 1]")
+    return probability >= min_probability
+
+
+class FittedRow(FrozenModel):
+    """Рядок, на якому вчився фолд. `fit_label` після перемішування може відрізнятись від істинної мітки."""
+
+    symbol: str
+    time_ms: int
+    exit_open_time_ms: int
+    true_label: int
+    fit_label: int
+    weight: Decimal
+
+
+class ScoredRow(FrozenModel):
+    """Out-of-sample кандидат. Оцінений моделлю фолду, яка цей рядок не бачила в train.
+
+    `true_label` — `None`, якщо `label_meta` пропустив шлях (дірка після входу). Рішення фільтра від
+    мітки не залежить, тож кандидат оцінюється й торгується, але в `probability_gap` і калібрування не йде.
+    """
+
+    symbol: str
+    time_ms: int
+    entry_index: int
+    side: PositionSide
+    true_label: int | None
+    probability: Decimal
+    taken: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MetaFoldModel:
+    """Модель одного фолду. `columns` — фічі цього покриття плюс `side_long`, якого немає в schema hash."""
+
+    fold_index: int
+    columns: tuple[str, ...]
+    feature_columns: tuple[str, ...]
+    schema_hash: str
+    preprocessing_version: str
+    estimator: Any
+
+    def probability(self, values: Sequence[float], *, side: PositionSide) -> Decimal:
+        """Імовірність TP для одного кандидата. `values` — колонки фіч без сторони, у порядку `feature_columns`."""
+        if type(side) is not PositionSide:
+            raise ValueError("side має бути PositionSide")
+        if len(values) != len(self.feature_columns):
+            raise ValueError("довжина вектора не збігається з колонками фіч")
+        vector = np.empty(len(self.columns), dtype=np.float64)
+        for index, value in enumerate(values):
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("фіча не скінченна")
+            vector[index] = number
+        vector[-1] = 1.0 if side is PositionSide.LONG else 0.0
+        return _probabilities(self.estimator, vector.reshape(1, -1))[0]
+
+
+@dataclass(frozen=True, slots=True)
+class MetaFold:
+    """Один фолд: модель, рядки навчання, оцінки тесту і прогін відфільтрованих сигналів.
+
+    Правило без фільтра торгового символу рахується двічі: на всіх сигналах вікна тесту
+    (`unfiltered_trading_net`) і лише на тих, які модель оцінила (`scored_unfiltered_trading_net`).
+    `n_unscored_signals` — сигнали правила без валідних фіч: модель їх не бачила (рішення 0017).
+    """
+
+    fold_index: int
+    model: MetaFoldModel
+    fitted: tuple[FittedRow, ...]
+    scored: tuple[ScoredRow, ...]
+    record: FoldRecord
+    unfiltered_trading_net: Decimal
+    scored_unfiltered_trading_net: Decimal
+    n_unscored_signals: int
+    stress: FoldOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class MetaRun:
+    """Прогін walk-forward. Hold-out сюди не входить ні мітками, ні фічами, ні угодами."""
+
+    spec: StrategySpec
+    split: ResearchSplit
+    seed: int
+    trading_symbol: str
+    shuffled_labels: bool
+    min_probability: Decimal
+    folds: tuple[MetaFold, ...]
+
+    @property
+    def filtered_total_net(self) -> Decimal:
+        # Суми — у контексті G1 (`total_net`), не потоку: інакше журнал і G1 розійдуться на останньому знаку.
+        return total_net(_trading_net(fold.record, self.trading_symbol) for fold in self.folds)
+
+    @property
+    def unfiltered_total_net(self) -> Decimal:
+        return total_net(fold.unfiltered_trading_net for fold in self.folds)
+
+    @property
+    def scored_unfiltered_total_net(self) -> Decimal:
+        return total_net(fold.scored_unfiltered_trading_net for fold in self.folds)
+
+    @property
+    def beats_unfiltered(self) -> bool:
+        """Сума чистого результату торгового символу строго вища за обидва правила без фільтра (Gate G1).
+
+        Лише все правило не годиться: сигнали без валідних фіч модель не оцінює, і фільтр «вигравав» би
+        на них без жодного рішення (рішення 0017).
+        """
+        filtered = self.filtered_total_net
+        return filtered > self.unfiltered_total_net and filtered > self.scored_unfiltered_total_net
+
+    @property
+    def records(self) -> tuple[FoldRecord, ...]:
+        return tuple(fold.record for fold in self.folds)
+
+    @property
+    def stress(self) -> tuple[FoldOutcome, ...]:
+        return tuple(fold.stress for fold in self.folds)
+
+    def trial_params(self) -> dict[str, Any]:
+        """Параметри спроби журналу. Зайві ключі не дають збігу з опорним бейзлайном, тож спроба йде в PBO.
+
+        `comparison` — лише зведення для людини. G1 рахує обидва правила і стрес не з нього, а зі звітів
+        `FoldRecord.meta`, які `record_trial` звіряє з угодами (рішення 0017). Стрес — не окрема спроба,
+        тож N від нього не росте.
+        """
+        params = meta_recipe(shuffled_labels=self.shuffled_labels, min_probability=self.min_probability)
+        params["role"] = "meta"
+        params["strategy"] = self.spec.metadata()
+        params["comparison"] = {
+            "filtered_total_net": self.filtered_total_net,
+            "unfiltered_total_net": self.unfiltered_total_net,
+            "scored_unfiltered_total_net": self.scored_unfiltered_total_net,
+            "n_unscored_signals": [fold.n_unscored_signals for fold in self.folds],
+            "beats_unfiltered": self.beats_unfiltered,
+        }
+        return params
+
+
+@dataclass(frozen=True, slots=True)
+class MetaExperiment:
+    """Експеримент і єдина спроба моделі. Стрес у журналі окремим рядком не лежить."""
+
+    experiment_id: str
+    trial: RecordedTrial
+    run: MetaRun
+
+
+def probability_gap(scored: Sequence[ScoredRow]) -> Decimal | None:
+    """Середня ймовірність справжніх TP мінус середня ймовірність решти.
+
+    На перемішаних мітках прогалина близько нуля: мітка не була у фічах. `None` — одного з класів немає.
+    Рядки без мітки (пропущений шлях) не рахуються.
+    """
+    wins = [row.probability for row in scored if row.true_label == 1]
+    losses = [row.probability for row in scored if row.true_label == 0]
+    if not wins or not losses:
+        return None
+    return _mean(wins) - _mean(losses)
+
+
+def train_meta(
+    histories: Sequence[SymbolHistory],
+    *,
+    spec: StrategySpec,
+    split: ResearchSplit,
+    trading_symbol: str,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    costs: CostModel | None = None,
+    params: TargetParams | None = None,
+    feature_data: Mapping[str, SymbolData] | None = None,
+    min_probability: Decimal = META_MIN_PROBABILITY,
+    shuffled_labels: bool = False,
+) -> MetaRun:
+    """Навчити по моделі на фолд і прогнати відфільтровані сигнали бектестом.
+
+    `feature_data` дає обсяг і деривативи. Ціни фіч усе одно беруться зі свічок історії, щоб мітка
+    і вектор дивились на один ряд. `None` — обсяг 1 і без деривативів (`vol_ratio` стає 1).
+    `shuffled_labels` перемішує лише навчальні мітки фолду; фічі, спани унікальності й тест лишаються
+    на своїх рядках. Генератор — PCG64 від seed, не глобальний стан numpy.
+    """
+    books = _books(histories, trading_symbol)
+    _spec(spec)
+    _seed(seed)
+    _probability_threshold(min_probability)
+    if type(shuffled_labels) is not bool:
+        raise ValueError("shuffled_labels має бути bool")
+    if split.bar_ms != HOUR_MS:
+        raise ValueError("meta-модель рахується на свічках 1h")
+    if not split.folds:
+        raise ValueError("у розбивці немає фолдів")
+    model_costs = costs if costs is not None else CostModel()
+    if type(model_costs) is not CostModel:
+        raise ValueError("costs має бути CostModel")
+    target = params if params is not None else TargetParams(horizon_bars=split.horizon_bars)
+    if type(target) is not TargetParams:
+        raise ValueError("params має бути TargetParams")
+    if target.horizon_bars != split.horizon_bars:
+        raise ValueError("горизонт таргета і розбивки різний")
+    series = _feature_series(books, feature_data, split.holdout_from_ms)
+    found = {history.symbol: _candidates(spec, history, split, target, model_costs, seed) for history in books}
+    by_key = {(item.row.symbol, item.row.index): item for history in books for item in found[history.symbol]}
+    samples = tuple(item.sample for history in books for item in found[history.symbol] if item.sample is not None)
+    candidates = tuple(
+        sorted((item.row for item in by_key.values()), key=lambda row: (row.time_ms, row.symbol, row.index))
+    )
+    reject_holdout(candidates, split, purpose=SplitPurpose.PRIMARY_STRATEGY)
+    common = _Backtest(
+        limits=limits,
+        initial_equity=initial_equity,
+        maintenance_margin_rate=maintenance_margin_rate,
+        seed=seed,
+        costs=model_costs,
+        params=target,
+    )
+    # Ключ — набір колонок. Покриття змінює лише його, не значення вже порахованої колонки.
+    cache: dict[tuple[str, ...], FeatureRows] = {}
+    folds = tuple(
+        _train_fold(
+            books,
+            spec=spec,
+            split=split,
+            fold=fold,
+            trading_symbol=trading_symbol,
+            by_key=by_key,
+            samples=samples,
+            candidates=candidates,
+            series=series,
+            cache=cache,
+            common=common,
+            seed=seed,
+            min_probability=min_probability,
+            shuffled_labels=shuffled_labels,
+        )
+        for fold in split.folds
+    )
+    return MetaRun(
+        spec=spec,
+        split=split,
+        seed=seed,
+        trading_symbol=trading_symbol,
+        shuffled_labels=shuffled_labels,
+        min_probability=min_probability,
+        folds=folds,
+    )
+
+
+async def run_meta_experiment(
+    session: AsyncSession,
+    histories: Sequence[SymbolHistory],
+    *,
+    spec: StrategySpec,
+    split: ResearchSplit,
+    trading_symbol: str,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    costs: CostModel | None = None,
+    params: TargetParams | None = None,
+    feature_data: Mapping[str, SymbolData] | None = None,
+    min_probability: Decimal = META_MIN_PROBABILITY,
+    shuffled_labels: bool = False,
+) -> MetaExperiment:
+    """Створити експеримент `label_type=meta`, навчити і записати одну спробу.
+
+    Невдале навчання теж записується (`FAILED`, порожній префікс фолдів) і збільшує N лінії.
+    `primary_strategy` — `StrategySpec.metadata()` цього правила, не словник вибору з T2.7.
+    """
+    recipe = meta_recipe(shuffled_labels=shuffled_labels, min_probability=min_probability)
+    symbols = tuple(history.symbol for history in _books(histories, trading_symbol))
+    experiment_id = await create_experiment(
+        session,
+        split=split,
+        research_line=trading_symbol,
+        symbols=symbols,
+        label_type="meta",
+        primary_strategy=spec.metadata(),
+        params=recipe,
+        seed=seed,
+    )
+    try:
+        run = await asyncio.to_thread(
+            train_meta,
+            histories,
+            spec=spec,
+            split=split,
+            trading_symbol=trading_symbol,
+            limits=limits,
+            initial_equity=initial_equity,
+            maintenance_margin_rate=maintenance_margin_rate,
+            seed=seed,
+            costs=costs,
+            params=params,
+            feature_data=feature_data,
+            min_probability=min_probability,
+            shuffled_labels=shuffled_labels,
+        )
+    except MetaTrainError as exc:
+        failed = dict(recipe)
+        failed["role"] = "meta"
+        failed["strategy"] = spec.metadata()
+        await record_trial(
+            session,
+            experiment_id=experiment_id,
+            split=split,
+            state="FAILED",
+            params=failed,
+            folds=(),
+        )
+        exc.experiment_id = experiment_id
+        raise
+    trial = await record_trial(
+        session,
+        experiment_id=experiment_id,
+        split=split,
+        state="COMPLETE",
+        params=run.trial_params(),
+        folds=run.records,
+    )
+    return MetaExperiment(experiment_id=experiment_id, trial=trial, run=run)
+
+
+@dataclass(frozen=True, slots=True)
+class _Backtest:
+    limits: RiskLimits
+    initial_equity: Decimal
+    maintenance_margin_rate: Decimal
+    seed: int
+    costs: CostModel
+    params: TargetParams
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """Кандидат правила до hold-out. `sample` — `None`, якщо `label_meta` пропустив шлях."""
+
+    row: SampleRow
+    side: PositionSide
+    sample: MetaSample | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Joined:
+    candidate: _Candidate
+    values: np.ndarray
+
+
+def _train_fold(
+    books: Sequence[SymbolHistory],
+    *,
+    spec: StrategySpec,
+    split: ResearchSplit,
+    fold: Fold,
+    trading_symbol: str,
+    by_key: Mapping[tuple[str, int], _Candidate],
+    samples: tuple[MetaSample, ...],
+    candidates: tuple[SampleRow, ...],
+    series: Mapping[str, SymbolData],
+    cache: dict[tuple[str, ...], FeatureRows],
+    common: _Backtest,
+    seed: int,
+    min_probability: Decimal,
+    shuffled_labels: bool,
+) -> MetaFold:
+    features = _features_for_fold(series, split, fold.index, cache)
+    train_rows = rows_for(candidates, split, SplitPurpose.TRAIN, fold_index=fold.index)
+    reject_holdout(train_rows, split, purpose=SplitPurpose.TRAIN)
+    # Пропущений шлях мітки не має: у train не йде і нулем не стає.
+    train = [item for item in _join(train_rows, by_key, features) if item.candidate.sample is not None]
+    guard_sample_weights(tuple(item.candidate.row for item in train), split, fold.index)
+    if not train:
+        raise MetaTrainError(f"фолд {fold.index}: немає навчальних рядків із фічами")
+    train_samples = tuple(_train_sample(item) for item in train)
+    true_labels = [sample.label for sample in train_samples]
+    fit_labels = _shuffle_labels(true_labels, seed, fold.index) if shuffled_labels else list(true_labels)
+    if len(set(fit_labels)) < 2:
+        raise MetaTrainError(f"фолд {fold.index}: у train один клас, бінарну модель не навчити")
+    spans = tuple(label_span(sample.symbol, sample.trade) for sample in train_samples)
+    weights = sample_weights(spans, fit_labels)
+    if not weights or any(weight <= 0 for weight in weights):
+        raise MetaTrainError("без ваг унікальності навчати не можна")
+    estimator = _estimator(seed)
+    estimator.fit(_matrix(train), np.asarray(fit_labels, dtype=np.int32), sample_weight=_weight_array(weights))
+    model = MetaFoldModel(
+        fold_index=fold.index,
+        columns=(*features.columns, SIDE_COLUMN),
+        feature_columns=features.columns,
+        schema_hash=features.schema_hash,
+        preprocessing_version=features.preprocessing_version,
+        estimator=estimator,
+    )
+    fitted = tuple(
+        FittedRow(
+            symbol=sample.symbol,
+            time_ms=sample.trade.entry_open_time_ms,
+            exit_open_time_ms=sample.trade.exit_open_time_ms,
+            true_label=sample.label,
+            fit_label=fit_label,
+            weight=weight,
+        )
+        for sample, fit_label, weight in zip(train_samples, fit_labels, weights, strict=True)
+    )
+    test_rows = rows_for(candidates, split, SplitPurpose.TEST, fold_index=fold.index)
+    reject_holdout(test_rows, split, purpose=SplitPurpose.TEST)
+    # Тест — усі кандидати з валідними фічами, з міткою чи без: інакше фільтр знав би майбутні дірки.
+    scored = _score(model, _join(test_rows, by_key, features), min_probability=min_probability)
+    trading = _history(books, trading_symbol)
+    rule = _fold_signals(trading, spec, split, fold, common.seed)
+    seen = _scored_signals(trading, rule, scored, taken_only=False)
+    taken = _scored_signals(trading, rule, scored, taken_only=True)
+    # Звіти, а не числа: `record_trial` звірить їх з угодами і сигналами фільтра, G1 рахує з них (рішення 0017).
+    runs = MetaFoldRuns(
+        unfiltered=_window(trading, rule, split, fold, common),
+        scored_unfiltered=_window(trading, seen, split, fold, common),
+        stress=_window(trading, taken, split, fold, common, cost_factor=_STRESS_COST),
+    )
+    record = _filtered_record(books, spec, split, fold, scored, samples, common).model_copy(update={"meta": runs})
+    return MetaFold(
+        fold_index=fold.index,
+        model=model,
+        fitted=fitted,
+        scored=scored,
+        record=record,
+        unfiltered_trading_net=runs.unfiltered.metrics.total_net_usd,
+        scored_unfiltered_trading_net=runs.scored_unfiltered.metrics.total_net_usd,
+        n_unscored_signals=len(rule) - len(seen),
+        stress=fold_outcome_from_report(runs.stress, below_min_trades=fold.below_min_trades),
+    )
+
+
+def _features_for_fold(
+    series: Mapping[str, SymbolData],
+    split: ResearchSplit,
+    fold_index: int,
+    cache: dict[tuple[str, ...], FeatureRows],
+) -> FeatureRows:
+    start, end = train_coverage_ms(split, fold_index)
+    require_train_coverage(split, fold_index, start, end)
+    covered = sources_covering(series, start_ms=start, end_ms=end)
+    columns = feature_columns(covered)
+    found = cache.get(columns)
+    if found is not None:
+        return found
+    rows = compute_features(series, coverage_start_ms=start, coverage_end_ms=end)
+    if rows.columns != columns:
+        raise RuntimeError("колонки фіч не збіглися з покриттям train")
+    cache[columns] = rows
+    return rows
+
+
+def _filtered_record(
+    books: Sequence[SymbolHistory],
+    spec: StrategySpec,
+    split: ResearchSplit,
+    fold: Fold,
+    scored: tuple[ScoredRow, ...],
+    samples: Sequence[MetaSample],
+    common: _Backtest,
+) -> FoldRecord:
+    reports = tuple(
+        _window(
+            history,
+            _scored_signals(history, _fold_signals(history, spec, split, fold, common.seed), scored, taken_only=True),
+            split,
+            fold,
+            common,
+        )
+        for history in books
+    )
+    return FoldRecord(
+        reports=reports,
+        train_labels=_label_stats(samples, split, fold, train=True),
+        test_labels=_label_stats(samples, split, fold, train=False),
+    )
+
+
+def _window(
+    history: SymbolHistory,
+    signals: Sequence[EntrySignal],
+    split: ResearchSplit,
+    fold: Fold,
+    common: _Backtest,
+    cost_factor: Decimal = Decimal(1),
+) -> BacktestReport:
+    return backtest_fold_signals(
+        history,
+        signals,
+        split=split,
+        fold=fold,
+        limits=common.limits,
+        initial_equity=common.initial_equity,
+        maintenance_margin_rate=common.maintenance_margin_rate,
+        seed=common.seed,
+        costs=common.costs,
+        params=common.params,
+        cost_factor=cost_factor,
+    )
+
+
+def _fold_signals(
+    history: SymbolHistory,
+    spec: StrategySpec,
+    split: ResearchSplit,
+    fold: Fold,
+    seed: int,
+) -> tuple[EntrySignal, ...]:
+    signals = primary_signals(spec, history.candles, horizon_bars=split.horizon_bars, seed=seed)
+    kept: list[EntrySignal] = []
+    for signal in signals:
+        stamp = history.candles[signal.entry_index].open_time_ms
+        if fold.test_start_ms <= stamp < fold.test_end_ms:
+            kept.append(signal)
+    return tuple(kept)
+
+
+def _scored_signals(
+    history: SymbolHistory,
+    signals: Sequence[EntrySignal],
+    scored: Sequence[ScoredRow],
+    *,
+    taken_only: bool,
+) -> tuple[EntrySignal, ...]:
+    """Сигнали правила, які модель оцінила; `taken_only` — лише ті, що пройшли поріг."""
+    by_time = {row.time_ms: row for row in scored if row.symbol == history.symbol and (row.taken or not taken_only)}
+    kept: list[EntrySignal] = []
+    for signal in signals:
+        stamp = history.candles[signal.entry_index].open_time_ms
+        row = by_time.get(stamp)
+        if row is None:
+            continue
+        if row.side is not signal.side:
+            raise RuntimeError("сторона сигналу не збігається з оціненим кандидатом")
+        kept.append(signal)
+    return tuple(kept)
+
+
+def _label_stats(
+    samples: Sequence[MetaSample],
+    split: ResearchSplit,
+    fold: Fold,
+    *,
+    train: bool,
+) -> LabelStats:
+    keep_row = is_train_row if train else is_test_row
+    chosen = [
+        sample
+        for sample in samples
+        if keep_row(
+            SampleRow(
+                symbol=sample.symbol,
+                time_ms=sample.trade.entry_open_time_ms,
+                index=sample.trade.entry_index,
+            ),
+            split,
+            fold.index,
+        )
+    ]
+    return label_diagnostics(chosen)
+
+
+def _join(
+    rows: Sequence[SampleRow],
+    by_key: Mapping[tuple[str, int], _Candidate],
+    features: FeatureRows,
+) -> list[_Joined]:
+    lookup: dict[tuple[str, int], int] = {}
+    for index, symbol in enumerate(features.symbol):
+        lookup[(symbol, int(features.entry_open_time_ms[index]))] = index
+    joined: list[_Joined] = []
+    for row in rows:
+        candidate = by_key[(row.symbol, row.index)]
+        if candidate.row != row:
+            raise RuntimeError("рядок не збігається з кандидатом")
+        slot = lookup.get((row.symbol, row.time_ms))
+        if slot is None or not bool(features.valid[slot]):
+            continue
+        values = np.array(features.values[slot], dtype=np.float64, copy=True)
+        if not np.isfinite(values).all():
+            continue
+        joined.append(_Joined(candidate=candidate, values=values))
+    joined.sort(key=lambda item: (item.candidate.row.time_ms, item.candidate.row.symbol))
+    return joined
+
+
+def _train_sample(item: _Joined) -> MetaSample:
+    sample = item.candidate.sample
+    if sample is None:
+        raise RuntimeError("навчальний рядок без мітки")
+    return sample
+
+
+def _matrix(joined: Sequence[_Joined]) -> np.ndarray:
+    if not joined:
+        raise MetaTrainError("порожня матриця навчання")
+    width = joined[0].values.shape[0] + 1
+    matrix = np.empty((len(joined), width), dtype=np.float64)
+    for row_index, item in enumerate(joined):
+        if item.values.shape != (width - 1,):
+            raise RuntimeError("ширина фіч змінилася")
+        matrix[row_index, :-1] = item.values
+        matrix[row_index, -1] = 1.0 if item.candidate.side is PositionSide.LONG else 0.0
+    return matrix
+
+
+def _score(
+    model: MetaFoldModel,
+    joined: Sequence[_Joined],
+    *,
+    min_probability: Decimal,
+) -> tuple[ScoredRow, ...]:
+    if not joined:
+        return ()
+    probabilities = _probabilities(model.estimator, _matrix(joined))
+    scored: list[ScoredRow] = []
+    for item, probability in zip(joined, probabilities, strict=True):
+        candidate = item.candidate
+        scored.append(
+            ScoredRow(
+                symbol=candidate.row.symbol,
+                time_ms=candidate.row.time_ms,
+                entry_index=candidate.row.index,
+                side=candidate.side,
+                true_label=None if candidate.sample is None else candidate.sample.label,
+                probability=probability,
+                taken=keep(probability, min_probability=min_probability),
+            )
+        )
+    return tuple(scored)
+
+
+def _estimator(seed: int) -> lgb.LGBMClassifier:
+    raw = lgbm_journal_params()
+    model = lgb.LGBMClassifier(
+        objective="binary",
+        boosting_type=str(raw["boosting_type"]),
+        num_leaves=int(raw["num_leaves"]),
+        max_depth=int(raw["max_depth"]),
+        learning_rate=float(raw["learning_rate"]),
+        n_estimators=int(raw["n_estimators"]),
+        min_child_samples=int(raw["min_child_samples"]),
+        min_child_weight=float(raw["min_child_weight"]),
+        subsample=float(raw["subsample"]),
+        subsample_freq=int(raw["subsample_freq"]),
+        colsample_bytree=float(raw["colsample_bytree"]),
+        reg_alpha=float(raw["reg_alpha"]),
+        reg_lambda=float(raw["reg_lambda"]),
+        min_split_gain=float(raw["min_split_gain"]),
+        deterministic=True,
+        force_col_wise=True,
+        n_jobs=1,
+        class_weight=None,
+        random_state=seed,
+        device="cpu",
+        verbosity=-1,
+    )
+    params = model.get_params()
+    if params.get("device") != "cpu" or params.get("class_weight") is not None:
+        raise MetaTrainError("рецепт LightGBM змінився: очікувались device=cpu і порожній class_weight")
+    return model
+
+
+def _probabilities(estimator: Any, matrix: np.ndarray) -> tuple[Decimal, ...]:
+    classes = [int(label) for label in estimator.classes_]
+    if 1 not in classes:
+        raise MetaTrainError("модель не має класу TP")
+    column = classes.index(1)
+    raw = estimator.predict_proba(matrix)
+    return tuple(_as_probability(float(row[column])) for row in raw)
+
+
+def _shuffle_labels(labels: Sequence[int], seed: int, fold_index: int) -> list[int]:
+    generator = np.random.Generator(np.random.PCG64(np.random.SeedSequence([seed, fold_index, 28])))
+    order = generator.permutation(len(labels))
+    shuffled = [labels[int(index)] for index in order]
+    original = list(labels)
+    if shuffled == original and len(set(original)) > 1:
+        shuffled = original[1:] + original[:1]
+    return shuffled
+
+
+def _feature_series(
+    books: Sequence[SymbolHistory],
+    feature_data: Mapping[str, SymbolData] | None,
+    holdout_from_ms: int,
+) -> dict[str, SymbolData]:
+    if feature_data is not None and set(feature_data) != {history.symbol for history in books}:
+        raise ValueError("feature_data має бути на кожен символ історії")
+    built: dict[str, SymbolData] = {}
+    for history in books:
+        prefix = tuple(bar for bar in history.candles if bar.open_time_ms < holdout_from_ms)
+        if len(prefix) < 2:
+            raise ValueError("немає свічок до hold-out")
+        extra = None if feature_data is None else feature_data[history.symbol]
+        volumes = _volumes(extra, prefix)
+        candles = tuple(
+            CandleBar(
+                open_time_ms=bar.open_time_ms,
+                open=float(bar.open),
+                high=float(bar.high),
+                low=float(bar.low),
+                close=float(bar.close),
+                volume=volumes[bar.open_time_ms],
+            )
+            for bar in prefix
+        )
+        if extra is None:
+            built[history.symbol] = SymbolData(candles=candles)
+            continue
+        built[history.symbol] = SymbolData(
+            candles=candles,
+            open_interest=_before(extra.open_interest, holdout_from_ms),
+            premium=_before(extra.premium, holdout_from_ms),
+            long_short=tuple(point for point in extra.long_short if point.ts_ms < holdout_from_ms),
+            liquidations=tuple(bar for bar in extra.liquidations if bar.ts_ms < holdout_from_ms),
+            funding=_before(extra.funding, holdout_from_ms),
+            gaps=extra.gaps,
+        )
+    return built
+
+
+def _volumes(extra: SymbolData | None, prefix: Sequence[Any]) -> dict[int, float]:
+    if extra is None:
+        return {bar.open_time_ms: 1.0 for bar in prefix}
+    found = {bar.open_time_ms: bar.volume for bar in extra.candles}
+    volumes: dict[int, float] = {}
+    for bar in prefix:
+        if bar.open_time_ms not in found:
+            raise ValueError("у feature_data немає обсягу свічки")
+        volume = float(found[bar.open_time_ms])
+        if not math.isfinite(volume) or volume < 0.0:
+            raise ValueError("обсяг свічки недійсний")
+        volumes[bar.open_time_ms] = volume
+    return volumes
+
+
+def _before(points: Sequence[TimedValue], holdout_from_ms: int) -> tuple[TimedValue, ...]:
+    return tuple(point for point in points if point.ts_ms < holdout_from_ms)
+
+
+def _candidates(
+    spec: StrategySpec,
+    history: SymbolHistory,
+    split: ResearchSplit,
+    target: TargetParams,
+    costs: CostModel,
+    seed: int,
+) -> tuple[_Candidate, ...]:
+    prefix = tuple(bar for bar in history.candles if bar.open_time_ms < split.holdout_from_ms)
+    found = tuple(
+        candidate
+        for candidate in primary_candidates(spec, prefix, symbol=history.symbol, seed=seed)
+        if prefix[candidate.entry_index].open_time_ms < split.decision_end_ms
+    )
+    marks = None
+    if history.mark_candles is not None:
+        marks = tuple(bar for bar in history.mark_candles if bar.open_time_ms < split.holdout_from_ms)
+    funding = tuple(event for event in history.funding if event.time_ms < split.holdout_from_ms)
+    labeled = label_meta(prefix, found, params=target, costs=costs, mark_candles=marks, funding=funding)
+    if len(labeled.samples) + len(labeled.skipped) != len(found):
+        raise RuntimeError("label_meta загубив кандидата")
+    by_index = {sample.trade.entry_index: sample for sample in labeled.samples}
+    result: list[_Candidate] = []
+    for candidate in found:
+        time_ms = prefix[candidate.entry_index].open_time_ms
+        sample = by_index.get(candidate.entry_index)
+        if sample is not None and (
+            sample.trade.entry_open_time_ms != time_ms or sample.trade.side is not candidate.side
+        ):
+            raise RuntimeError("мітка не збігається з кандидатом")
+        row = SampleRow(symbol=history.symbol, time_ms=time_ms, index=candidate.entry_index)
+        result.append(_Candidate(row=row, side=candidate.side, sample=sample))
+    return tuple(result)
+
+
+def _books(histories: Sequence[SymbolHistory], trading_symbol: str) -> tuple[SymbolHistory, ...]:
+    if not isinstance(histories, Sequence) or isinstance(histories, (str, bytes)) or not histories:
+        raise ValueError("потрібна хоча б одна історія")
+    if type(trading_symbol) is not str or not trading_symbol:
+        raise ValueError("торговий символ порожній")
+    books = tuple(histories)
+    symbols = [history.symbol for history in books]
+    if len(set(symbols)) != len(symbols):
+        raise ValueError("символ історії повторився")
+    if trading_symbol not in symbols:
+        raise ValueError("торгового символу немає в історіях")
+    for history in books:
+        if type(history) is not SymbolHistory:
+            raise ValueError("історія має бути SymbolHistory")
+    return books
+
+
+def _history(books: Sequence[SymbolHistory], symbol: str) -> SymbolHistory:
+    return next(history for history in books if history.symbol == symbol)
+
+
+def _spec(spec: StrategySpec) -> None:
+    if type(spec) is not StrategySpec or spec not in PRIMARY_CANDIDATES:
+        raise ValueError("meta-модель учиться лише на зафіксованому кандидаті")
+
+
+def _seed(seed: int) -> None:
+    if type(seed) is not int or isinstance(seed, bool) or seed < 0:
+        raise ValueError("seed має бути невід'ємний int")
+
+
+def _probability_threshold(value: Decimal) -> None:
+    require_decimal("min_probability", value)
+    if value < 0 or value > 1:
+        raise ValueError("поріг імовірності поза [0, 1]")
+
+
+def _trading_net(record: FoldRecord, trading_symbol: str) -> Decimal:
+    return next(report.metrics.total_net_usd for report in record.reports if report.symbol == trading_symbol)
+
+
+def _weight_array(weights: Sequence[Decimal]) -> np.ndarray:
+    return np.asarray([float(weight) for weight in weights], dtype=np.float64)
+
+
+def _as_probability(value: float) -> Decimal:
+    if not math.isfinite(value):
+        raise MetaTrainError("ймовірність моделі не скінченна")
+    quantized = Decimal(format(value, ".12f")).quantize(_PROBABILITY_QUANTUM)
+    if quantized < 0 or quantized > 1:
+        raise MetaTrainError("ймовірність моделі поза [0, 1]")
+    return quantized
+
+
+def _mean(values: Sequence[Decimal]) -> Decimal:
+    return sum(values, Decimal(0)) / Decimal(len(values))

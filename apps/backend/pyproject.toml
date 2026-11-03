@@ -23,6 +23,11 @@ dependencies = [
     # без shift(-n), bfill і resample. Стеля <2.5: 2.5 уже без Python 3.11, і lock розщеплювався на дві версії —
     # навчання й live під різними Python рахували б фічі різним numpy.
     "numpy>=2.1,<2.5",
+    # Бінарна meta-модель (app/ml/meta_model.py, T2.8). CPU: device=cpu, GPU відкладено (ТЗ §5.6).
+    # На macOS офіційне колесо шукає libomp (`brew install libomp`).
+    "lightgbm>=4.5,<5",
+    # LGBMClassifier вимагає scikit-learn; калібрування ймовірності — T2.9.
+    "scikit-learn>=1.5,<2",
 ]
 
 [dependency-groups]
@@ -140,6 +145,11 @@ ignore_missing_imports = true
 # CCXT без py.typed. Виклики ізольовані в app/exchange/bybit.py; сирі винятки за адаптер не виходять.
 [[tool.mypy.overrides]]
 module = ["ccxt", "ccxt.*"]
+ignore_missing_imports = true
+
+# LightGBM 4.7 не постачає py.typed. Виклики ізольовані в app/ml/meta_model.py.
+[[tool.mypy.overrides]]
+module = ["lightgbm", "lightgbm.*"]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]

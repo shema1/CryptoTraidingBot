@@ -19,7 +19,7 @@ Hold-out відкривається лише через `open_holdout_after_gate
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Context, Decimal, DivisionByZero, InvalidOperation, Overflow, localcontext
 from itertools import combinations
@@ -697,6 +697,16 @@ def fold_outcome_from_report(report: BacktestReport, *, below_min_trades: bool) 
     )
 
 
+def total_net(values: Iterable[Decimal]) -> Decimal:
+    """Сума чистих результатів у `_CONTEXT`, а не в контексті потоку.
+
+    Прогін (`MetaRun`) і G1 мають рахувати однаково: CCXT перемикає округлення потоку на HALF_UP,
+    і тоді рівний правилу фільтр «вигравав» би на останньому знаку (рішення 0017).
+    """
+    with localcontext(_CONTEXT):
+        return sum(values, Decimal(0))
+
+
 def fold_outcomes_from_metrics(metrics: Mapping[str, Any]) -> tuple[FoldOutcome, ...]:
     """Фолди спроби з журналу: торговий символ, не пул усіх символів."""
     folds = metrics.get("folds")
@@ -734,13 +744,16 @@ def evaluate_gate(
     pbo: Decimal | None,
     n_trials: int,
     unfiltered_total_net: Decimal | None = None,
+    scored_unfiltered_total_net: Decimal | None = None,
     thresholds: GateThresholds | None = None,
 ) -> GateDecision:
     """Gate G1 на walk-forward торгового символу. Hold-out у ці фолди не входить.
 
     «Не руйнується при подвоєнні витрат» — стрес із `cost_factor` 2 на тих самих сигналах (`n_signals`),
-    медіана PF ≥ 1 і сумарний чистий результат > 0. Для `meta` фільтр має бути строго кращим за
-    правило без фільтра за сумою `total_net_usd`; для `direct` і `rule_only` це порівняння не діє.
+    медіана PF ≥ 1 і сумарний чистий результат > 0. Для `meta` фільтр має бути строго кращим за сумою
+    `total_net_usd` за обидва правила без фільтра: усе правило (`unfiltered_total_net`) і правило лише на
+    сигналах, які модель оцінила (`scored_unfiltered_total_net`, рішення 0017). Немає хоча б одного —
+    відмова. Для `direct` і `rule_only` це порівняння не діє.
     """
     if label_type not in LABEL_TYPES:
         raise ValueError("невідомий label_type")
@@ -755,6 +768,8 @@ def evaluate_gate(
         require_decimal("pbo", pbo)
     if unfiltered_total_net is not None:
         require_decimal("unfiltered_total_net", unfiltered_total_net)
+    if scored_unfiltered_total_net is not None:
+        require_decimal("scored_unfiltered_total_net", scored_unfiltered_total_net)
     with localcontext(_CONTEXT):
         return _decide(
             label_type=label_type,
@@ -764,6 +779,7 @@ def evaluate_gate(
             pbo=pbo,
             n_trials=n_trials,
             unfiltered_total_net=unfiltered_total_net,
+            scored_unfiltered_total_net=scored_unfiltered_total_net,
             thresholds=limits,
         )
 
@@ -774,8 +790,7 @@ async def open_holdout_after_gate(
     experiment_id: str,
     trial_id: int,
     model_version: str,
-    stress: Sequence[FoldOutcome],
-    unfiltered_total_net: Decimal | None = None,
+    stress: Sequence[FoldOutcome] | None = None,
     thresholds: GateThresholds | None = None,
 ) -> RecordedOpening:
     """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
@@ -789,13 +804,18 @@ async def open_holdout_after_gate(
     теж лишається в N і в розкиді DSR, якщо в нього достатньо угод, але в PBO не змагається
     і кандидатом не буває. Модель відкриття має належати цьому
     експерименту (`experiment_id`, `label_type`, символ, таймфрейм): інакше тип експерименту вирішував
-    би, чи порівнювати ML-фільтр з правилом.
+    би, чи порівнювати ML-фільтр з правилом. З тієї ж причини спроба з ознаками meta (`stage`, `role`,
+    `comparison`) в експерименті іншого `label_type` кандидатом не буває (`ValueError`, рішення 0017).
     Відмова — `GateRejected` з рішенням
     (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
-    G1 (пороги, послаблені пороги, стрес, правило без фільтра) і лише тоді — знімок
+    G1 (пороги, послаблені пороги, стрес, обидва правила без фільтра) і лише тоді — знімок
     `n_trials_line`, `dsr`, `pbo` на експерименті: він завжди збігається з останнім відкриттям
     цього експерименту, а спроба — `result.trial_id` того відкриття.
     Зсув hold-out сюди не входить: його робить `create_experiment` з новішим вікном.
+    Для `meta` обидва правила без фільтра і стрес G1 рахує зі звітів бектесту, які `record_trial` перевірив
+    і поклав у `metrics` фолду (`meta`, рішення 0017). Стрес викликача можна не передавати; переданий
+    має збігатися із записаним. Звітів немає або стрес інший — `G1_FILTER` / `G1_STRESS`, без запису.
+    Для `direct` і `rule_only` стрес передає викликач; без нього — `G1_STRESS`.
     """
     if type(trial_id) is not int or isinstance(trial_id, bool):
         raise ValueError("trial_id має бути int")
@@ -807,6 +827,9 @@ async def open_holdout_after_gate(
         raise ValueError("спроба позначена недійсною і не буває кандидатом")
     if is_reference_baseline(trial.params):
         raise ValueError("опорний бейзлайн не буває кандидатом Gate G1")
+    if experiment.label_type != "meta" and _is_meta_trial(trial.params):
+        # Інакше спроба meta, записана в `direct` / `rule_only`, обійшла б порівняння з правилом (рішення 0017).
+        raise ValueError("спроба meta-моделі в експерименті іншого label_type не буває кандидатом")
     stored = experiment.params.get("validation")
     if not isinstance(stored, dict):
         raise SplitLeakError("в експерименту немає розбивки")
@@ -828,14 +851,26 @@ async def open_holdout_after_gate(
     pbo_detail = pbo_estimate(competing, candidate_index=candidate_index)
     dsr = dsr_detail.dsr
     pbo = pbo_detail.pbo
+    folds = fold_outcomes_from_metrics(trial.metrics)
+    checked_stress: tuple[FoldOutcome, ...] = () if stress is None else tuple(stress)
+    unfiltered_total_net: Decimal | None = None
+    scored_unfiltered_total_net: Decimal | None = None
+    if experiment.label_type == "meta":
+        # Числа викликача не годяться: однакові «обидва правила» або стрес іншого прогону з тими самими
+        # n_signals обійшли б G1. Звіти в журналі перевірені угодами при записі (рішення 0017).
+        unfiltered_total_net, scored_unfiltered_total_net, recorded = _journal_meta_runs(trial.metrics)
+        if stress is not None and checked_stress != recorded:
+            recorded = None
+        checked_stress = () if recorded is None else recorded
     decision = evaluate_gate(
         label_type=experiment.label_type,
-        folds=fold_outcomes_from_metrics(trial.metrics),
-        stress=stress,
+        folds=folds,
+        stress=checked_stress,
         dsr=dsr,
         pbo=pbo,
         n_trials=len(series),
         unfiltered_total_net=unfiltered_total_net,
+        scored_unfiltered_total_net=scored_unfiltered_total_net,
         thresholds=effective,
     )
     if not decision.passed or dsr is None or pbo is None:
@@ -867,7 +902,8 @@ async def open_holdout_after_gate(
             "median_pf_unbounded": decision.median_pf_unbounded,
             "profitable_fold_share": decision.profitable_fold_share,
             "unfiltered_total_net": unfiltered_total_net,
-            "stress": [item.model_dump() for item in stress],
+            "scored_unfiltered_total_net": scored_unfiltered_total_net,
+            "stress": [item.model_dump() for item in checked_stress],
             "thresholds": effective.model_dump(),
             "loosened": list(loosened_thresholds(effective)),
             "invalidated_trials": [
@@ -894,6 +930,7 @@ def _decide(
     pbo: Decimal | None,
     n_trials: int,
     unfiltered_total_net: Decimal | None,
+    scored_unfiltered_total_net: Decimal | None,
     thresholds: GateThresholds,
 ) -> GateDecision:
     reasons: list[str] = []
@@ -918,7 +955,7 @@ def _decide(
         reasons.append(G1_COST_FACTOR)
     if not _stress_holds(folds, stress, thresholds):
         reasons.append(G1_STRESS)
-    if label_type == "meta" and not _filter_better(folds, unfiltered_total_net):
+    if label_type == "meta" and not _filter_better(folds, unfiltered_total_net, scored_unfiltered_total_net):
         reasons.append(G1_FILTER)
     if dsr is None or dsr < thresholds.dsr_min:
         reasons.append(G1_DSR)
@@ -955,10 +992,17 @@ def _stress_holds(
     return sum((item.total_net_usd for item in stress), Decimal(0)) > 0
 
 
-def _filter_better(folds: tuple[FoldOutcome, ...], unfiltered_total_net: Decimal | None) -> bool:
-    if unfiltered_total_net is None:
+def _filter_better(
+    folds: tuple[FoldOutcome, ...],
+    unfiltered_total_net: Decimal | None,
+    scored_unfiltered_total_net: Decimal | None,
+) -> bool:
+    # Сигнали без валідних фіч правило торгує, а модель не бачить: перемога лише над усім правилом
+    # міряла б дірки в даних, а не фільтр (рішення 0017).
+    if unfiltered_total_net is None or scored_unfiltered_total_net is None:
         return False
-    return sum((fold.total_net_usd for fold in folds), Decimal(0)) > unfiltered_total_net
+    total = total_net(fold.total_net_usd for fold in folds)
+    return total > unfiltered_total_net and total > scored_unfiltered_total_net
 
 
 def _median_pf(folds: Sequence[FoldOutcome]) -> tuple[Decimal | None, bool]:
@@ -993,6 +1037,46 @@ def _pf_rank(fold: FoldOutcome) -> Decimal | None:
             return None
         return Decimal(0)
     return fold.profit_factor
+
+
+def _journal_meta_runs(
+    metrics: Mapping[str, Any],
+) -> tuple[Decimal | None, Decimal | None, tuple[FoldOutcome, ...] | None]:
+    """Обидва правила без фільтра і стрес зі звітів фолдів `meta`. Хоч одного фолду без них — `None`."""
+    folds = metrics.get("folds")
+    if not isinstance(folds, list) or not folds:
+        return None, None, None
+    unfiltered: list[Decimal] = []
+    scored: list[Decimal] = []
+    stress: list[FoldOutcome] = []
+    try:
+        for fold in folds:
+            runs = fold.get("meta") if isinstance(fold, Mapping) else None
+            if not isinstance(runs, Mapping):
+                return None, None, None
+            unfiltered.append(_journal_net(runs.get("unfiltered")))
+            scored.append(_journal_net(runs.get("scored_unfiltered")))
+            block = runs.get("stress")
+            cost = block.get("cost_factor") if isinstance(block, Mapping) else None
+            below = fold.get("below_min_trades")
+            stress.append(_fold_outcome({"trading": block, "below_min_trades": below, "cost_factor": cost}))
+    except ValueError:
+        return None, None, None
+    return total_net(unfiltered), total_net(scored), tuple(stress)
+
+
+def _journal_net(block: object) -> Decimal:
+    if not isinstance(block, Mapping):
+        raise ValueError("звіту правила немає")
+    metrics = block.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("у звіту правила немає метрик")
+    return _decimal_text(metrics.get("total_net_usd"))
+
+
+def _is_meta_trial(params: Mapping[str, Any]) -> bool:
+    """Ознаки спроби meta-моделі в параметрах — те, що пише `MetaRun.trial_params()`."""
+    return params.get("stage") == "meta_model" or params.get("role") == "meta" or "comparison" in params
 
 
 def _fold_outcome(fold: object) -> FoldOutcome:

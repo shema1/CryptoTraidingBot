@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import tracemalloc
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from itertools import combinations
 from statistics import NormalDist
 
@@ -49,6 +49,7 @@ from app.ml.statistics import (
     probability_of_backtest_overfitting,
     r_profit_factor,
     return_moments,
+    total_net,
     trial_series_from_journal,
 )
 from app.ml.trade_sim import ExitReason, StopPriceSource
@@ -174,6 +175,7 @@ def _gate(
     pbo: Decimal | None = Decimal("0.49"),
     n_trials: int = 4,
     unfiltered_total_net: Decimal | None = Decimal("0"),
+    scored_unfiltered_total_net: Decimal | None = Decimal("0"),
     thresholds: GateThresholds | None = None,
 ) -> GateDecision:
     return evaluate_gate(
@@ -184,6 +186,7 @@ def _gate(
         pbo=pbo,
         n_trials=n_trials,
         unfiltered_total_net=unfiltered_total_net,
+        scored_unfiltered_total_net=scored_unfiltered_total_net,
         thresholds=thresholds,
     )
 
@@ -830,10 +833,28 @@ def test_gate_passes_on_the_boundary_and_names_every_miss() -> None:
     assert "G1_STRESS" in _gate(stress=flat_stress).reasons
     assert "G1_FILTER" in _gate(unfiltered_total_net=Decimal("50")).reasons
     assert "G1_FILTER" in _gate(unfiltered_total_net=None).reasons
+    # Фільтр кращий за все правило, але не за правило на сигналах, які модель змогла оцінити (рішення 0017).
+    assert "G1_FILTER" in _gate(unfiltered_total_net=Decimal("-100"), scored_unfiltered_total_net=Decimal("50")).reasons
+    assert "G1_FILTER" in _gate(scored_unfiltered_total_net=None).reasons
+    assert (
+        "G1_FILTER" not in _gate(unfiltered_total_net=Decimal("49"), scored_unfiltered_total_net=Decimal("49")).reasons
+    )
     assert _gate(label_type="rule_only", unfiltered_total_net=Decimal("999")).passed is True
-    assert _gate(label_type="direct", unfiltered_total_net=None).passed is True
+    assert _gate(label_type="rule_only", scored_unfiltered_total_net=Decimal("999")).passed is True
+    assert _gate(label_type="direct", unfiltered_total_net=None, scored_unfiltered_total_net=None).passed is True
     assert "G1_COST_FACTOR" in _gate(folds=tuple(_fold("10", "1.20", cost="2") for _ in range(5))).reasons
     assert _gate(dsr=None, pbo=None).reasons == ("G1_DSR", "G1_PBO")
+
+
+def test_net_sums_do_not_depend_on_the_thread_decimal_context() -> None:
+    # Прогін і G1 мають рахувати суми однаково, хоч би який контекст Decimal лишив потоку CCXT (рішення 0017).
+    values = [Decimal("1000.000000000000000000000004"), Decimal("0.0000000000000000000000005")]
+    expected = total_net(values)
+    assert expected == Decimal("1000.000000000000000000000004")
+    with localcontext() as ctx:
+        ctx.rounding = ROUND_HALF_UP
+        assert sum(values, Decimal(0)) != expected
+        assert total_net(values) == expected
 
 
 def test_gate_uses_the_thresholds_the_caller_passes() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 
 import numpy as np
 import pytest
@@ -18,8 +18,10 @@ from app.ml.strategy import ALWAYS_FLAT
 from app.ml.trade_sim import ExitReason, StopPriceSource
 from app.ml.validation import (
     HOUR_MS,
+    Fold,
     FoldRecord,
     LabelStats,
+    MetaFoldRuns,
     ResearchSplit,
     build_split,
     create_experiment,
@@ -80,8 +82,25 @@ def _decision(trade: BacktestTrade, decision: str) -> BacktestDecision:
     )
 
 
-def _report(symbol: str, trades: tuple[BacktestTrade, ...]) -> BacktestReport:
-    """Кожна угода — рішення ENTER; ще один сигнал фолду відкинуто cooldown."""
+def _skip_after(trade: BacktestTrade) -> BacktestDecision:
+    """Сигнал на свічці після угоди: `run_backtest` дає одне рішення на сигнал, не два на одну свічку."""
+    return BacktestDecision(
+        ts_ms=trade.entry_open_time_ms + HOUR,
+        entry_index=trade.entry_index + 1,
+        stage="RISK",
+        decision="SKIP",
+        reason_code="RISK_COOLDOWN",
+        side=trade.side,
+    )
+
+
+def _report(
+    symbol: str,
+    trades: tuple[BacktestTrade, ...],
+    *,
+    cost_factor: Decimal = Decimal("1"),
+) -> BacktestReport:
+    """Кожна угода — рішення ENTER; ще один сигнал на наступній свічці відкинуто cooldown."""
     total = sum((trade.net_usd for trade in trades), Decimal(0))
     wins = sum(1 for trade in trades if trade.net_usd > 0)
     loss = sum((-trade.net_usd for trade in trades if trade.net_usd < 0), Decimal(0))
@@ -89,9 +108,9 @@ def _report(symbol: str, trades: tuple[BacktestTrade, ...]) -> BacktestReport:
     return BacktestReport(
         symbol=symbol,
         seed=7,
-        cost_factor=Decimal("1"),
+        cost_factor=cost_factor,
         trades=trades,
-        decisions=(*(_decision(trade, "ENTER") for trade in trades), _decision(trades[-1], "SKIP")),
+        decisions=(*(_decision(trade, "ENTER") for trade in trades), _skip_after(trades[-1])),
         metrics=BacktestMetrics(
             n_trades=len(trades),
             total_r=total,
@@ -119,33 +138,55 @@ def _paths(n_trades: int) -> tuple[tuple[Decimal, ...], tuple[Decimal, ...]]:
     return strong, junk
 
 
-def _records(split: ResearchSplit, series: tuple[Decimal, ...]) -> list[FoldRecord]:
+def _pair(fold: Fold, values: tuple[Decimal, ...]) -> tuple[BacktestTrade, ...]:
+    """Угоди на перших годинах тесту фолду: ті самі сигнали, що в торговому прогоні `_records`."""
+    return tuple(
+        _trade(fold.test_start_ms + offset * HOUR, value, entry_index=offset) for offset, value in enumerate(values)
+    )
+
+
+def _meta_runs(fold: Fold, pair: tuple[Decimal, ...], *, scored_shift: Decimal = Decimal("0")) -> MetaFoldRuns:
+    """Прогони для G1 (рішення 0017): усе правило дає нуль, стрес — PF 1.1 на тих самих сигналах."""
+    flat = _report(BTC, _pair(fold, (Decimal("0"), Decimal("0"))))
+    scored = flat if not scored_shift else _report(BTC, _pair(fold, tuple(value + scored_shift for value in pair)))
+    return MetaFoldRuns(
+        unfiltered=flat,
+        scored_unfiltered=scored,
+        stress=_report(BTC, _pair(fold, (Decimal("2.2"), Decimal("-2"))), cost_factor=Decimal("2")),
+    )
+
+
+def _records(
+    split: ResearchSplit,
+    series: tuple[Decimal, ...],
+    *,
+    meta: bool = False,
+    scored_shift: Decimal = Decimal("0"),
+) -> list[FoldRecord]:
     if len(series) != len(split.folds) * 2:
         raise ValueError("ряд має містити дві угоди на фолд")
     records: list[FoldRecord] = []
     for index, fold in enumerate(split.folds):
         pair = series[index * 2 : index * 2 + 2]
-        btc = tuple(
-            _trade(fold.test_start_ms + offset * HOUR, value, entry_index=offset) for offset, value in enumerate(pair)
-        )
         eth = (_trade(fold.test_start_ms, Decimal("9"), entry_index=0),)
         records.append(
             FoldRecord(
-                reports=(_report(BTC, btc), _report(ETH, eth)),
+                reports=(_report(BTC, _pair(fold, pair)), _report(ETH, eth)),
                 train_labels=_LABELS,
                 test_labels=_LABELS,
+                meta=_meta_runs(fold, pair, scored_shift=scored_shift) if meta else None,
             )
         )
     return records
 
 
 def _stress(split: ResearchSplit) -> tuple[FoldOutcome, ...]:
+    """Те, що G1 прочитає зі стресу `_meta_runs`: дві угоди з тих самих трьох сигналів, одна збиткова."""
     return tuple(
-        # Подвоєні витрати увімкнули cooldown: виконано одну угоду з тих самих трьох сигналів.
         FoldOutcome(
-            n_trades=1,
+            n_trades=2,
             n_signals=3,
-            total_net_usd=Decimal("1"),
+            total_net_usd=Decimal("0.2"),
             profit_factor=Decimal("1.1"),
             below_min_trades=False,
             cost_factor=Decimal("2"),
@@ -189,7 +230,7 @@ async def _strong_and_junk(session: AsyncSession, split: ResearchSplit) -> tuple
         split=split,
         state="COMPLETE",
         params={"name": "strong"},
-        folds=_records(split, strong_r),
+        folds=_records(split, strong_r, meta=True),
     )
     return experiment_id, strong.trial_id, junk.trial_id
 
@@ -212,7 +253,6 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
                 trial_id=strong_id,
                 model_version=await _model(conn, experiment_id),
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
             )
         decision = caught.value.decision
         assert "G1_MIN_TRADES_FOLD" in decision.reasons
@@ -230,7 +270,6 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
                 trial_id=strong_id,
                 model_version=await _model(conn, experiment_id),
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
                 thresholds=GateThresholds(min_oos_trades=50),
             )
         assert "G1_MIN_TRADES_TOTAL" not in other.value.decision.reasons
@@ -290,7 +329,6 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
                 trial_id=strong_id,
                 model_version=model,
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
             )
         assert caught.value.decision.n_trials == 5
         opened = await open_holdout_after_gate(
@@ -299,7 +337,6 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
             trial_id=strong_id,
             model_version=model,
             stress=_stress(split),
-            unfiltered_total_net=Decimal("0"),
             thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
         )
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
@@ -342,7 +379,7 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
             split=shifted,
             state="COMPLETE",
             params={"name": "strong"},
-            folds=_records(shifted, strong_r),
+            folds=_records(shifted, strong_r, meta=True),
         )
         opened = await open_holdout_after_gate(
             session,
@@ -350,7 +387,6 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
             trial_id=candidate.trial_id,
             model_version=model,
             stress=_stress(shifted),
-            unfiltered_total_net=Decimal("0"),
             thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
         )
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
@@ -373,7 +409,6 @@ async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConn
             trial_id=strong_id,
             model_version=model,
             stress=_stress(split),
-            unfiltered_total_net=Decimal("0"),
             thresholds=loose,
         )
         with pytest.raises(GateRejected):
@@ -383,7 +418,6 @@ async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConn
                 trial_id=junk_id,
                 model_version=model,
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
                 thresholds=loose,
             )
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
@@ -408,8 +442,7 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
             experiment_id=experiment_id,
             trial_id=strong_id,
             model_version=model,
-            stress=_stress(split),
-            unfiltered_total_net=Decimal("0"),
+            # Для meta стрес можна не передавати: G1 бере його зі звітів спроби.
             thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
         )
         assert opened.opening_no == 1
@@ -435,16 +468,211 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
         assert result["loosened"] == ["min_trades_per_fold", "min_oos_trades"]
         assert result["n_trades"] == len(split.folds) * 2
         assert result["unfiltered_total_net"] == "0"
+        assert result["scored_unfiltered_total_net"] == "0"
         assert result["invalidated_trials"] == []
         assert len(result["stress"]) == len(split.folds)
         assert result["stress"][0] == {
-            "n_trades": 1,
+            "n_trades": 2,
             "n_signals": 3,
-            "total_net_usd": "1",
+            "total_net_usd": "0.2",
             "profit_factor": "1.1",
             "below_min_trades": False,
             "cost_factor": "2",
         }
+
+
+async def test_record_trial_does_not_depend_on_the_thread_decimal_context(conn: AsyncConnection) -> None:
+    """`run_backtest` рахує суми у фіксованому контексті; звірка журналу — так само, а не в HALF_UP від CCXT."""
+    split = _split()
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    records = _records(split, strong_r, meta=True)
+    fold = split.folds[0]
+    # Точна сума має 29 значущих цифр: HALF_EVEN дає …004, HALF_UP — …005.
+    odd = _pair(fold, (Decimal("1000.000000000000000000000004"), Decimal("0.0000000000000000000000005")))
+    records[0] = records[0].model_copy(update={"reports": (_report(BTC, odd), records[0].reports[1])})
+    async with AsyncSession(bind=conn) as session:
+        experiment_id = await _line(session, split)
+        with localcontext() as ctx:
+            ctx.rounding = ROUND_HALF_UP
+            written = await record_trial(
+                session,
+                experiment_id=experiment_id,
+                split=split,
+                state="COMPLETE",
+                params={"name": "half-up"},
+                folds=records,
+            )
+        stored = await session.get(ExperimentTrial, written.trial_id)
+        assert stored is not None
+        assert stored.metrics["folds"][0]["trading"]["metrics"]["total_net_usd"] == "1000.000000000000000000000004"
+
+
+async def test_meta_gate_takes_rule_numbers_and_stress_from_the_journal(conn: AsyncConnection) -> None:
+    """Викликач не підміняє ні правило без фільтра, ні стрес: G1 рахує їх зі звітів спроби (рішення 0017)."""
+    split = _split()
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        model = await _model(conn, experiment_id)
+        # Сильніший стрес з тими самими сигналами, але не з цього прогону.
+        forged = tuple(item.model_copy(update={"total_net_usd": Decimal("100")}) for item in _stress(split))
+        with pytest.raises(GateRejected) as caught:
+            await open_holdout_after_gate(
+                session,
+                experiment_id=experiment_id,
+                trial_id=strong_id,
+                model_version=model,
+                stress=forged,
+                thresholds=loose,
+            )
+        assert "G1_STRESS" in caught.value.decision.reasons
+        assert "G1_FILTER" not in caught.value.decision.reasons
+        cases: tuple[tuple[str, list[FoldRecord], tuple[str, ...]], ...] = (
+            # Без звітів правила і стресу в журналі G1 нема з чим порівнювати.
+            ("no-runs", _records(split, strong_r), ("G1_FILTER", "G1_STRESS")),
+            # Правило на оцінених сигналах краще за фільтр.
+            ("scored-wins", _records(split, strong_r, meta=True, scored_shift=Decimal("1")), ("G1_FILTER",)),
+        )
+        for name, folds, reasons in cases:
+            trial = await record_trial(
+                session,
+                experiment_id=experiment_id,
+                split=split,
+                state="COMPLETE",
+                params={"name": name},
+                folds=folds,
+            )
+            with pytest.raises(GateRejected) as caught:
+                await open_holdout_after_gate(
+                    session,
+                    experiment_id=experiment_id,
+                    trial_id=trial.trial_id,
+                    model_version=model,
+                    thresholds=loose,
+                )
+            assert set(reasons) <= set(caught.value.decision.reasons), name
+        openings = select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == BTC)
+        assert (await session.execute(openings)).scalar_one() == 0
+
+
+async def test_meta_runs_are_checked_when_written(conn: AsyncConnection) -> None:
+    """Звіти правила і стресу — угоди бектесту торгового символу на сигналах фільтра, а не голі числа."""
+    split = _split()
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    good = _records(split, strong_r, meta=True)
+    fold = split.folds[0]
+    runs = good[0].meta
+    assert runs is not None
+    flat = _pair(fold, (Decimal("0"), Decimal("0")))
+    shifted = (flat[0], _trade(fold.test_start_ms + 2 * HOUR, Decimal("1"), entry_index=2))
+    twice = _decision(runs.stress.trades[-1], "SKIP")
+    lying = runs.unfiltered.model_copy(
+        update={"metrics": runs.unfiltered.metrics.model_copy(update={"total_net_usd": Decimal("-50")})}
+    )
+    cases: tuple[tuple[dict[str, object], str], ...] = (
+        ({"unfiltered": _report(ETH, flat)}, "торгового символу"),
+        ({"unfiltered": lying}, "PnL"),
+        ({"stress": _report(BTC, _pair(fold, (Decimal("2.2"), Decimal("-2"))))}, "стрес"),
+        # Стрес на іншому наборі сигналів: другий сигнал на годину пізніше, ніж у фільтра.
+        ({"stress": _report(BTC, shifted, cost_factor=Decimal("2"))}, "сигнал"),
+        # Оцінених сигналів менше, ніж узяв фільтр.
+        ({"scored_unfiltered": _report(BTC, flat[:1])}, "сигнал"),
+        # Два рішення на одній свічці: множина сигналів сховала б повтор.
+        ({"stress": runs.stress.model_copy(update={"decisions": (*runs.stress.decisions[:-1], twice)})}, "повтор"),
+    )
+    async with AsyncSession(bind=conn) as session:
+        experiment_id = await _line(session, split)
+        for update, message in cases:
+            broken = good[0].model_copy(update={"meta": runs.model_copy(update=update)})
+            with pytest.raises(ValueError, match=message):
+                await record_trial(
+                    session,
+                    experiment_id=experiment_id,
+                    split=split,
+                    state="COMPLETE",
+                    params={"name": "broken"},
+                    folds=[broken, *good[1:]],
+                )
+        direct = await create_experiment(
+            session,
+            split=split,
+            research_line=BTC,
+            symbols=(BTC, ETH),
+            label_type="direct",
+            primary_strategy={"name": "ema_cross"},
+            params={},
+            seed=7,
+        )
+        with pytest.raises(ValueError, match="meta"):
+            await record_trial(
+                session,
+                experiment_id=direct,
+                split=split,
+                state="COMPLETE",
+                params={"name": "meta-runs"},
+                folds=good,
+            )
+        written = await record_trial(
+            session,
+            experiment_id=experiment_id,
+            split=split,
+            state="COMPLETE",
+            params={"name": "good"},
+            folds=good,
+        )
+        stored = await session.get(ExperimentTrial, written.trial_id)
+        assert stored is not None
+        block = stored.metrics["folds"][0]["meta"]
+        assert block["unfiltered"]["metrics"]["total_net_usd"] == "0"
+        assert block["stress"]["cost_factor"] == "2"
+        assert block["stress"]["n_signals"] == 3
+
+
+async def test_meta_trial_in_another_experiment_type_is_not_a_candidate(conn: AsyncConnection) -> None:
+    """Тип експерименту не вимикає порівняння з правилом: спроба meta в `direct` / `rule_only` — не кандидат."""
+    split = _split()
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    markers: tuple[dict[str, object], ...] = (
+        {"name": "comparison", "comparison": {"beats_unfiltered": True}},
+        {"name": "role", "role": "meta"},
+        {"name": "stage", "stage": "meta_model"},
+    )
+    async with AsyncSession(bind=conn) as session:
+        for label_type in ("direct", "rule_only"):
+            experiment_id = await create_experiment(
+                session,
+                split=split,
+                research_line=BTC,
+                symbols=(BTC, ETH),
+                label_type=label_type,
+                primary_strategy={"name": "ema_cross"},
+                params={},
+                seed=7,
+            )
+            artifact = {"artifact_path": None} if label_type == "rule_only" else {}
+            model = await make_model(conn, experiment_id=experiment_id, label_type=label_type, **artifact)
+            for params in markers:
+                trial = await record_trial(
+                    session,
+                    experiment_id=experiment_id,
+                    split=split,
+                    state="COMPLETE",
+                    params=params,
+                    folds=_records(split, strong_r),
+                )
+                with pytest.raises(ValueError, match="meta"):
+                    await open_holdout_after_gate(
+                        session,
+                        experiment_id=experiment_id,
+                        trial_id=trial.trial_id,
+                        model_version=model,
+                        stress=_stress(split),
+                        thresholds=loose,
+                    )
+        openings = select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == BTC)
+        assert (await session.execute(openings)).scalar_one() == 0
 
 
 async def test_invalidated_trial_counts_in_n_but_not_in_spread_or_pbo(conn: AsyncConnection) -> None:
@@ -471,7 +699,6 @@ async def test_invalidated_trial_counts_in_n_but_not_in_spread_or_pbo(conn: Asyn
                 trial_id=strong_id,
                 model_version=model,
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
                 thresholds=loose,
             )
         assert "G1_DSR" in caught.value.decision.reasons
@@ -497,7 +724,6 @@ async def test_invalidated_trial_counts_in_n_but_not_in_spread_or_pbo(conn: Asyn
                 trial_id=leak.trial_id,
                 model_version=model,
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
                 thresholds=loose,
             )
         opened = await open_holdout_after_gate(
@@ -506,7 +732,6 @@ async def test_invalidated_trial_counts_in_n_but_not_in_spread_or_pbo(conn: Asyn
             trial_id=strong_id,
             model_version=model,
             stress=_stress(split),
-            unfiltered_total_net=Decimal("0"),
             thresholds=loose,
         )
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
@@ -543,7 +768,6 @@ async def test_opening_model_must_belong_to_the_experiment(conn: AsyncConnection
                     trial_id=strong_id,
                     model_version=await make_model(conn, **overrides),
                     stress=_stress(split),
-                    unfiltered_total_net=Decimal("0"),
                     thresholds=loose,
                 )
         with pytest.raises(ValueError, match="немає"):
@@ -553,7 +777,6 @@ async def test_opening_model_must_belong_to_the_experiment(conn: AsyncConnection
                 trial_id=strong_id,
                 model_version="m-missing",
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
                 thresholds=loose,
             )
         openings = select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == BTC)
@@ -616,7 +839,6 @@ async def test_reference_baseline_counts_in_n_but_not_in_pbo(conn: AsyncConnecti
                 trial_id=baseline.trial_id,
                 model_version=model,
                 stress=_stress(split),
-                unfiltered_total_net=Decimal("0"),
                 thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
             )
         opened = await open_holdout_after_gate(
@@ -625,7 +847,6 @@ async def test_reference_baseline_counts_in_n_but_not_in_pbo(conn: AsyncConnecti
             trial_id=strong_id,
             model_version=model,
             stress=_stress(split),
-            unfiltered_total_net=Decimal("0"),
             thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
         )
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()

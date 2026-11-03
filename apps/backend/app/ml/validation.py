@@ -33,11 +33,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.models import AUDIT_ACTION_TRIAL_INVALIDATE, AuditLog
 from app.core.clock import now_ms
 from app.core.db import SYMBOL_RE
+from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial, HoldoutOpening, TrialInvalidation
 from app.ml.trade_sim import DirectSample, ExitReason, MetaSample, StopPriceSource
-from app.risk.numbers import FrozenModel
+from app.risk.numbers import FrozenModel, fixed_context
 
 # 90 і 180 діб — наближення «3 і 6 місяців» без прив'язки до календаря.
 DAY_MS: int = 24 * HOUR_MS
@@ -176,12 +177,29 @@ class LabelStats(FrozenModel):
         return Decimal(self.n_both_reached_tp) / Decimal(self.n_labels)
 
 
+class MetaFoldRuns(FrozenModel):
+    """Прогони торгового символу, з якими G1 порівнює фільтр `meta` (рішення 0017).
+
+    `unfiltered` — усі сигнали правила у вікні тесту; `scored_unfiltered` — лише ті, які модель оцінила,
+    без порогу; `stress` — сигнали фільтра з подвоєними витратами. Усе — звіти `run_backtest` з угодами:
+    G1 рахує суми з них, а не з чисел, які хтось поклав у `params`.
+    """
+
+    unfiltered: BacktestReport
+    scored_unfiltered: BacktestReport
+    stress: BacktestReport
+
+
 class FoldRecord(FrozenModel):
-    """Прогони одного фолду. Кожен символ експерименту — рівно один `run_backtest`."""
+    """Прогони одного фолду. Кожен символ експерименту — рівно один `run_backtest`.
+
+    `meta` — лише для експерименту `label_type=meta`: правило без фільтра і стрес того самого фолду.
+    """
 
     reports: tuple[BacktestReport, ...]
     train_labels: LabelStats
     test_labels: LabelStats
+    meta: MetaFoldRuns | None = None
 
 
 class RecordedTrial(FrozenModel):
@@ -616,6 +634,7 @@ async def record_trial(
             symbols=symbols,
             seed=experiment.seed,
             research_line=experiment.research_line,
+            label_type=experiment.label_type,
         )
         checked.append(block)
         series.extend(fold_r)
@@ -922,6 +941,7 @@ def _fold_block(
     symbols: Sequence[str],
     seed: int,
     research_line: str,
+    label_type: str,
 ) -> tuple[dict[str, Any], list[str], list[int], bool, bool]:
     got = [report.symbol for report in record.reports]
     if len(got) != len(set(got)) or set(got) != set(symbols):
@@ -959,10 +979,66 @@ def _fold_block(
         "all_symbols": _pool(record.reports),
         "labels": {"train": _label_json(record.train_labels), "test": _label_json(record.test_labels)},
     }
+    if record.meta is not None:
+        if label_type != "meta":
+            raise ValueError("прогони правила і стресу пишуться лише в експеримент meta")
+        block["meta"] = _meta_block(
+            record.meta,
+            trading,
+            split=split,
+            fold_index=fold_index,
+            seed=seed,
+            research_line=research_line,
+        )
     return block, series, entries, any_last, any_both
 
 
+def _meta_block(
+    runs: MetaFoldRuns,
+    trading: BacktestReport,
+    *,
+    split: ResearchSplit,
+    fold_index: int,
+    seed: int,
+    research_line: str,
+) -> dict[str, Any]:
+    """Звіти правила і стресу перевіряються так само, як прогін фолду, і мають ті самі сигнали (рішення 0017)."""
+    for report in (runs.unfiltered, runs.scored_unfiltered, runs.stress):
+        if report.symbol != research_line:
+            raise ValueError("прогони правила і стресу — лише торгового символу")
+        if report.seed != seed:
+            raise ValueError("seed прогону не збігається з експериментом")
+        _report_matches_trades(report)
+        for trade in report.trades:
+            _trade_inside(trade, split, fold_index)
+    if runs.unfiltered.cost_factor != trading.cost_factor or runs.scored_unfiltered.cost_factor != trading.cost_factor:
+        raise ValueError("правило без фільтра рахується з витратами фолду")
+    if runs.stress.cost_factor <= trading.cost_factor:
+        raise ValueError("стрес має бути дорожчим за прогін фолду")
+    for report in (trading, runs.unfiltered, runs.scored_unfiltered, runs.stress):
+        if len(_signal_keys(report)) != report.n_signals:
+            raise ValueError("сигнал повторюється в прогоні: `run_backtest` дає одне рішення на свічку")
+    filtered = _signal_keys(trading)
+    # Шлях підмножини сигналів не довший, тож сигнал фільтра є і в ширшому прогоні.
+    if not filtered <= _signal_keys(runs.scored_unfiltered) <= _signal_keys(runs.unfiltered):
+        raise ValueError("сигнали фільтра, оцінені й усі сигнали правила мають бути вкладені")
+    if _signal_keys(runs.stress) != filtered or runs.stress.n_signals != trading.n_signals:
+        raise ValueError("стрес — ті самі сигнали, що фільтр")
+    return {
+        "unfiltered": _report_json(runs.unfiltered),
+        "scored_unfiltered": _report_json(runs.scored_unfiltered),
+        "stress": {**_report_json(runs.stress), "cost_factor": runs.stress.cost_factor},
+    }
+
+
+def _signal_keys(report: BacktestReport) -> set[tuple[int, PositionSide]]:
+    """Сигнали прогону: час свічки входу і сторона кожного рішення ENTER чи SKIP."""
+    return {(decision.ts_ms, decision.side) for decision in report.decisions if decision.decision != "CLOSE"}
+
+
+@fixed_context
 def _report_matches_trades(report: BacktestReport) -> None:
+    # Той самий контекст Decimal, що в `run_backtest`: CCXT лишає потоку HALF_UP, і чесний звіт не зійшовся б.
     trades = report.trades
     metrics = report.metrics
     if metrics.n_trades != len(trades):
@@ -1004,6 +1080,7 @@ def _trade_inside(trade: BacktestTrade, split: ResearchSplit, fold_index: int) -
         raise SplitLeakError("вхід угоди поза тестом фолду")
 
 
+@fixed_context
 def _pool(reports: Sequence[BacktestReport]) -> dict[str, Any]:
     """Суми вже порахованих угод. Просадка і Sharpe лишаються в прогоні кожного символу."""
     trades = [trade for report in reports for trade in report.trades]

@@ -90,6 +90,8 @@ uv run --project apps/backend pre-commit install    # git-хуки (лише д�
 bash ai-setup/install.sh                            # лише якщо в корені є тека ai-setup/ (AI-агенти: .claude/, .mcp.json)
 ```
 
+На macOS офіційне колесо LightGBM шукає `libomp`. Якщо `import lightgbm` падає з `Library not loaded: libomp.dylib`, поставте `brew install libomp` і повторіть `uv sync`. Рецепт meta-моделі фіксує `n_jobs=1`, тож OpenMP на результат навчання не впливає, але без бібліотеки колесо просто не імпортується.
+
 Працюєте з AI-агентами (Claude Code, Cursor) — після кроку 4 задайте `MCP_DATABASE_URI` для MCP `postgres-readonly`
 (агент читає dev-БД через роль `ctb_readonly`): `docs/ai/AI_SETUP.md`, «Встановлення», крок 2. Змінна живе в профілі
 shell, а не в `.env`; без неї бекенд працює, лише агент не бачить БД.
