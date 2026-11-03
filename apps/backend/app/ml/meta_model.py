@@ -1,8 +1,9 @@
 """Бінарна meta-модель LightGBM (ТЗ §5.1, §5А.3, §5А.9, T2.8).
 
 Первинне правило вже зафіксоване (`StrategySpec` з `PRIMARY_CANDIDATES`). Модель лише оцінює
-ймовірність, що кандидат дійде до TP. Навчання — стандартні параметри LightGBM, без Optuna,
-`device=cpu`. `sample_weight` — `sample_weights` (унікальність × баланс класів); `class_weight`
+ймовірність, що кандидат дійде до TP. За замовчуванням — стандартні параметри LightGBM, без Optuna,
+`device=cpu`. Optuna (T2.10) передає вже перевірену точку з діапазонів ТЗ §5А.7; таргет і правило
+вона не змінює. `sample_weight` — `sample_weights` (унікальність × баланс класів); `class_weight`
 класифікатора не вмикається, інакше баланс врахувався б двічі.
 
 Кожен фолд учиться лише на своєму train. Фічі цього фолду рахуються з покриттям train
@@ -13,14 +14,14 @@
 Стрес (`cost_factor=2`) лишається на об'єкті прогону і в журнал окремою спробою не пишеться.
 
 `train_meta` синхронний: це навчання, не торговий цикл. `run_meta_experiment` виносить його
-з event loop. Воркер (T2.10) викликає той самий шлях.
+з event loop. Воркер Optuna викликає той самий `train_meta` з точкою пошуку.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -41,6 +42,7 @@ from app.ml.features import (
     feature_columns,
     sources_covering,
 )
+from app.ml.lgbm_space import EARLY_STOP_FRACTION, EARLY_STOPPING_ROUNDS, lgbm_search_record, search_point
 from app.ml.statistics import FoldOutcome, fold_outcome_from_report, total_net
 from app.ml.strategy import (
     PRIMARY_CANDIDATES,
@@ -83,11 +85,15 @@ _STRESS_COST: Decimal = Decimal(2)
 
 
 class MetaTrainError(RuntimeError):
-    """Фолд не можна навчити. Журнал, якщо експеримент уже створено, отримує `FAILED`."""
+    """Фолд не можна навчити. Журнал, якщо експеримент уже створено, отримує `FAILED`.
+
+    `completed_folds` — префікс фолдів, які встигли навчитися. Optuna записує його, не пропускаючи дірку.
+    """
 
     def __init__(self, message: str, *, experiment_id: str | None = None) -> None:
         super().__init__(message)
         self.experiment_id = experiment_id
+        self.completed_folds: tuple[MetaFold, ...] = ()
 
 
 def lgbm_journal_params() -> dict[str, Any]:
@@ -218,6 +224,8 @@ class MetaFold:
     scored_unfiltered_trading_net: Decimal
     n_unscored_signals: int
     stress: FoldOutcome
+    # Скільки дерев лишилось після ранньої зупинки. `None` — журнальний рецепт без неї.
+    best_iteration: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +239,8 @@ class MetaRun:
     shuffled_labels: bool
     min_probability: Decimal
     folds: tuple[MetaFold, ...]
+    # `None` — `lgbm_journal_params`. Інакше перевірена точка пошуку, не сирий словник викликача.
+    lgbm: Mapping[str, Any] | None = None
 
     @property
     def filtered_total_net(self) -> Decimal:
@@ -271,6 +281,9 @@ class MetaRun:
         тож N від нього не росте.
         """
         params = meta_recipe(shuffled_labels=self.shuffled_labels, min_probability=self.min_probability)
+        if self.lgbm is not None:
+            params["lgbm"] = dict(self.lgbm)
+            params["best_iteration"] = [fold.best_iteration for fold in self.folds]
         params["role"] = "meta"
         params["strategy"] = self.spec.metadata()
         params["comparison"] = {
@@ -320,6 +333,8 @@ def train_meta(
     feature_data: Mapping[str, SymbolData] | None = None,
     min_probability: Decimal = META_MIN_PROBABILITY,
     shuffled_labels: bool = False,
+    lgbm: Mapping[str, Any] | None = None,
+    stop_after: Callable[[MetaFold], bool] | None = None,
 ) -> MetaRun:
     """Навчити по моделі на фолд і прогнати відфільтровані сигнали бектестом.
 
@@ -327,6 +342,8 @@ def train_meta(
     і вектор дивились на один ряд. `None` — обсяг 1 і без деривативів (`vol_ratio` стає 1).
     `shuffled_labels` перемішує лише навчальні мітки фолду; фічі, спани унікальності й тест лишаються
     на своїх рядках. Генератор — PCG64 від seed, не глобальний стан numpy.
+    `lgbm` — точка `lgbm_search_record` (Optuna). `None` лишає журнальний рецепт без ранньої зупинки.
+    `stop_after` повертає True, щоб не вчити решту фолдів (префікс для `PRUNED`).
     """
     books = _books(histories, trading_symbol)
     _spec(spec)
@@ -334,6 +351,9 @@ def train_meta(
     _probability_threshold(min_probability)
     if type(shuffled_labels) is not bool:
         raise ValueError("shuffled_labels має бути bool")
+    checked = None if lgbm is None else lgbm_search_record(search_point(lgbm))
+    if stop_after is not None and not callable(stop_after):
+        raise ValueError("stop_after має бути викликаним")
     if split.bar_ms != HOUR_MS:
         raise ValueError("meta-модель рахується на свічках 1h")
     if not split.folds:
@@ -364,25 +384,32 @@ def train_meta(
     )
     # Ключ — набір колонок. Покриття змінює лише його, не значення вже порахованої колонки.
     cache: dict[tuple[str, ...], FeatureRows] = {}
-    folds = tuple(
-        _train_fold(
-            books,
-            spec=spec,
-            split=split,
-            fold=fold,
-            trading_symbol=trading_symbol,
-            by_key=by_key,
-            samples=samples,
-            candidates=candidates,
-            series=series,
-            cache=cache,
-            common=common,
-            seed=seed,
-            min_probability=min_probability,
-            shuffled_labels=shuffled_labels,
-        )
-        for fold in split.folds
-    )
+    done: list[MetaFold] = []
+    try:
+        for fold in split.folds:
+            trained = _train_fold(
+                books,
+                spec=spec,
+                split=split,
+                fold=fold,
+                trading_symbol=trading_symbol,
+                by_key=by_key,
+                samples=samples,
+                candidates=candidates,
+                series=series,
+                cache=cache,
+                common=common,
+                seed=seed,
+                min_probability=min_probability,
+                shuffled_labels=shuffled_labels,
+                lgbm=checked,
+            )
+            done.append(trained)
+            if stop_after is not None and stop_after(trained):
+                break
+    except MetaTrainError as exc:
+        exc.completed_folds = tuple(done)
+        raise
     return MetaRun(
         spec=spec,
         split=split,
@@ -390,7 +417,8 @@ def train_meta(
         trading_symbol=trading_symbol,
         shuffled_labels=shuffled_labels,
         min_probability=min_probability,
-        folds=folds,
+        folds=tuple(done),
+        lgbm=checked,
     )
 
 
@@ -511,6 +539,7 @@ def _train_fold(
     seed: int,
     min_probability: Decimal,
     shuffled_labels: bool,
+    lgbm: Mapping[str, Any] | None,
 ) -> MetaFold:
     features = _features_for_fold(series, split, fold.index, cache)
     train_rows = rows_for(candidates, split, SplitPurpose.TRAIN, fold_index=fold.index)
@@ -529,8 +558,23 @@ def _train_fold(
     weights = sample_weights(spans, fit_labels)
     if not weights or any(weight <= 0 for weight in weights):
         raise MetaTrainError("без ваг унікальності навчати не можна")
-    estimator = _estimator(seed)
-    estimator.fit(_matrix(train), np.asarray(fit_labels, dtype=np.int32), sample_weight=_weight_array(weights))
+    matrix = _matrix(train)
+    labels = np.asarray(fit_labels, dtype=np.int32)
+    weight_array = _weight_array(weights)
+    if lgbm is None:
+        estimator = _estimator(seed, None)
+        estimator.fit(matrix, labels, sample_weight=weight_array)
+        best_iteration = None
+    else:
+        estimator, best_iteration = _fit_search(
+            matrix,
+            labels,
+            weight_array,
+            train,
+            seed=seed,
+            lgbm=lgbm,
+            embargo_start_ms=fold.embargo_start_ms,
+        )
     model = MetaFoldModel(
         fold_index=fold.index,
         columns=(*features.columns, SIDE_COLUMN),
@@ -575,6 +619,7 @@ def _train_fold(
         scored_unfiltered_trading_net=runs.scored_unfiltered.metrics.total_net_usd,
         n_unscored_signals=len(rule) - len(seen),
         stress=fold_outcome_from_report(runs.stress, below_min_trades=fold.below_min_trades),
+        best_iteration=best_iteration,
     )
 
 
@@ -778,23 +823,25 @@ def _score(
     return tuple(scored)
 
 
-def _estimator(seed: int) -> lgb.LGBMClassifier:
-    raw = lgbm_journal_params()
+def _estimator(seed: int, raw: Mapping[str, Any] | None) -> lgb.LGBMClassifier:
+    source = lgbm_journal_params() if raw is None else raw
+    if source.get("n_jobs") != 1 or source.get("class_weight") is not None or source.get("deterministic") is not True:
+        raise MetaTrainError("рецепт LightGBM змінився: очікувались n_jobs=1, deterministic і порожній class_weight")
     model = lgb.LGBMClassifier(
         objective="binary",
-        boosting_type=str(raw["boosting_type"]),
-        num_leaves=int(raw["num_leaves"]),
-        max_depth=int(raw["max_depth"]),
-        learning_rate=float(raw["learning_rate"]),
-        n_estimators=int(raw["n_estimators"]),
-        min_child_samples=int(raw["min_child_samples"]),
-        min_child_weight=float(raw["min_child_weight"]),
-        subsample=float(raw["subsample"]),
-        subsample_freq=int(raw["subsample_freq"]),
-        colsample_bytree=float(raw["colsample_bytree"]),
-        reg_alpha=float(raw["reg_alpha"]),
-        reg_lambda=float(raw["reg_lambda"]),
-        min_split_gain=float(raw["min_split_gain"]),
+        boosting_type=str(source["boosting_type"]),
+        num_leaves=int(source["num_leaves"]),
+        max_depth=int(source["max_depth"]),
+        learning_rate=float(source["learning_rate"]),
+        n_estimators=int(source["n_estimators"]),
+        min_child_samples=int(source["min_child_samples"]),
+        min_child_weight=float(source["min_child_weight"]),
+        subsample=float(source["subsample"]),
+        subsample_freq=int(source["subsample_freq"]),
+        colsample_bytree=float(source["colsample_bytree"]),
+        reg_alpha=float(source["reg_alpha"]),
+        reg_lambda=float(source["reg_lambda"]),
+        min_split_gain=float(source["min_split_gain"]),
         deterministic=True,
         force_col_wise=True,
         n_jobs=1,
@@ -804,9 +851,83 @@ def _estimator(seed: int) -> lgb.LGBMClassifier:
         verbosity=-1,
     )
     params = model.get_params()
-    if params.get("device") != "cpu" or params.get("class_weight") is not None:
-        raise MetaTrainError("рецепт LightGBM змінився: очікувались device=cpu і порожній class_weight")
+    if params.get("device") != "cpu" or params.get("class_weight") is not None or params.get("n_jobs") != 1:
+        raise MetaTrainError("рецепт LightGBM змінився: очікувались device=cpu, n_jobs=1 і порожній class_weight")
     return model
+
+
+def _fit_search(
+    matrix: np.ndarray,
+    labels: np.ndarray,
+    weights: np.ndarray,
+    train: Sequence[_Joined],
+    *,
+    seed: int,
+    lgbm: Mapping[str, Any],
+    embargo_start_ms: int,
+) -> tuple[Any, int]:
+    """Навчити з ранньою зупинкою на хвості train і донавчити всі train-рядки з обраним числом дерев.
+
+    Хвіст — частина train до embargo. Тест і hold-out у `eval_set` не потрапляють. Якщо хвоста
+    не вистачає на `min_child_samples`, лишається верхня межа `n_estimators` без зупинки.
+    """
+    cap = int(lgbm["n_estimators"])
+    parts = _early_stop_split(train, embargo_start_ms, min_child=int(lgbm["min_child_samples"]))
+    if parts is None or len({int(item) for item in labels[parts[0]]}) < 2:
+        estimator = _estimator(seed, lgbm)
+        estimator.fit(matrix, labels, sample_weight=weights)
+        return estimator, cap
+    fit_idx, val_idx = parts
+    stopper = _estimator(seed, lgbm)
+    stopper.fit(
+        matrix[fit_idx],
+        labels[fit_idx],
+        sample_weight=weights[fit_idx],
+        eval_set=[(matrix[val_idx], labels[val_idx])],
+        eval_sample_weight=[weights[val_idx]],
+        callbacks=[
+            lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
+            lgb.log_evaluation(period=0),
+        ],
+    )
+    best = int(getattr(stopper, "best_iteration_", 0) or 0)
+    if best < 1 or best > cap:
+        best = cap
+    tuned = dict(lgbm)
+    tuned["n_estimators"] = best
+    refit = _estimator(seed, tuned)
+    refit.fit(matrix, labels, sample_weight=weights)
+    return refit, best
+
+
+def _early_stop_split(
+    train: Sequence[_Joined],
+    embargo_start_ms: int,
+    *,
+    min_child: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    count = len(train)
+    val_count = int(Decimal(count) * EARLY_STOP_FRACTION)
+    if val_count < 1 or count - val_count < min_child:
+        return None
+    val_start = count - val_count
+    first_val = train[val_start].candidate.row.time_ms
+    if first_val >= embargo_start_ms:
+        raise MetaTrainError("рання зупинка залізла в embargo")
+    fit: list[int] = []
+    for index in range(val_start):
+        row = train[index].candidate.row
+        sample = train[index].candidate.sample
+        if row.time_ms >= embargo_start_ms or sample is None:
+            raise MetaTrainError("рання зупинка бачить не train")
+        if sample.trade.exit_open_time_ms < first_val:
+            fit.append(index)
+    if len(fit) < min_child:
+        return None
+    for index in range(val_start, count):
+        if train[index].candidate.row.time_ms >= embargo_start_ms:
+            raise MetaTrainError("рання зупинка залізла в embargo")
+    return np.asarray(fit, dtype=np.int64), np.asarray(range(val_start, count), dtype=np.int64)
 
 
 def _probabilities(estimator: Any, matrix: np.ndarray) -> tuple[Decimal, ...]:

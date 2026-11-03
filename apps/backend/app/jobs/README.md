@@ -15,8 +15,6 @@
 (`app/data/collector.py`). Задачі йдуть по одній, тож і GPU-задачі (`device: cuda`, ТЗ §5.6) не паралеляться.
 `SKIP LOCKED` лишається захистом черги від подвійного взяття.
 
-> Заплановано: T2.10 — Optuna як `kind` цього ж воркера.
-
 ## Розділи ТЗ
 
 - ТЗ §5.6 — Optuna, навчання, `device: cpu | cuda`
@@ -31,7 +29,8 @@
 | `run_worker` | `worker.py` | цикл: зняти прострочені `RUNNING`, взяти одну `QUEUED`, виконати. Порожня черга або збій БД — пауза `POLL_INTERVAL_MS`; збій БД, коли зупинку вже запитано, — вихід без повтору |
 | `claim_next` | `worker.py` | `FOR UPDATE SKIP LOCKED`. Повертає `(задача, False)`, `(None, False)` якщо черга порожня, `(None, True)` якщо рядок уже записаний `FAILED` (`BAD_PARAMS`) і треба брати наступний без паузи |
 | `fail_stale_jobs` | `worker.py` | `RUNNING`, чий `heartbeat_at_ms` старіший за `STALE_AFTER_MS`, → `FAILED` / `STALE_HEARTBEAT`. Вік рівно поріг ще живий |
-| `handle_backfill`, `handle_derivatives`, `default_handlers` | `worker.py` | `backfill_candles` → `run_backfill_job`; `backfill_derivatives` → `run_derivatives_job`. Словник `handlers=` у `serve` / `run_worker` замінює цей набір, а не доповнює |
+| `handle_backfill`, `handle_derivatives`, `handle_optuna`, `default_handlers` | `worker.py` | `backfill_candles`, `backfill_derivatives`, `optuna_meta`. Словник `handlers=` у `serve` / `run_worker` замінює цей набір, а не доповнює |
+| `cancel_job` | `worker.py` | `QUEUED` або `RUNNING` → `CANCELED` (`error=CANCELED`). Фініш `DONE`/`FAILED` такий рядок уже не переписує |
 | `open_worker_market` | `worker.py` | публічний `BybitAdapter` режиму `demo` (mainnet без ключів) і `RateLimiter` з роллю `WORKER` |
 | `JobContext.report` | `worker.py` | прогрес `Decimal` у `[0, 1]` і `progress_message` (обрізається до 500 символів); разом оновлює heartbeat |
 | `lower_os_priority` | `worker.py` | POSIX `nice(+NICE_INCREMENT)`; Windows — `BELOW_NORMAL`. Немає прав — попередження в лог, процес працює далі |
@@ -44,7 +43,7 @@
 ## Стани та інваріанти
 
 `QUEUED` → `RUNNING` (у тій самій транзакції, що й `SKIP LOCKED`, до виклику обробника) → `DONE` або `FAILED`.
-`CANCELED` воркер сам не ставить. `RUNNING` має `started_at_ms` і `heartbeat_at_ms`. `finished_at_ms` заданий
+`CANCELED` ставить `cancel_job`, не цикл воркера. `RUNNING` має `started_at_ms` і `heartbeat_at_ms`. `finished_at_ms` заданий
 лише для `DONE` / `FAILED` / `CANCELED`.
 
 Пріоритет: менше число — раніше; за рівних — `created_at_ms`, потім `id`.
@@ -60,7 +59,7 @@ SIGINT під час очікування — код 0. Під час робот
 другий воркер не може стартувати, поки перший ще ходить до біржі. Задачу потім знімає прострочення heartbeat.
 
 `SIGTERM` / `SIGINT` повертають поточну задачу в `QUEUED` (очищають `started_at_ms` і `heartbeat_at_ms`).
-Backfill ідемпотентний, тож повтор безпечний. `kill -9` прибирання не робить: рядок лишається `RUNNING`, lock
+Backfill ідемпотентний, тож повтор безпечний. Optuna продовжує той самий рядок: `experiment_id` лишається в `params`; перервана спроба не пишеться, потік довчає лише поточний фолд, і процес завершується після нього. `kill -9` прибирання не робить: рядок лишається `RUNNING`, lock
 звільняється разом із сесією, і наступний старт ставить `FAILED`, щойно heartbeat стане старішим за 30 с.
 Якщо під час зупинки БД недоступна, процес однаково завершується з кодом 0 і БД більше не опитує; задача, яку не
 вдалося повернути в `QUEUED`, лишається `RUNNING` і так само стає `FAILED` за простроченим heartbeat.
@@ -71,7 +70,8 @@ Backfill ідемпотентний, тож повтор безпечний. `ki
 | --- | --- |
 | `STALE_HEARTBEAT` | `RUNNING` без свіжого heartbeat |
 | `UNKNOWN_KIND` | для `kind` немає обробника |
-| `BAD_PARAMS` | `params` — не JSON-об'єкт |
+| `BAD_PARAMS` | `params` — не JSON-об'єкт, або параметри `optuna_meta` не з контракту (`OptunaParamsError`) |
+| `CANCELED` | `cancel_job` зняв `QUEUED`/`RUNNING`. Heartbeat бачить це за ≤ 5 с і знімає обробник: перервана спроба Optuna в журнал не пишеться (результату ніхто не бачив), потік навчання довчає лише поточний фолд; наступна спроба не починається |
 | `BACKFILL_INCOMPLETE` | біржа відхилила частину символів свічок або деривативів; решту вже докачано (`result.failed_symbols`). Свічки: `candles_inserted`, `funding_inserted`. Деривативи: лічильники п'яти рядів |
 | `HANDLER_ERROR` | інший виняток обробника (`result.error_type` — лише ім'я класу) |
 
@@ -106,6 +106,7 @@ Backfill ідемпотентний, тож повтор безпечний. `ki
 
 - `tests/jobs/test_worker.py` — пріоритет ОС, ключ lock воркера і коди виходу, відсутність ключів у коді, публічний mainnet і роль `WORKER`; збій БД на першому проході, під час роботи (пауза й повтор) і під час зупинки (вихід без повтору).
 - `tests/jobs/test_worker_db.py` (`integration`) — два сеанси не беруть один рядок; прострочена `RUNNING`; backfill `DONE` / `BACKFILL_INCOMPLETE`; heartbeat і прогрес.
+- `tests/ml/test_optuna_job.py` (`integration`) — черга `optuna_meta`, `CANCELED`, продовження і `HANDLER_ERROR` без історії. Навчання і скасування посеред навчання — `tests/ml/test_optuna_study.py` (`slow`, потрібен libomp).
 - `tests/jobs/test_worker_process.py` (`integration` + `slow`) — другий воркер не стартує (код 10, задачу не бере); SIGTERM під час очікування lock — код 0; втрата lock — код 12, задача `RUNNING`; `kill -9` лишає `RUNNING`, наступний старт бере lock і ставить `FAILED`; SIGTERM повертає задачу в `QUEUED`.
 
 ## Стан реалізації
@@ -115,4 +116,4 @@ Backfill ідемпотентний, тож повтор безпечний. `ki
 | T0.4 | `[x]` | таблиця `jobs` |
 | T1.8 | `[x]` | процес воркера (один на БД, lock `WORKER_LOCK_ID`), `backfill_candles`, прострочений heartbeat |
 | T1.9 | `[x]` | той самий процес виконує `backfill_derivatives` (пріоритет 210, після свічок) |
-| T2.10 | `[ ]` | Optuna як задача воркера |
+| T2.10 | `[x]` | `optuna_meta` (пріоритет 300, після backfill), `cancel_job`, продовження тієї самої розбивки |

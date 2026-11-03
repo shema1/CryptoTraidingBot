@@ -38,7 +38,7 @@ from app.ml.backtest import BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial, HoldoutOpening, TrialInvalidation
 from app.ml.trade_sim import DirectSample, ExitReason, MetaSample, StopPriceSource
-from app.risk.numbers import FrozenModel, fixed_context
+from app.risk.numbers import FrozenModel, fixed_context, require_decimal
 
 # 90 і 180 діб — наближення «3 і 6 місяців» без прив'язки до календаря.
 DAY_MS: int = 24 * HOUR_MS
@@ -465,6 +465,75 @@ def validation_payload(split: ResearchSplit) -> dict[str, Any]:
             for fold in split.folds
         ],
     }
+
+
+def split_from_payload(payload: Mapping[str, Any]) -> ResearchSplit:
+    """Відновити ту саму розбивку зі збереженого `params.validation`.
+
+    Повторний `build_split` після догрузки свічок дав би інше вікно, і `record_trial` відхилив би
+    спробу як витік. Відновлена розбивка має збігтися зі збереженою.
+    """
+    if not isinstance(payload, Mapping):
+        raise SplitLeakError("розбивка експерименту не об'єкт")
+    try:
+        raw_folds = payload["folds"]
+        if type(raw_folds) is not list:
+            raise TypeError
+        split = ResearchSplit(
+            data_from_ms=_payload_int(payload["data_from_ms"]),
+            data_to_ms=_payload_int(payload["data_to_ms"]),
+            holdout_from_ms=_payload_int(payload["holdout_from_ms"]),
+            holdout_to_ms=_payload_int(payload["holdout_to_ms"]),
+            holdout_fraction=_payload_fraction(payload["holdout_fraction"]),
+            horizon_bars=_payload_int(payload["horizon_bars"]),
+            embargo_bars=_payload_int(payload["embargo_bars"]),
+            bar_ms=_payload_int(payload["bar_ms"]),
+            min_train_ms=_payload_int(payload["min_train_ms"]),
+            test_segment_ms=_payload_int(payload["test_segment_ms"]),
+            test_segment_extended_ms=_payload_int(payload["test_segment_extended_ms"]),
+            min_trades_per_fold=_payload_int(payload["min_trades_per_fold"]),
+            decision_end_ms=_payload_int(payload["decision_end_ms"]),
+            unused_from_ms=_payload_int(payload["unused_from_ms"]),
+            folds=tuple(_fold_from_payload(item) for item in raw_folds),
+        )
+    except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+        raise SplitLeakError("розбивка експерименту не читається") from exc
+    if validation_payload(split) != dict(payload):
+        raise SplitLeakError("розбивка експерименту не збігається зі збереженою")
+    return split
+
+
+def _payload_int(value: object) -> int:
+    if type(value) is not int or isinstance(value, bool):
+        raise TypeError
+    return value
+
+
+def _payload_fraction(value: object) -> Decimal:
+    if type(value) is not str:
+        raise TypeError
+    number = Decimal(value)
+    require_decimal("holdout_fraction", number)
+    return number
+
+
+def _fold_from_payload(value: object) -> Fold:
+    if not isinstance(value, Mapping):
+        raise TypeError
+    extended = value["extended"]
+    below = value["below_min_trades"]
+    if type(extended) is not bool or type(below) is not bool:
+        raise TypeError
+    return Fold(
+        index=_payload_int(value["index"]),
+        train_start_ms=_payload_int(value["train_start_ms"]),
+        embargo_start_ms=_payload_int(value["embargo_start_ms"]),
+        test_start_ms=_payload_int(value["test_start_ms"]),
+        test_end_ms=_payload_int(value["test_end_ms"]),
+        extended=extended,
+        n_trading_trades=_payload_int(value["n_trading_trades"]),
+        below_min_trades=below,
+    )
 
 
 async def create_experiment(

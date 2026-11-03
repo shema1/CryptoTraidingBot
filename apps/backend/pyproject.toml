@@ -28,6 +28,8 @@ dependencies = [
     "lightgbm>=4.5,<5",
     # LGBMClassifier вимагає scikit-learn; калібрування ймовірності — T2.9.
     "scikit-learn>=1.5,<2",
+    # Підбір гіперпараметрів LightGBM як задача воркера (app/ml/optuna_search.py, T2.10). Діапазони — ТЗ §5А.7.
+    "optuna>=4.1,<5",
 ]
 
 [dependency-groups]
@@ -155,6 +157,11 @@ ignore_missing_imports = true
 # scikit-learn без py.typed. Калібратор ізольований в app/ml/decision.py.
 [[tool.mypy.overrides]]
 module = ["sklearn", "sklearn.*"]
+ignore_missing_imports = true
+
+# Optuna без py.typed. Виклики ізольовані в app/ml/optuna_search.py (T2.10).
+[[tool.mypy.overrides]]
+module = ["optuna", "optuna.*"]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]

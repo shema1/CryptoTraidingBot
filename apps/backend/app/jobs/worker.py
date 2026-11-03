@@ -10,8 +10,10 @@
 
 Зависла `RUNNING` (heartbeat старіший за `STALE_AFTER_MS`) на старті і перед кожною спробою взяти задачу
 стає `FAILED` (`STALE_HEARTBEAT`). Так рядок звільняє `dedup_key`, і наступний прохід backfill ставить
-нову задачу. `SIGTERM` повертає поточну задачу в `QUEUED` (backfill ідемпотентний). `kill -9` і втрата lock
-цього не роблять: рядок лишається `RUNNING`, доки heartbeat не прострочиться.
+нову задачу. `SIGTERM` повертає поточну задачу в `QUEUED` (backfill ідемпотентний; Optuna продовжує той самий
+рядок, бо `experiment_id` лишається в параметрах). `kill -9` і втрата lock цього не роблять:
+рядок лишається `RUNNING`, доки heartbeat не прострочиться. Скасування людиною ставить `CANCELED`
+(`cancel_job`): фініш `DONE`/`FAILED` такий рядок уже не переписує.
 
 Публічні свічки воркер читає з mainnet (режим `demo`: той самий публічний хост, що й live, без ключів).
 Testnet для історії навчання не використовується.
@@ -84,6 +86,7 @@ ERROR_UNKNOWN_KIND: Final = "UNKNOWN_KIND"
 ERROR_BACKFILL_INCOMPLETE: Final = "BACKFILL_INCOMPLETE"
 ERROR_HANDLER: Final = "HANDLER_ERROR"
 ERROR_BAD_PARAMS: Final = "BAD_PARAMS"
+ERROR_CANCELED: Final = "CANCELED"
 PROGRESS_MESSAGE_MAX_LEN: Final = 500
 
 # Коди виходу — ті самі числа, що в торгового процесу (`app/__main__.py`).
@@ -215,8 +218,80 @@ async def handle_derivatives(ctx: JobContext) -> dict[str, int]:
     return stats.as_dict()
 
 
+async def handle_optuna(ctx: JobContext) -> dict[str, Any]:
+    """`optuna_meta`. Довгий пошук іде по одній спробі; `CANCELED` знімає обробник, перервана спроба не пишеться.
+
+    Дані читає `load_optuna_inputs` короткою транзакцією; розбивка рахується в потоці.
+    Імпорт навмисно тут: модуль пошуку не тягне LightGBM, а саме навчання підвантажується лише
+    коли задача справді пішла. Помилка параметрів — `OptunaParamsError` (`BAD_PARAMS`).
+    """
+    from app.ml.optuna_search import load_optuna_inputs, parse_optuna_job, remember_experiment, run_optuna_study
+    from app.risk.limits import RiskLimits
+
+    request = parse_optuna_job(ctx.params)
+    prepared = await load_optuna_inputs(ctx.sessions, request)
+
+    async def remember(session: AsyncSession, experiment_id: str) -> None:
+        await remember_experiment(session, ctx.job_id, experiment_id)
+
+    async def should_stop() -> bool:
+        async with ctx.sessions() as session, session.begin():
+            job = await session.get(Job, ctx.job_id)
+            return job is None or job.status != "RUNNING"
+
+    async def on_progress(done: int, total: int) -> None:
+        try:
+            await ctx.report(Decimal(done) / Decimal(total), f"{done}/{total}")
+        except JobLost:
+            return
+
+    result = await run_optuna_study(
+        ctx.sessions,
+        prepared.histories,
+        spec=request.strategy,
+        split=prepared.split,
+        trading_symbol=request.trading_symbol,
+        limits=RiskLimits(
+            min_equity_usd=request.min_equity_usd,
+            max_notional_per_symbol_usd=request.max_notional_per_symbol_usd,
+        ),
+        initial_equity=request.initial_equity,
+        maintenance_margin_rate=request.maintenance_margin_rate,
+        seed=request.seed,
+        n_trials=request.n_trials,
+        feature_data=prepared.feature_data,
+        experiment_id=request.experiment_id,
+        on_created=remember,
+        should_stop=should_stop,
+        on_progress=on_progress,
+    )
+    return result.as_dict()
+
+
 def default_handlers() -> dict[str, JobHandler]:
-    return {JOB_KIND_BACKFILL: handle_backfill, JOB_KIND_DERIVATIVES: handle_derivatives}
+    from app.ml.optuna_search import JOB_KIND_OPTUNA
+
+    return {
+        JOB_KIND_BACKFILL: handle_backfill,
+        JOB_KIND_DERIVATIVES: handle_derivatives,
+        JOB_KIND_OPTUNA: handle_optuna,
+    }
+
+
+async def cancel_job(session: AsyncSession, job_id: uuid.UUID) -> bool:
+    """`QUEUED` або `RUNNING` → `CANCELED`. Термінальний рядок не чіпає. Викликати в транзакції.
+
+    Heartbeat бачить зміну за ≤ `HEARTBEAT_INTERVAL_MS` і знімає обробник. Перервана спроба Optuna в журнал
+    не пишеться (її результату ніхто не бачив), потік навчання довчає лише поточний фолд. Наступна
+    не починається: фініш воркера змінює лише рядок у `RUNNING`.
+    """
+    result = await session.execute(
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(("QUEUED", "RUNNING")))
+        .values(status="CANCELED", error=ERROR_CANCELED, finished_at_ms=now_ms())
+        .returning(Job.id)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 _DERIVATIVE_METHODS: Final = (
@@ -689,6 +764,23 @@ async def _finish_exc(sessions: SessionFactory, claimed: ClaimedJob, exc: BaseEx
         return
     if isinstance(exc, JobLost):
         _LOG.warning("job_finish_skipped", job_id=str(claimed.id), kind=claimed.kind, status="RUNNING")
+        return
+    from app.ml.optuna_search import OptunaParamsError
+
+    if isinstance(exc, OptunaParamsError):
+        _LOG.error(
+            "job_failed",
+            job_id=str(claimed.id),
+            kind=claimed.kind,
+            error=ERROR_BAD_PARAMS,
+            error_type="OptunaParamsError",
+        )
+        await _finish_failed(
+            sessions,
+            claimed.id,
+            error=ERROR_BAD_PARAMS,
+            result={"error_type": "OptunaParamsError"},
+        )
         return
     if not isinstance(exc, Exception):
         raise exc
