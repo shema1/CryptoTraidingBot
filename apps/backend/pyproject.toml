@@ -152,6 +152,11 @@ ignore_missing_imports = true
 module = ["lightgbm", "lightgbm.*"]
 ignore_missing_imports = true
 
+# scikit-learn без py.typed. Калібратор ізольований в app/ml/decision.py.
+[[tool.mypy.overrides]]
+module = ["sklearn", "sklearn.*"]
+ignore_missing_imports = true
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true

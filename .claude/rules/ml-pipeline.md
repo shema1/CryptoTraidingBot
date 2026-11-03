@@ -46,7 +46,9 @@ paths:
 - Метрики — після витрат. Accuracy не є метрикою якості. Підозрілі результати (PF/Sharpe > 3, accuracy > 80%) — баг, а не успіх. Перемішані мітки → `probability_gap` на OOS близько 0 (не доларовий PnL фільтра).
 
 ## Правило входу
-- `EV = p·TP_net − (1−p)·SL_net` з каліброваною `p`; time-stop = повний SL. Вхід лише при `EV ≥ min_edge` і `p ≥ min_confidence`. Пороги — лише з walk-forward, фіксуються в `model_metadata.decision_rule`.
+- `ml/decision.py`. `EV = p·TP_net − (1−p)·SL_net`; `TP_net` / `SL_net` — `PriceExecution.tp_net_per_unit` і `loss_per_unit`. Край — EV / ATR. Time-stop = повний SL, не `net_per_unit` time-stop; funding у формулу не входить. Горизонт край не змінює.
+- Вхід лише при каліброваній `p ≥ min_confidence` і краї `≥ min_edge_atr` (`judge_entry`, обидві межі включно). Дефолт `0.10` ATR і `0.40`. Live викликає `decide_entry`, не `keep`.
+- Калібратор — isotonic або Platt лише на розмічених OOS (`rows_for(CALIBRATION/THRESHOLDS)` + `reject_holdout`). Імовірність — з моделі фолду, в чиєму тесті лежить рядок. Метод і пороги — на out-of-fold імовірностях (кожен фолд калібрується іншими); фінальний калібратор для live донавчається після вибору. `true_label is None` не входить і не стає 0. Нічия Brier — Platt. Сітка порогів фіксована; критерій — медіана суми реалізованого краю фолдів (`median_fold_edge_atr`), не бектест із лімітами. Пороги фіксуються в `model_metadata.decision_rule` (`DecisionRule.metadata()`, рядки Decimal).
 
 ## Артефакти і відтворюваність
 - `models/<model_version>/` = файл моделі + `model_metadata.json` (схема ТЗ §5.4), генерується лише пайплайном.

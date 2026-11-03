@@ -6,8 +6,9 @@
 класифікатора не вмикається, інакше баланс врахувався б двічі.
 
 Кожен фолд учиться лише на своєму train. Фічі цього фолду рахуються з покриттям train
-(`train_coverage_ms`). Мітка у вектор не входить. Поріг до калібрування (T2.9) — `META_MIN_PROBABILITY`.
+(`train_coverage_ms`). Мітка у вектор не входить. Поріг до калібрування — `META_MIN_PROBABILITY`.
 Тестовий кандидат оцінюється й без мітки: дірка в шляху після входу — це майбутнє, і фільтр її не знає.
+Калібрування цих імовірностей і поріг live — `decision.py`, не `keep`.
 Метрики — `run_backtest` на відфільтрованих `EntrySignal`, тим самим вікном, що правило без фільтра.
 Стрес (`cost_factor=2`) лишається на об'єкті прогону і в журнал окремою спробою не пишеться.
 
@@ -134,7 +135,10 @@ def meta_recipe(*, shuffled_labels: bool, min_probability: Decimal) -> dict[str,
 
 
 def keep(probability: Decimal, *, min_probability: Decimal = META_MIN_PROBABILITY) -> bool:
-    """Чи залишити кандидата. Поріг імовірності TP до калібрування; live-поріг EV ставитиме T2.9."""
+    """Чи залишити кандидата. Поріг імовірності TP до калібрування.
+
+    Live-вхід — `decide_entry` у `decision.py`: калібрована ймовірність і край в ATR, не цей поріг.
+    """
     require_decimal("probability", probability)
     _probability_threshold(min_probability)
     if probability < 0 or probability > 1:
