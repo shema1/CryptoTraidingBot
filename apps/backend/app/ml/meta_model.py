@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -30,8 +30,18 @@ import lightgbm as lgb
 import numpy as np
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import get_logger
 from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestReport, EntrySignal
+from app.ml.decision import (
+    ENTER,
+    ENTRY_EVALUATION,
+    CalibrationError,
+    DecisionFit,
+    OosObservation,
+    decide_entry,
+    fit_decision,
+)
 from app.ml.features import (
     HOUR_MS,
     CandleBar,
@@ -52,7 +62,7 @@ from app.ml.strategy import (
     primary_candidates,
     primary_signals,
 )
-from app.ml.trade_sim import MetaSample, TargetParams, label_meta, label_span, sample_weights
+from app.ml.trade_sim import MetaSample, NoAtr, TargetParams, atr_before_entry, label_meta, label_span, sample_weights
 from app.ml.validation import (
     Fold,
     FoldRecord,
@@ -79,6 +89,8 @@ from app.ml.validation import (
 from app.risk.costs import CostModel
 from app.risk.limits import RiskLimits
 from app.risk.numbers import FrozenModel, require_decimal
+
+_LOG = get_logger("app.ml.meta_model")
 
 # До правила EV (T2.9). 0.5 — стандартний поріг бінарного класифікатора, не підібраний на історії.
 META_MIN_PROBABILITY: Decimal = Decimal("0.5")
@@ -244,6 +256,11 @@ class MetaRun:
     folds: tuple[MetaFold, ...]
     # `None` — `lgbm_journal_params`. Інакше перевірена точка пошуку, не сирий словник викликача.
     lgbm: Mapping[str, Any] | None = None
+    # Налаштування бектесту навчання: перехресна оцінка правила входу перераховує фолди з тими самими.
+    backtest: _Backtest | None = None
+    # Правило входу кожного фолду, підігнане на інших фолдах (`cross_fold_entry`, рішення 0020).
+    # Порожньо — угоди фолдів відібрані `keep(min_probability)`, і G1 таку спробу meta не пропустить.
+    entry_rules: tuple[DecisionFit, ...] = ()
 
     @property
     def filtered_total_net(self) -> Decimal:
@@ -296,6 +313,16 @@ class MetaRun:
             "n_unscored_signals": [fold.n_unscored_signals for fold in self.folds],
             "beats_unfiltered": self.beats_unfiltered,
         }
+        if self.entry_rules:
+            # Імпорт усередині: `artifacts` імпортує цей модуль. sha256 — той самий канонічний текст калібратора,
+            # що в `params.decision`: правило кожного фолду відтворюване з журналу (рішення 0020).
+            from app.ml.artifacts import decision_payload
+
+            params["entry_evaluation"] = ENTRY_EVALUATION
+            params["entry_rules"] = [
+                {"fold_index": fold.fold_index, "method": fit.method, **decision_payload(fit.rule, fit.calibrator)}
+                for fold, fit in zip(self.folds, self.entry_rules, strict=True)
+            ]
         return params
 
 
@@ -306,6 +333,10 @@ class MetaExperiment:
     experiment_id: str
     trial: RecordedTrial
     run: MetaRun
+    # Правило входу і калібратор (T2.12). `None` — не вдалось підігнати: причина в `decision_error`,
+    # і спроба G1 без `params.decision` допуском не стане.
+    decision: DecisionFit | None = None
+    decision_error: str | None = None
 
 
 def probability_gap(scored: Sequence[ScoredRow]) -> Decimal | None:
@@ -422,6 +453,7 @@ def train_meta(
         min_probability=min_probability,
         folds=tuple(done),
         lgbm=checked,
+        backtest=common,
     )
 
 
@@ -595,7 +627,13 @@ async def run_meta_experiment(
 ) -> MetaExperiment:
     """Створити експеримент `label_type=meta`, навчити і записати одну спробу.
 
-    Невдале навчання теж записується (`FAILED`, порожній префікс фолдів) і збільшує N лінії.
+    Пише в сесію викликача і не комітить. Викликач комітить і після винятку: інакше спроба `FAILED`
+    (модель навчена) зникне з журналу разом з rollback. `run_iteration_one` так і робить.
+
+    Невдале навчання теж записується (`FAILED`, порожній префікс фолдів) і збільшує N лінії. Так само
+    `FAILED` (`failed_at = "entry_rule"`) — збій після навчання: модель навчена, отже це спроба.
+    Спроба `COMPLETE` несе правило входу і схему фіч рецепта (`g1_recipe_fields`, рішення 0019) або
+    `decision_error`, якщо правило не підганяється (тоді допуск її відхилить).
     `primary_strategy` — `StrategySpec.metadata()` цього правила, не словник вибору з T2.7.
     """
     recipe = meta_recipe(shuffled_labels=shuffled_labels, min_probability=min_probability)
@@ -645,15 +683,277 @@ async def run_meta_experiment(
         )
         exc.experiment_id = experiment_id
         raise
+    # Правило входу і схема фіч — частина рецепта спроби G1 (T2.11, рішення 0019). Без них допуск відмовить.
+    # Модель уже навчена: будь-який збій далі (витік у вибірці порогу, рядок без свічки входу) — теж
+    # спроба. Вона пишеться як `FAILED` і збільшує N, інакше збій ховав би множинне тестування.
+    entry_costs = costs if costs is not None else CostModel()
+    try:
+        recipe_run = await asyncio.to_thread(
+            recipe_trial,
+            run,
+            histories,
+            split=split,
+            costs=entry_costs,
+            params=target,
+        )
+    except Exception as exc:
+        _LOG.error(
+            "meta_entry_rule_failed",
+            experiment_id=experiment_id,
+            symbol=trading_symbol,
+            strategy=spec.name,
+            error=type(exc).__name__,
+        )
+        await record_trial(
+            session,
+            experiment_id=experiment_id,
+            split=split,
+            state="FAILED",
+            params=entry_rule_failure({**recipe, "role": "meta", "strategy": spec.metadata()}, exc),
+            folds=(),
+        )
+        exc.add_note(f"experiment_id={experiment_id}")
+        raise
     trial = await record_trial(
         session,
         experiment_id=experiment_id,
         split=split,
         state="COMPLETE",
-        params=run.trial_params(),
-        folds=run.records,
+        params=recipe_run.params,
+        folds=recipe_run.run.records,
     )
-    return MetaExperiment(experiment_id=experiment_id, trial=trial, run=run)
+    return MetaExperiment(
+        experiment_id=experiment_id,
+        trial=trial,
+        run=recipe_run.run,
+        decision=recipe_run.decision,
+        decision_error=recipe_run.decision_error,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeTrial:
+    """Що пише COMPLETE-спроба meta: прогін, `params` і правило входу рецепта (рішення 0019, 0020).
+
+    `run` — фолди, оцінені перехресно правилом входу (`cross_fold_entry`), або прогін `keep`, якщо
+    правило не підганяється: тоді `decision` — `None`, причина в `decision_error`, і G1 спробу не пропустить.
+    """
+
+    run: MetaRun
+    params: dict[str, Any]
+    decision: DecisionFit | None
+    decision_error: str | None
+
+
+def recipe_trial(
+    run: MetaRun,
+    histories: Sequence[SymbolHistory],
+    *,
+    split: ResearchSplit,
+    costs: CostModel,
+    params: TargetParams,
+) -> RecipeTrial:
+    """Спроба G1 з правилом входу рецепта: рецепт для live і чесна оцінка того самого правила.
+
+    1. `fit_entry_rule` — калібратор і поріг на OOF-рядках усіх фолдів: це правило йде в `params.decision`,
+       модель допуску і live.
+    2. `cross_fold_entry` — те саме правило, але для фолду k підігнане на інших фолдах, перераховує угоди
+       кожного фолду. Їх і читає G1: поріг, обраний на угодах фолду, завищив би його результат.
+    Не підганяється (немає розмічених рядків, менше трьох фолдів, немає ATR) — `decision_error` і прогін
+    `keep` без позначки `entry_evaluation`: G1 відмовить (`G1_ENTRY_RULE`), допуск теж. Будь-який інший
+    виняток — збій після навчання: викликач пише спробу `FAILED` (`entry_rule_failure`) і прокидає його.
+    Спільне для `run_meta_experiment` і Optuna (T2.12). Синхронна: з event loop — `asyncio.to_thread`.
+    """
+    common = run.backtest
+    if common is not None:
+        # Правило рецепта і правила фолдів G1 — з тими самими витратами й таргетом, що бектест навчання.
+        if costs != common.costs:
+            raise ValueError("витрати правила входу не ті, що в навчанні")
+        if params != common.params:
+            raise ValueError("таргет правила входу не той, що в навчанні")
+    fit, error = fit_entry_rule(run, histories, split=split, costs=costs, params=params)
+    if fit is None:
+        return _without_rule(run, error)
+    try:
+        evaluated = cross_fold_entry(run, histories)
+    except (CalibrationError, NoAtr) as exc:
+        return _without_rule(run, f"перехресна оцінка правила входу: {exc}")
+    trial_params = evaluated.trial_params()
+    trial_params.update(g1_recipe_fields(evaluated, fit))
+    return RecipeTrial(run=evaluated, params=trial_params, decision=fit, decision_error=None)
+
+
+def _without_rule(run: MetaRun, error: str | None) -> RecipeTrial:
+    if not error:
+        raise RuntimeError("правило входу не підігнано, а причини немає")
+    trial_params = run.trial_params()
+    trial_params["decision_error"] = error
+    return RecipeTrial(run=run, params=trial_params, decision=None, decision_error=error)
+
+
+def cross_fold_entry(run: MetaRun, histories: Sequence[SymbolHistory]) -> MetaRun:
+    """Угоди кожного фолду за правилом входу рецепта, підігнаним без цього фолду (рішення 0020).
+
+    Для фолду k калібратор і поріг — `fit_decision` на OOF-рядках інших фолдів; кандидат фолду k
+    береться, якщо `decide_entry` каже `ENTER` (та сама функція, що в live). Мітки фолду k у правило
+    не входять. Далі — ті самі звіти, що в `train_meta`: відфільтровані угоди кожного символу і стрес
+    на прийнятих сигналах; обидва правила без фільтра від рішення не залежать і лишаються як були.
+    Калібрування на решті потребує щонайменше двох фолдів, тож фолдів — щонайменше три
+    (інакше `CalibrationError`). Бектест — з налаштувань навчання (`MetaRun.backtest`).
+    """
+    common = run.backtest
+    if common is None:
+        raise ValueError("прогін без налаштувань бектесту: перехресну оцінку рахує лише прогін train_meta")
+    if run.entry_rules:
+        raise ValueError("прогін уже оцінено правилом входу")
+    books = _books(histories, run.trading_symbol)
+    trading = _history(books, run.trading_symbol)
+    by_index = {fold.index: fold for fold in run.split.folds}
+    rows = decision_observations(run, histories)
+    evaluated: list[MetaFold] = []
+    rules: list[DecisionFit] = []
+    for fold in run.folds:
+        pool = tuple(row for row in rows if row.fold_index != fold.fold_index)
+        fit = fit_decision(pool, run.split, costs=common.costs, params=common.params)
+        own = {(row.symbol, row.time_ms): row for row in rows if row.fold_index == fold.fold_index}
+        scored = tuple(
+            row.model_copy(update={"taken": _enters(own[(row.symbol, row.time_ms)], fit, common)})
+            for row in fold.scored
+        )
+        window = by_index[fold.fold_index]
+        reports = tuple(
+            _window(
+                history,
+                _scored_signals(
+                    history,
+                    _fold_signals(history, run.spec, run.split, window, common.seed),
+                    scored,
+                    taken_only=True,
+                ),
+                run.split,
+                window,
+                common,
+            )
+            for history in books
+        )
+        taken = _scored_signals(
+            trading,
+            _fold_signals(trading, run.spec, run.split, window, common.seed),
+            scored,
+            taken_only=True,
+        )
+        stress = _window(trading, taken, run.split, window, common, cost_factor=_STRESS_COST)
+        before = fold.record.meta
+        if before is None:
+            raise RuntimeError("фолд meta без звітів правила")
+        runs = MetaFoldRuns(unfiltered=before.unfiltered, scored_unfiltered=before.scored_unfiltered, stress=stress)
+        record = FoldRecord(
+            reports=reports,
+            train_labels=fold.record.train_labels,
+            test_labels=fold.record.test_labels,
+        ).model_copy(update={"meta": runs})
+        evaluated.append(
+            replace(
+                fold,
+                scored=scored,
+                record=record,
+                stress=fold_outcome_from_report(stress, below_min_trades=window.below_min_trades),
+            )
+        )
+        rules.append(fit)
+    return replace(run, folds=tuple(evaluated), entry_rules=tuple(rules))
+
+
+def _enters(row: OosObservation, fit: DecisionFit, common: _Backtest) -> bool:
+    verdict = decide_entry(
+        raw_probability=row.raw_probability,
+        side=row.side,
+        entry=row.entry,
+        atr=row.atr,
+        costs=common.costs,
+        params=common.params,
+        calibrator=fit.calibrator,
+        rule=fit.rule,
+    )
+    return verdict.decision == ENTER
+
+
+def entry_rule_failure(params: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
+    """`params` спроби `FAILED`, коли модель навчена, а правило входу чи поля рецепта впали."""
+    failed = dict(params)
+    failed["failed_at"] = "entry_rule"
+    failed["error"] = f"{type(exc).__name__}: {exc}"
+    return failed
+
+
+def decision_observations(run: MetaRun, histories: Sequence[SymbolHistory]) -> tuple[OosObservation, ...]:
+    """Out-of-sample рядки всіх фолдів для калібрування і порогу входу (T2.9, T2.12).
+
+    Ціна входу — `open` свічки `entry_index` ряду символу, ATR — ATR(t−1) того самого ряду
+    (`atr_before_entry`). Hold-out сюди не потрапляє: `scored` містить лише тестові кандидати фолдів.
+    Рядок без свічки входу або ATR — помилка, а не пропуск: інакше поріг бачив би іншу вибірку.
+    """
+    by_symbol = {history.symbol: history for history in histories}
+    rows: list[OosObservation] = []
+    for fold in run.folds:
+        for scored in fold.scored:
+            history = by_symbol.get(scored.symbol)
+            if history is None:
+                raise ValueError(f"немає історії символу {scored.symbol} для рядка фолду {fold.fold_index}")
+            entry = history.candles[scored.entry_index]
+            if entry.open_time_ms != scored.time_ms:
+                raise RuntimeError("рядок не збігається зі свічкою входу")
+            rows.append(
+                OosObservation(
+                    symbol=scored.symbol,
+                    time_ms=scored.time_ms,
+                    index=scored.entry_index,
+                    fold_index=fold.fold_index,
+                    side=scored.side,
+                    raw_probability=scored.probability,
+                    true_label=scored.true_label,
+                    entry=entry.open,
+                    atr=atr_before_entry(history.candles, scored.entry_index),
+                )
+            )
+    return tuple(rows)
+
+
+def fit_entry_rule(
+    run: MetaRun,
+    histories: Sequence[SymbolHistory],
+    *,
+    split: ResearchSplit,
+    costs: CostModel,
+    params: TargetParams,
+) -> tuple[DecisionFit | None, str | None]:
+    """Калібратор і поріг на out-of-fold рядках. Немає розмічених рядків або ATR — `(None, причина)`.
+
+    Витоки (hold-out у вибірці, чужий фолд) не ковтаються: `SplitLeakError` летить далі.
+    """
+    try:
+        rows = decision_observations(run, histories)
+        return fit_decision(rows, split, costs=costs, params=params), None
+    except (CalibrationError, NoAtr) as exc:
+        return None, str(exc)
+
+
+def g1_recipe_fields(run: MetaRun, fit: DecisionFit) -> dict[str, Any]:
+    """Поля рецепта G1 у `params` спроби: правило входу і схема фіч (рішення 0019).
+
+    Схема рецепта — схема останнього фолду: його train має найбільше покриття деривативів. Допуск
+    порівнює з нею схему свого навчання; різниця — відмова, а не тихий пропуск. Імпорт усередині:
+    `artifacts` імпортує цей модуль.
+    """
+    from app.ml.artifacts import decision_payload
+
+    if not run.folds:
+        raise ValueError("немає фолдів, з яких береться схема рецепта")
+    return {
+        "decision": decision_payload(fit.rule, fit.calibrator),
+        "feature_schema_hash": run.folds[-1].model.schema_hash,
+        "feature_schema_hashes": [fold.model.schema_hash for fold in run.folds],
+    }
 
 
 @dataclass(frozen=True, slots=True)

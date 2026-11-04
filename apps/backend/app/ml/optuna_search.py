@@ -560,7 +560,14 @@ async def run_optuna_study(
     `trial_bounds` звужує бюджет лише для тестів. Задача воркера його не передає, тож лишається 100–200.
     `sampler` і `pruner` теж для тестів: задача бере TPE із seed і медіанний pruner.
     """
-    from app.ml.meta_model import META_MIN_PROBABILITY, MetaRun, MetaTrainError, train_meta
+    from app.ml.meta_model import (
+        META_MIN_PROBABILITY,
+        MetaRun,
+        MetaTrainError,
+        entry_rule_failure,
+        recipe_trial,
+        train_meta,
+    )
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     _budget(n_trials, trial_bounds)
@@ -671,6 +678,37 @@ async def run_optuna_study(
                 )
                 study.tell(trial, state=TrialState.PRUNED)
             else:
+                # Правило входу і схема фіч — рецепт спроби G1, як у `run_meta_experiment` (рішення 0019).
+                # Збій тут — помилка конвеєра після навчання: спроба `FAILED` у журнал, задача зупиняється.
+                try:
+                    recipe_run = await asyncio.to_thread(
+                        recipe_trial,
+                        run,
+                        books,
+                        split=split,
+                        costs=model_costs,
+                        params=target,
+                    )
+                except Exception as exc:
+                    _LOG.error(
+                        "optuna_entry_rule_failed",
+                        experiment_id=created,
+                        number=expected,
+                        error=type(exc).__name__,
+                    )
+                    await _write_trial(
+                        sessions,
+                        experiment_id=created,
+                        split=split,
+                        state="FAILED",
+                        number=expected,
+                        value=None,
+                        steps=steps,
+                        params=entry_rule_failure(run.trial_params(), exc),
+                        folds=(),
+                    )
+                    exc.add_note(f"experiment_id={created}")
+                    raise
                 score = steps[-1]
                 await _write_trial(
                     sessions,
@@ -680,8 +718,8 @@ async def run_optuna_study(
                     number=expected,
                     value=score,
                     steps=steps,
-                    params=run.trial_params(),
-                    folds=run.records,
+                    params=recipe_run.params,
+                    folds=recipe_run.run.records,
                 )
                 study.tell(trial, values=float(score))
         recorded += 1

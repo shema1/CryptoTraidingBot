@@ -1,0 +1,208 @@
+"""Дослідницький цикл моделі, ітерація 1 (ТЗ §5А.3 п. 2–10, §5А.11 п. 1; T2.12).
+
+Порядок: бейзлайни й кандидати на walk-forward → вибір 1–2 правил (`select_primary`) → по одному
+meta-експерименту на правило → перегляд Gate G1 без запису. Кожна спроба — у журналі лінії, тож
+N для DSR росте з кожним кроком.
+
+Цикл hold-out не відкриває ніколи. Він повертає перегляди, а рішення відкрити hold-out приймає
+людина окремим викликом `open_holdout_after_gate` (§5А.10, крок 2). Ітерація 2 (пряме 3-класове
+прогнозування) цим модулем не покривається — див. T2.13.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from decimal import Decimal
+
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.core.logging import get_logger
+from app.ml.features import SymbolData
+from app.ml.meta_model import MetaExperiment, run_meta_experiment
+from app.ml.statistics import G1Preview, GateThresholds, preview_gate_g1
+from app.ml.strategy import (
+    PrimarySelection,
+    StrategySpec,
+    SymbolHistory,
+    compare_strategies,
+    record_strategy_comparison,
+    select_primary,
+)
+from app.ml.trade_sim import TargetParams
+from app.ml.validation import RecordedTrial, ResearchSplit, costs_payload, create_experiment, target_payload
+from app.risk.costs import CostModel
+from app.risk.limits import RiskLimits
+
+SessionFactory = async_sessionmaker[AsyncSession]
+
+_LOG = get_logger("app.ml.research_cycle")
+
+# Наступний крок, якщо жодне правило не пройшло перегляд G1 (§5А.11 п. 2).
+ITERATION_TWO = "iteration_two"
+# Хоча б одне правило пройшло перегляд. Відкриває hold-out лише людина (`open_holdout_after_gate`).
+WAIT_FOR_HUMAN_HOLDOUT = "wait_for_human_holdout"
+
+
+@dataclass(frozen=True, slots=True)
+class RuleResult:
+    """Перегляд G1 одного обраного правила. `passed` — лише про перегляд, не про відкриття.
+
+    `passed` вимагає порогів ТЗ (без `preview.loosened`) і підігнаного правила входу: інакше відкриття
+    hold-out не може дати `CANDIDATE`, і його не варто витрачати.
+    """
+
+    spec_name: str
+    experiment_id: str
+    trial_id: int
+    decision_error: str | None
+    preview: G1Preview
+
+    @property
+    def passed(self) -> bool:
+        return (
+            self.decision_error is None
+            and self.preview.decision.passed
+            and not self.preview.loosened
+            and self.preview.dsr is not None
+            and self.preview.pbo is not None
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class IterationOneReport:
+    selection: PrimarySelection
+    comparison_trials: tuple[RecordedTrial, ...]
+    rules: tuple[RuleResult, ...]
+    next_step: str
+    # Цикл hold-out не відкриває. Поле фіксує це в звіті, а не лише в документації.
+    hold_out_opened: bool = False
+
+
+def iteration_one_verdict(passed: Sequence[bool]) -> str:
+    """Що далі після перегляду G1 обраних правил. Жодного відкриття тут не відбувається."""
+    return WAIT_FOR_HUMAN_HOLDOUT if any(passed) else ITERATION_TWO
+
+
+async def run_iteration_one(
+    sessions: SessionFactory,
+    histories: Sequence[SymbolHistory],
+    *,
+    split: ResearchSplit,
+    trading_symbol: str,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    costs: CostModel | None = None,
+    params: TargetParams | None = None,
+    feature_data: Mapping[str, SymbolData] | None = None,
+    thresholds: GateThresholds | None = None,
+) -> IterationOneReport:
+    """Ітерація 1 на вже завантаженій розбивці. Завантаження історій — окремий крок (`load_optuna_inputs`).
+
+    Порівняння каталогу йде на тих самих фолдах, що й meta-експерименти: один `split`, один `seed`.
+    Вибір `select_primary` — лише за OOS walk-forward, до будь-якого навчання meta-моделі.
+    `sessions` — фабрика сесій: каталог і кожен meta-експеримент комітяться окремо, спроба `FAILED` —
+    ще до прокидання винятку. Так журнал має кожну спробу, навіть якщо цикл упав посередині.
+    Перегляди G1 — лише після запису спроб усіх обраних правил: кожен бачить повне N лінії і всіх
+    суперників у PBO, як потім побачить `open_holdout_after_gate`.
+    Таргет і витрати визначаються один раз (без явних — горизонт розбивки і `CostModel()`, як у
+    `run_meta_experiment`) і йдуть і в порівняння каталогу, і в meta-експерименти, і в журнал каталогу.
+    """
+    target = params if params is not None else TargetParams(horizon_bars=split.horizon_bars)
+    cost_model = costs if costs is not None else CostModel()
+    comparison = await asyncio.to_thread(
+        compare_strategies,
+        histories,
+        split=split,
+        trading_symbol=trading_symbol,
+        limits=limits,
+        initial_equity=initial_equity,
+        maintenance_margin_rate=maintenance_margin_rate,
+        seed=seed,
+        costs=cost_model,
+        params=target,
+    )
+    selection = select_primary(comparison)
+    # Кожен крок — окрема транзакція, як спроби Optuna: те, що людина побачить у перегляді, уже в журналі,
+    # і rollback викликача не стирає спроб (N для DSR не занижується).
+    async with sessions() as session, session.begin():
+        comparison_experiment = await create_experiment(
+            session,
+            split=split,
+            research_line=trading_symbol,
+            symbols=tuple(history.symbol for history in histories),
+            label_type="meta",
+            primary_strategy=selection.metadata(),
+            params={"stage": "primary_strategy", "target": target_payload(target), "costs": costs_payload(cost_model)},
+            seed=seed,
+        )
+        comparison_trials = await record_strategy_comparison(
+            session,
+            experiment_id=comparison_experiment,
+            comparison=comparison,
+        )
+    # Спершу всі спроби, потім перегляди: інакше перше правило бачило б менше N і не мало б суперника в PBO,
+    # а людина — оптимістичніший перегляд, ніж порахує саме відкриття.
+    recorded: list[tuple[StrategySpec, MetaExperiment]] = []
+    for spec in selection.chosen:
+        async with sessions() as session:
+            try:
+                meta = await run_meta_experiment(
+                    session,
+                    histories,
+                    spec=spec,
+                    split=split,
+                    trading_symbol=trading_symbol,
+                    limits=limits,
+                    initial_equity=initial_equity,
+                    maintenance_margin_rate=maintenance_margin_rate,
+                    seed=seed,
+                    costs=cost_model,
+                    params=target,
+                    feature_data=feature_data,
+                )
+            except Exception:
+                # `run_meta_experiment` уже поклав у сесію спробу `FAILED` (модель навчена): фіксуємо її до
+                # прокидання, інакше закриття сесії відкотило б її. Скасування (`CancelledError`) не пишеться.
+                await _keep_failed_trial(session, spec.name)
+                raise
+            await session.commit()
+        recorded.append((spec, meta))
+    rules: list[RuleResult] = []
+    async with sessions() as session:
+        for spec, meta in recorded:
+            preview = await preview_gate_g1(
+                session,
+                experiment_id=meta.experiment_id,
+                trial_id=meta.trial.trial_id,
+                stress=meta.run.stress,
+                thresholds=thresholds,
+            )
+            rules.append(
+                RuleResult(
+                    spec_name=spec.name,
+                    experiment_id=meta.experiment_id,
+                    trial_id=meta.trial.trial_id,
+                    decision_error=meta.decision_error,
+                    preview=preview,
+                )
+            )
+    return IterationOneReport(
+        selection=selection,
+        comparison_trials=comparison_trials,
+        rules=tuple(rules),
+        next_step=iteration_one_verdict(tuple(item.passed for item in rules)),
+    )
+
+
+async def _keep_failed_trial(session: AsyncSession, spec_name: str) -> None:
+    """Закомітити спробу `FAILED` перед прокиданням винятку. Невдалий commit — у лог; далі летить
+    початковий виняток, бо він пояснює збій, а не commit."""
+    try:
+        await session.commit()
+    except SQLAlchemyError as exc:
+        _LOG.error("research_cycle_failed_trial_not_committed", strategy=spec_name, error=type(exc).__name__)

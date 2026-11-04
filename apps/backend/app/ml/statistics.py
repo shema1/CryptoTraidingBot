@@ -31,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.backtest import BacktestReport, BacktestTrade
+from app.ml.decision import ENTRY_EVALUATION
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact, TrialInvalidation
 from app.ml.strategy import is_reference_baseline
@@ -74,6 +75,8 @@ G1_FOLD_SHARE = "G1_FOLD_SHARE"
 G1_COST_FACTOR = "G1_COST_FACTOR"
 G1_STRESS = "G1_STRESS"
 G1_FILTER = "G1_FILTER"
+# Угоди спроби meta відібрані не правилом входу рецепта, оціненим перехресно (рішення 0020).
+G1_ENTRY_RULE = "G1_ENTRY_RULE"
 G1_DSR = "G1_DSR"
 G1_PBO = "G1_PBO"
 
@@ -784,44 +787,52 @@ def evaluate_gate(
         )
 
 
-async def open_holdout_after_gate(
+def entry_rule_evaluated(params: Any) -> bool:
+    """Спроба meta оцінена правилом входу рецепта перехресно по фолдах і несе саме правило (рішення 0020)."""
+    return (
+        isinstance(params, Mapping)
+        and params.get("entry_evaluation") == ENTRY_EVALUATION
+        and isinstance(params.get("decision"), Mapping)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _G1:
+    """Результат перевірки G1 однієї спроби. Нічого не пише; `open_holdout_after_gate` бере з нього все."""
+
+    experiment: Experiment
+    trial: ExperimentTrial
+    stored: dict[str, Any]
+    series: list[TrialSeries]
+    invalid: dict[int, TrialInvalidation]
+    baseline: set[int]
+    effective: GateThresholds
+    dsr_detail: DsrEstimate
+    pbo_detail: PboEstimate
+    dsr: Decimal | None
+    pbo: Decimal | None
+    checked_stress: tuple[FoldOutcome, ...]
+    unfiltered_total_net: Decimal | None
+    scored_unfiltered_total_net: Decimal | None
+    decision: GateDecision
+
+
+async def _evaluate_g1(
     session: AsyncSession,
     *,
     experiment_id: str,
     trial_id: int,
-    model_version: str,
-    stress: Sequence[FoldOutcome] | None = None,
-    thresholds: GateThresholds | None = None,
-) -> RecordedOpening:
-    """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
-
-    DSR і PBO перераховуються з поточного журналу лінії. Розкид Sharpe для DSR — з рядів, де угод
-    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1), і не менший за `1/(T−1)`. PBO — за часом на
-    walk-forward кандидата, з пропусками; рядок журналу без часу угод — відмова. Запис відкриття
-    показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій, розбиттів і відрізок PBO.
-    Позначені недійсними спроби (рішення 0015) лишаються в N, але не входять у розкид DSR і в PBO;
-    кандидатом вони не бувають, а запис відкриття їх називає. Опорний бейзлайн (рішення 0016)
-    теж лишається в N і в розкиді DSR, якщо в нього достатньо угод, але в PBO не змагається
-    і кандидатом не буває. Модель відкриття має належати цьому
-    експерименту (`experiment_id`, `label_type`, символ, таймфрейм): інакше тип експерименту вирішував
-    би, чи порівнювати ML-фільтр з правилом. З тієї ж причини спроба з ознаками meta (`stage`, `role`,
-    `comparison`) в експерименті іншого `label_type` кандидатом не буває (`ValueError`, рішення 0017).
-    Відмова — `GateRejected` з рішенням
-    (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
-    G1 (пороги, послаблені пороги, стрес, обидва правила без фільтра) і лише тоді — знімок
-    `n_trials_line`, `dsr`, `pbo` на експерименті: він завжди збігається з останнім відкриттям
-    цього експерименту, а спроба — `result.trial_id` того відкриття.
-    Зсув hold-out сюди не входить: його робить `create_experiment` з новішим вікном.
-    Для `meta` обидва правила без фільтра і стрес G1 рахує зі звітів бектесту, які `record_trial` перевірив
-    і поклав у `metrics` фолду (`meta`, рішення 0017). Стрес викликача можна не передавати; переданий
-    має збігатися із записаним. Звітів немає або стрес інший — `G1_FILTER` / `G1_STRESS`, без запису.
-    Для `direct` і `rule_only` стрес передає викликач; без нього — `G1_STRESS`.
-    """
+    model_version: str | None,
+    stress: Sequence[FoldOutcome] | None,
+    thresholds: GateThresholds | None,
+) -> _G1:
+    """Gate G1 для спроби без запису в БД. `model_version=None` — перегляд без перевірки моделі допуску."""
     if type(trial_id) is not int or isinstance(trial_id, bool):
         raise ValueError("trial_id має бути int")
     limits = thresholds if thresholds is not None else GateThresholds()
     experiment, trial, rows = await _load_candidate(session, experiment_id, trial_id)
-    await _check_model(session, model_version, experiment)
+    if model_version is not None:
+        await _check_model(session, model_version, experiment)
     invalid = await _invalidations(session, [row.id for row in rows])
     if trial.id in invalid:
         raise ValueError("спроба позначена недійсною і не буває кандидатом")
@@ -873,6 +884,128 @@ async def open_holdout_after_gate(
         scored_unfiltered_total_net=scored_unfiltered_total_net,
         thresholds=effective,
     )
+    if experiment.label_type == "meta" and not entry_rule_evaluated(trial.params):
+        # Угоди відібрані `keep(0.5)` або правила входу немає: G1 оцінив би не те правило, що піде
+        # в модель допуску і live (рішення 0020). Відмова, а не тихий пропуск.
+        decision = decision.model_copy(update={"passed": False, "reasons": (*decision.reasons, G1_ENTRY_RULE)})
+    return _G1(
+        experiment=experiment,
+        trial=trial,
+        stored=stored,
+        series=series,
+        invalid=invalid,
+        baseline=baseline,
+        effective=effective,
+        dsr_detail=dsr_detail,
+        pbo_detail=pbo_detail,
+        dsr=dsr,
+        pbo=pbo,
+        checked_stress=checked_stress,
+        unfiltered_total_net=unfiltered_total_net,
+        scored_unfiltered_total_net=scored_unfiltered_total_net,
+        decision=decision,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class G1Preview:
+    """Перегляд G1: рішення і числа, без відкриття hold-out і без запису. `passed` не відкриває hold-out.
+
+    `loosened` — пороги, слабші за ТЗ (`loosened_thresholds`), як їх запише відкриття. З ними G1 може
+    пройти, але `CANDIDATE` — ні: людина має бачити це до відкриття.
+    """
+
+    trial_id: int
+    decision: GateDecision
+    dsr: Decimal | None
+    pbo: Decimal | None
+    n_trials: int
+    loosened: tuple[str, ...] = ()
+
+
+async def preview_gate_g1(
+    session: AsyncSession,
+    *,
+    experiment_id: str,
+    trial_id: int,
+    stress: Sequence[FoldOutcome] | None = None,
+    thresholds: GateThresholds | None = None,
+) -> G1Preview:
+    """Перевірити G1 так само, як `open_holdout_after_gate`, але нічого не записати.
+
+    Цикл T2.12 кличе це, щоб показати людині DSR, PBO, N і причини. Відкриття — лише окремим викликом
+    `open_holdout_after_gate`, яке ставить людина.
+    """
+    ev = await _evaluate_g1(
+        session,
+        experiment_id=experiment_id,
+        trial_id=trial_id,
+        model_version=None,
+        stress=stress,
+        thresholds=thresholds,
+    )
+    return G1Preview(
+        trial_id=ev.trial.id,
+        decision=ev.decision,
+        dsr=ev.dsr,
+        pbo=ev.pbo,
+        n_trials=len(ev.series),
+        loosened=loosened_thresholds(ev.effective),
+    )
+
+
+async def open_holdout_after_gate(
+    session: AsyncSession,
+    *,
+    experiment_id: str,
+    trial_id: int,
+    model_version: str,
+    stress: Sequence[FoldOutcome] | None = None,
+    thresholds: GateThresholds | None = None,
+) -> RecordedOpening:
+    """Відкрити hold-out експерименту, лише якщо ця COMPLETE-спроба пройшла Gate G1.
+
+    DSR і PBO перераховуються з поточного журналу лінії. Розкид Sharpe для DSR — з рядів, де угод
+    не менше за `DSR_SPREAD_MIN_TRADES` (не поріг G1), і не менший за `1/(T−1)`. PBO — за часом на
+    walk-forward кандидата, з пропусками; рядок журналу без часу угод — відмова. Запис відкриття
+    показує, з чого вони: рядів у розкиді, нижню межу, SR*, стратегій, розбиттів і відрізок PBO.
+    Позначені недійсними спроби (рішення 0015) лишаються в N, але не входять у розкид DSR і в PBO;
+    кандидатом вони не бувають, а запис відкриття їх називає. Опорний бейзлайн (рішення 0016)
+    теж лишається в N і в розкиді DSR, якщо в нього достатньо угод, але в PBO не змагається
+    і кандидатом не буває. Модель відкриття має належати цьому
+    експерименту (`experiment_id`, `label_type`, символ, таймфрейм): інакше тип експерименту вирішував
+    би, чи порівнювати ML-фільтр з правилом. З тієї ж причини спроба з ознаками meta (`stage`, `role`,
+    `comparison`) в експерименті іншого `label_type` кандидатом не буває (`ValueError`, рішення 0017).
+    Відмова — `GateRejected` з рішенням
+    (DSR, PBO, N усередині), без жодного запису в БД. Успіх пише відкриття з повним рішенням
+    G1 (пороги, послаблені пороги, стрес, обидва правила без фільтра) і лише тоді — знімок
+    `n_trials_line`, `dsr`, `pbo` на експерименті: він завжди збігається з останнім відкриттям
+    цього експерименту, а спроба — `result.trial_id` того відкриття.
+    Зсув hold-out сюди не входить: його робить `create_experiment` з новішим вікном.
+    Для `meta` обидва правила без фільтра і стрес G1 рахує зі звітів бектесту, які `record_trial` перевірив
+    і поклав у `metrics` фолду (`meta`, рішення 0017). Стрес викликача можна не передавати; переданий
+    має збігатися із записаним. Звітів немає або стрес інший — `G1_FILTER` / `G1_STRESS`, без запису.
+    Для `direct` і `rule_only` стрес передає викликач; без нього — `G1_STRESS`.
+    `model_version` обов'язкова: `None` у `_evaluate_g1` означає перегляд без перевірки моделі, тож
+    відкриття без неї відмовляє (`ValueError`) до будь-якого розрахунку.
+    """
+    if type(model_version) is not str or not model_version:
+        raise ValueError("відкриття hold-out потребує model_version моделі допуску")
+    ev = await _evaluate_g1(
+        session,
+        experiment_id=experiment_id,
+        trial_id=trial_id,
+        model_version=model_version,
+        stress=stress,
+        thresholds=thresholds,
+    )
+    experiment, trial, stored, series = ev.experiment, ev.trial, ev.stored, ev.series
+    invalid, baseline, effective = ev.invalid, ev.baseline, ev.effective
+    dsr_detail, pbo_detail = ev.dsr_detail, ev.pbo_detail
+    dsr, pbo, decision = ev.dsr, ev.pbo, ev.decision
+    checked_stress = ev.checked_stress
+    unfiltered_total_net = ev.unfiltered_total_net
+    scored_unfiltered_total_net = ev.scored_unfiltered_total_net
     if not decision.passed or dsr is None or pbo is None:
         raise GateRejected(decision)
     opened = await _open_holdout(

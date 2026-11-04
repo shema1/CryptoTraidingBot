@@ -28,7 +28,14 @@ from app.ml.meta_model import (
     train_meta,
 )
 from app.ml.models import Experiment, ExperimentTrial
-from app.ml.statistics import GateRejected, evaluate_gate, fold_outcomes_from_metrics, open_holdout_after_gate
+from app.ml.statistics import (
+    G1_ENTRY_RULE,
+    GateRejected,
+    entry_rule_evaluated,
+    evaluate_gate,
+    fold_outcomes_from_metrics,
+    open_holdout_after_gate,
+)
 from app.ml.strategy import (
     ALWAYS_FLAT,
     ALWAYS_LONG,
@@ -540,7 +547,11 @@ async def test_experiment_records_one_trial_and_not_the_stress_run(conn: AsyncCo
             unfiltered_total_net=recorded.run.unfiltered_total_net,
             scored_unfiltered_total_net=recorded.run.scored_unfiltered_total_net,
         )
-        assert decision.reasons == expected.reasons
+        # Журнальний G1 додає лише `G1_ENTRY_RULE`, якщо угоди не оцінені правилом входу перехресно (0020):
+        # на цій розбивці менше трьох фолдів, тож правила немає і відмова має цю причину.
+        assert recorded.decision is None
+        assert not entry_rule_evaluated(trials[0].params)
+        assert decision.reasons == (*expected.reasons, G1_ENTRY_RULE)
         assert ("G1_FILTER" in decision.reasons) is not recorded.run.beats_unfiltered
     assert experiment.label_type == "meta"
     assert experiment.primary_strategy == BREAKOUT.metadata()

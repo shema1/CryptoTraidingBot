@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionm
 from app.ml.features import HOUR_MS
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
 from app.ml.optuna_search import run_optuna_study
-from app.ml.statistics import deflated_sharpe, trial_series_from_journal
+from app.ml.statistics import deflated_sharpe, entry_rule_evaluated, trial_series_from_journal
 from app.ml.strategy import BREAKOUT
 from app.ml.trade_sim import SimCandle, TargetParams
 from app.ml.validation import ResearchSplit, build_split, line_trial_count
@@ -121,6 +121,26 @@ def _two_folds() -> tuple[list[SimCandle], ResearchSplit]:
         min_trades_per_fold=1,
     )
     assert len(split.folds) == 2
+    return candles, split
+
+
+def _three_folds() -> tuple[list[SimCandle], ResearchSplit]:
+    """Три фолди: правило входу оцінюється перехресно, кожен фолд — на двох інших (рішення 0020)."""
+    meta = _meta()
+    count = 5300
+    candles = meta._flat(count)
+    meta._paint(candles, 90, good=lambda step: step % 2 == 0)
+    split = build_split(
+        data_from_ms=0,
+        data_to_ms=count * HOUR_MS,
+        horizon_bars=4,
+        count_trades=lambda _start, _end: 20,
+        min_train_ms=meta._entry_index(60) * HOUR_MS,
+        test_segment_ms=4 * meta._SPACING * HOUR_MS,
+        test_segment_extended_ms=8 * meta._SPACING * HOUR_MS,
+        min_trades_per_fold=1,
+    )
+    assert len(split.folds) == 3
     return candles, split
 
 
@@ -302,3 +322,75 @@ async def test_pruned_prefix_still_counts_in_the_line(conn: AsyncConnection) -> 
     series = [trial_series_from_journal(trial.oos_results, trial.oos_entry_ms, trial.metrics).returns]
     estimate = deflated_sharpe(series[0], trial_returns=series, n_trials=counted)
     assert estimate.n_trials == 1
+
+
+async def _study_once(conn: AsyncConnection, candles: list[SimCandle], split: ResearchSplit) -> str:
+    meta = _meta()
+    result = await run_optuna_study(
+        _sessions(conn),
+        (meta._history(meta.BTC, candles),),
+        spec=BREAKOUT,
+        split=split,
+        trading_symbol=meta.BTC,
+        limits=meta._wide_limits(),
+        initial_equity=meta._EQUITY,
+        maintenance_margin_rate=meta._MARGIN,
+        seed=meta._SEED,
+        n_trials=1,
+        costs=meta._zero_costs(),
+        params=TargetParams(horizon_bars=4),
+        trial_bounds=(1, 1),
+        sampler=_Pinned(),
+    )
+    return result.experiment_id
+
+
+async def _only_trial(conn: AsyncConnection) -> ExperimentTrial:
+    async with _sessions(conn)() as session:
+        return (await session.execute(select(ExperimentTrial))).scalar_one()
+
+
+async def test_complete_trial_carries_the_entry_rule_and_the_feature_schema(conn: AsyncConnection) -> None:
+    # Спроба Optuna — теж кандидат G1: без правила входу і схеми фіч допуск її відхилив би (рішення 0019),
+    # а без перехресної оцінки правила входу — сам G1 (рішення 0020).
+    candles, split = _three_folds()
+    await _study_once(conn, candles, split)
+    trial = await _only_trial(conn)
+    assert trial.state == "COMPLETE"
+    assert "decision_error" not in trial.params
+    assert entry_rule_evaluated(trial.params)
+    assert [item["fold_index"] for item in trial.params["entry_rules"]] == [0, 1, 2]
+    assert set(trial.params["decision"]) == {"decision_rule", "calibrator_sha256"}
+    assert trial.params["decision"]["calibrator_sha256"].startswith("sha256:")
+    assert trial.params["feature_schema_hash"] == trial.params["feature_schema_hashes"][-1]
+    assert len(trial.params["feature_schema_hashes"]) == len(split.folds)
+
+
+async def test_one_fold_trial_says_why_it_has_no_entry_rule(conn: AsyncConnection) -> None:
+    candles, split = _one_fold()
+    await _study_once(conn, candles, split)
+    trial = await _only_trial(conn)
+    assert trial.state == "COMPLETE"
+    assert "decision" not in trial.params
+    assert trial.params["decision_error"] == "калібрування потребує щонайменше два фолди walk-forward"
+
+
+async def test_entry_rule_failure_is_a_failed_trial_and_stops_the_study(
+    conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Збій після навчання — помилка конвеєра: спроба в журналі (N росте), задача зупиняється.
+    from app.ml import meta_model
+    from app.ml.validation import SplitLeakError
+
+    def leak(*_args: Any, **_kwargs: Any) -> Any:
+        raise SplitLeakError("рядок hold-out у вибірці порогу")
+
+    monkeypatch.setattr(meta_model, "fit_entry_rule", leak)
+    candles, split = _two_folds()
+    with pytest.raises(SplitLeakError):
+        await _study_once(conn, candles, split)
+    trial = await _only_trial(conn)
+    assert trial.state == "FAILED"
+    assert trial.params["failed_at"] == "entry_rule"
+    assert trial.params["error"] == "SplitLeakError: рядок hold-out у вибірці порогу"
+    assert trial.params["optuna"]["state"] == "FAILED"

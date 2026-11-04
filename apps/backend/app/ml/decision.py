@@ -80,6 +80,9 @@ SKIP: str = "SKIP"
 REASON_CONFIDENCE_BELOW_MIN: str = "CONFIDENCE_BELOW_MIN"
 REASON_EDGE_BELOW_MIN: str = "EDGE_BELOW_MIN"
 REASON_UNUSABLE_EXIT: str = "UNUSABLE_EXIT"
+# Як оцінено угоди фолдів спроби meta для G1 (рішення 0020): правилом входу рецепта (`decide_entry`),
+# калібратор і поріг якого для фолду k підігнані на інших фолдах. Без цієї позначки G1 відмовляє.
+ENTRY_EVALUATION: str = "decision_cross_fold"
 
 _METHODS: tuple[str, ...] = ("isotonic", "platt")
 _SKIP_REASONS: tuple[str, ...] = (

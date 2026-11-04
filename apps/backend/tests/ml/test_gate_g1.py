@@ -12,8 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from app.api.models import AUDIT_ACTION_TRIAL_INVALIDATE
 from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
+from app.ml.decision import ENTRY_EVALUATION
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
-from app.ml.statistics import FoldOutcome, GateRejected, GateThresholds, open_holdout_after_gate
+from app.ml.statistics import G1_ENTRY_RULE, FoldOutcome, GateRejected, GateThresholds, open_holdout_after_gate
 from app.ml.strategy import ALWAYS_FLAT
 from app.ml.trade_sim import ExitReason, StopPriceSource
 from app.ml.validation import (
@@ -208,6 +209,15 @@ async def _line(session: AsyncSession, split: ResearchSplit, *, research_line: s
     )
 
 
+def _candidate(name: str) -> dict[str, object]:
+    """Параметри кандидата meta: угоди оцінені правилом входу рецепта перехресно, правило — у спробі (0020)."""
+    return {
+        "name": name,
+        "entry_evaluation": ENTRY_EVALUATION,
+        "decision": {"decision_rule": {"min_confidence": "0.40", "min_edge_atr": "0.10"}, "calibrator_sha256": None},
+    }
+
+
 async def _model(conn: AsyncConnection, experiment_id: str) -> str:
     """Модель рецепта цього експерименту: meta, BTC, 1h — як у `_line`."""
     return await make_model(conn, experiment_id=experiment_id)
@@ -229,7 +239,7 @@ async def _strong_and_junk(session: AsyncSession, split: ResearchSplit) -> tuple
         experiment_id=experiment_id,
         split=split,
         state="COMPLETE",
-        params={"name": "strong"},
+        params=_candidate("strong"),
         folds=_records(split, strong_r, meta=True),
     )
     return experiment_id, strong.trial_id, junk.trial_id
@@ -378,7 +388,7 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
             experiment_id=moved,
             split=shifted,
             state="COMPLETE",
-            params={"name": "strong"},
+            params=_candidate("strong"),
             folds=_records(shifted, strong_r, meta=True),
         )
         opened = await open_holdout_after_gate(
@@ -479,6 +489,42 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
             "below_min_trades": False,
             "cost_factor": "2",
         }
+
+
+async def test_meta_trial_not_evaluated_by_the_entry_rule_does_not_pass(conn: AsyncConnection) -> None:
+    """Ті самі угоди без позначки перехресної оцінки правилом входу — G1 відмовляє лише з цієї причини (0020).
+
+    Інакше G1 оцінював би `keep(0.5)`, а в модель допуску і live пішло б інше правило (`decide_entry`).
+    """
+    split = _split()
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, _strong_id, _junk_id = await _strong_and_junk(session, split)
+        model = await _model(conn, experiment_id)
+        for name, params in (
+            ("keep", {"name": "keep"}),
+            ("no-rule", {"name": "no-rule", "entry_evaluation": ENTRY_EVALUATION}),
+        ):
+            trial = await record_trial(
+                session,
+                experiment_id=experiment_id,
+                split=split,
+                state="COMPLETE",
+                params=params,
+                folds=_records(split, strong_r, meta=True),
+            )
+            with pytest.raises(GateRejected) as caught:
+                await open_holdout_after_gate(
+                    session,
+                    experiment_id=experiment_id,
+                    trial_id=trial.trial_id,
+                    model_version=model,
+                    thresholds=loose,
+                )
+            assert caught.value.decision.reasons == (G1_ENTRY_RULE,), name
+        openings = select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == BTC)
+        assert (await session.execute(openings)).scalar_one() == 0
 
 
 async def test_record_trial_does_not_depend_on_the_thread_decimal_context(conn: AsyncConnection) -> None:

@@ -69,45 +69,46 @@
 | 26 | T2.10 | Optuna як задача воркера | R1 | sonnet / high | T1.8, T2.8 |
 | 27 | T2.11 | Артефакти, відтворюваність, статуси, перенавчання рецепта | R3 | fable / xhigh | T2.9 |
 | 28 | T2.12 | Дослідницький цикл моделі (з людиною) | R2 | opus / high | T2.6–T2.11 |
-| 29 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
-| 30 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
-| 31 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
-| 32 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
-| 33 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
-| 34 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
-| 35 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
-| 36 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
-| 37 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
-| 38 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
-| 39 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
-| 40 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
-| 41 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
-| 42 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
-| 43 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
-| 44 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
-| 45 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
-| 46 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
-| 47 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
-| 48 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
-| 49 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
-| 50 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
-| 51 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
-| 52 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
-| 53 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
-| 54 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
-| 55 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
-| 56 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
-| 57 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
-| 58 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
-| 59 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
-| 60 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
-| 61 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
-| 62 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
-| 63 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
-| 64 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
-| 65 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
-| 66 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
-| 67 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
+| 29 | T2.13 | Дослідницький цикл, ітерація 2 (пряме 3-класове прогнозування) | R2 | opus / high | T2.12 |
+| 30 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
+| 31 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
+| 32 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
+| 33 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
+| 34 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
+| 35 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
+| 36 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
+| 37 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
+| 38 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
+| 39 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
+| 40 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
+| 41 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
+| 42 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
+| 43 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
+| 44 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
+| 45 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
+| 46 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
+| 47 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
+| 48 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
+| 49 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
+| 50 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
+| 51 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
+| 52 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
+| 53 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
+| 54 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
+| 55 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
+| 56 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
+| 57 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
+| 58 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
+| 59 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
+| 60 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
+| 61 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
+| 62 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
+| 63 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
+| 64 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
+| 65 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
+| 66 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
+| 67 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
+| 68 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
 
 ---
 
@@ -402,7 +403,7 @@
 - **Фінальне рев'ю `trading-safety-reviewer` (Opus 5.5, 2026-11-04):** вердикт «потребує змін», блокерів немає. **Виправлено:** модель, експеримент і відкриття читаються з `populate_existing` — довга сесія з `expire_on_commit=False` бачила CANDIDATE після RETIRED з іншої сесії і пропускала другий допуск після невдалого (тести на дві сесії, мутаційно перевірені); фічі — частина рецепта: допуск вимагає `params.feature_schema_hash` спроби G1 (fail-closed, як `decision`); `APPROVED` — лише з `model.approve`, записаним після CANDIDATE (`approval_audit_after_id`); інференс meta звіряє версію `scikit-learn` (калібратор); бустер читається з тих самих байтів, що хешувались; `hash_inputs` — у потоці; тест-охоронець — ще `_insert_model`, `db_status=`, `predict_probability(` і `versions=` поза модулем. Документацію виправлено: `rule_only` (правило, таргет, витрати) може стати `CANDIDATE` уже зараз, fail-closed стосується лише `meta`. Усі тести (2026), ruff, mypy — зелені. **Передано:** див. рядки T2.12, T4.1, T5.1, T5.2.
 - **Документація:** `app/ml/README.md` (розділ T2.11, таблиця API, `holdout_openings.result.admission`, `HoldoutGrant`; у розділах T2.8 і T2.10 — `params.target`/`params.costs` експерименту), `AppInfo.md` §5.3 п. 2 (уточнення «розширюється» з посиланням на 0018, з підтвердженням користувача), `docs/decisions/0018-holdout-no-backward-expansion.md`, `.claude/rules/ml-pipeline.md` → `.cursor/rules/ml-pipeline.mdc`, `.claude/skills/ml-pipeline/SKILL.md`, `.claude/agents/ml-leakage-auditor.md`, docstrings `artifacts.py`, `meta_model.py` (`HoldoutGrant`, `fit_frozen_meta`) і `validation.py` (`target_payload`, `costs_payload`), передачі в T2.12, T4.1, T5.1, T5.2, T5.4, T6.2. `docs/runbooks/getting-started.md`: абзац про `brew install libomp`, коли Homebrew 7 відмовляється вантажити формули з недовіреного tap. Запуск і `.env` ця задача не змінювала.
 
-#### T2.12 · Дослідницький цикл моделі (з людиною) `[ ]`
+#### T2.12 · Дослідницький цикл моделі (з людиною) `[~]`
 - **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5А.3, §5А.10, §5А.11
 - **Зробити:** ітерація 1 — meta-labeling з 1–2 первинними стратегіями на walk-forward; ітерація 2 — пряме 3-класове прогнозування (лише після ітерації 1); усі спроби в одному журналі. Рішення про відкриття hold-out приймає **людина** після Gate G1. Після успіху — перенавчання рецепта (T2.11), коридор, CANDIDATE. Критерій зупинки §5А.11.
 - **Готово, коли:** є модель у статусі CANDIDATE або задокументоване рішення торгувати первинною стратегією без ML.
@@ -417,6 +418,23 @@
   - (T2.11) модель допуску — `fit_frozen_meta` без гранту на розбивці експерименту (`split_from_payload`), рецептом спроби G1 (`strategy`, `lgbm`, seed експерименту), з `train_range_ms` і `feature_coverage_ms` до `holdout_from`; реєстрація — `register_model`. Після відкриття — один `record_holdout_admission(opening_id=, report=, walk_forward=, unfiltered=, scored_unfiltered=)`: звіти `run_backtest` на запечатаному вікні (базові витрати, seed експерименту), `walk_forward` — ті самі угоди, що в спробі G1. Менше 30 угод на hold-out — відмова, не розширення (рішення 0018). Невдалий допуск — назавжди для цієї моделі й спроби на цьому вікні. Потім `retrain_registered_recipe(session, histories, validation_version=, root=)` (не новий Optuna): той самий набір історій, що дав модель допуску, інакше відтворення не збіжиться. `CANDIDATE` — `promote_to_candidate` з угодами walk-forward спроби G1 і hold-out допуску в порядку часу; G1 мусить бути з порогами ТЗ (без `loosened`). Рядки hold-out — `rows_for_opened_holdout(experiment_id=, opening_id=)`. **Рішення методології:** рецепт Optuna (фолди з ранньою зупинкою, `best_iteration` ≠ `n_estimators`) допуск зараз відхиляє: яке число дерев брати для моделі на всіх даних (медіана `best_iteration`, окрема рання зупинка чи інше) — вирішити й зафіксувати в `docs/decisions/`. Відкрите: допуск перевіряє узгодженість звітів, але не те, що їх порахував цей рецепт на цих даних (перерахунок трьох звітів із сирих даних — тут); витрати рецепта в журналі спроби не записані й з ним не звіряються; коридор після `CANDIDATE` не перераховувати.
   - (T2.11, рішення користувача 2026-11-04) правило входу — частина рецепта: спроба G1 (`MetaRun.trial_params()` або запис T2.12) мусить мати `params.decision = decision_payload(DecisionRule, ProbabilityCalibrator)` — той самий поріг і калібратор, що потім лягають у модель допуску. Отже, `fit_decision` має відпрацювати до `record_trial` цієї спроби. Без цього `record_holdout_admission` відмовляє (fail-closed) і `CANDIDATE` неможливий. Експерименти, створені до 2026-11-04, не мають `params.target`/`params.costs` — для допуску потрібен новий експеримент.
   - (T2.11, фінальне рев'ю) спроба G1 має писати й `params.feature_schema_hash` — схему фіч моделі допуску (колонки фолдів можуть відрізнятися через покриття деривативів: вирішити, яку схему вважати схемою рецепта). Відкрите: з одного допуску можна перенавчити кілька моделей і кожна може стати CANDIDATE (UNIQUE на `validated_by` немає; дані hold-out у `histories` не звірені зі звітами допуску); `data_hash` і git моделі допуску задає викликач `build_metadata` (брати `hash_inputs` і `read_git_state`); оцінки G1 і walk-forward-частина коридора рахуються з `keep(0.5)`, а live входить через `decide_entry` — коридор має будуватись з угод за тим самим правилом; `holdout_pf_unbounded` (PF без збитків на ≥ 30 угодах) проходить без позначки для людини; версії коду первинної стратегії в артефакті немає; Optuna-експеримент, створений до 2026-11-04, не продовжиться (немає `params.costs`).
+
+- **Примітки (2026-11-04, ітерація 1):** `app/ml/research_cycle.py` (`run_iteration_one`, `iteration_one_verdict`), `app/ml/meta_model.py` (`decision_observations`, `fit_entry_rule`, `g1_recipe_fields`; `run_meta_experiment` пише `params.decision` і `params.feature_schema_hash` до `record_trial`), `app/ml/statistics.py` (`preview_gate_g1`; перевірка G1 винесена в `_evaluate_g1` без запису, `open_holdout_after_gate` її використовує). Рішення про схему рецепта — `docs/decisions/0019-recipe-schema-and-entry-rule.md` (прийнято 2026-11-04, обґрунтування виправлено на рев'ю). Цикл hold-out не відкриває: `hold_out_opened` завжди `False`. Тести: `tests/ml/test_research_cycle.py` (14 тестів; інтеграційні на тестовій БД), повний бекенд: 2054 passed (після рішень рев'ю й аудиту).
+  - **Рев'ю (Opus 5.5, 2026-11-04), виправлено:** перегляди G1 у `run_iteration_one` — лише після запису спроб усіх обраних правил (раніше перше правило бачило менше N і не мало суперника в PBO); збій після навчання в `run_meta_experiment` (підгонка правила входу, поля рецепта) пишеться спробою `FAILED` з `failed_at = "entry_rule"` (раніше спроба зникала з журналу); `open_holdout_after_gate` без `model_version` — `ValueError` (спільний `_evaluate_g1` трактує `None` як перегляд і пропускав `_check_model`). Нові тести: модель допуску з `fit_frozen_meta` і правилом входу спроби проходить `_recipe_matches_trial`; шлях `decision_error` у журналі; `RuleResult.passed` без правила входу хибний. README модуля (застаріле «журнал не пише `decision`») і правила ML виправлено.
+  - **Рев'ю, рішення людини (2026-11-04), виконано:** (е) G1 оцінює правило входу рецепта, а не `keep(0.5)`: угоди COMPLETE-спроби — `cross_fold_entry` (для фолду k калібратор і поріг — `fit_decision` на інших фолдах, вхід — `decide_entry`, потрібно ≥ 3 фолди), позначка `params.entry_evaluation`; журнальний G1 для `meta` без неї — `G1_ENTRY_RULE` (рішення `docs/decisions/0020-g1-on-cross-fold-entry-rule.md`). Метрика Optuna і pruner лишаються на `keep(0.5)`. (є) Обґрунтування 0019 виправлено (довший train — стільки ж або менше колонок), рішення прийнято. Optuna пише правило входу, схему фіч і перехресну оцінку (`recipe_trial`, спільне з `run_meta_experiment`), збій після навчання — `FAILED` і зупинка задачі. `G1Preview.loosened`; `RuleResult.passed` — лише на порогах ТЗ. Цикл визначає таргет і витрати один раз і пише їх в експеримент каталогу (без явного таргета порівняння падало: «горизонт таргета і вікна різний»). Тести: `test_research_cycle.py` (24), нові в `test_gate_g1.py` і `test_optuna_study.py`; фікстури кандидатів G1 доповнено позначкою 0020, `test_meta` очікує `G1_ENTRY_RULE` на розбивці з одним фолдом.
+  - **Аудит `ml-leakage-auditor` (2026-11-04, пункт (д)):** вердикт «ПІДОЗРА», прямого витоку немає: правило фолду k у `cross_fold_entry` напряму не бачить міток фолду k і hold-out, бектест — ті самі налаштування, стрес — ті самі сигнали, правила без фільтра не змінюються, перегляд G1 нічого не пише; `tests/ml` — 306 passed. **Виправлено (рішення людини):** (1) `run_iteration_one` приймає фабрику сесій і комітить каталог і кожну спробу окремо, `FAILED` — до прокидання винятку; `run_meta_experiment` документує, що комітить викликач. (2) Тест проводки: правило входу не бере нічого → у журналі нуль угод (мутація «журнал пише `keep`» його валить); тест на мітки перевіряє й чутливість. (4) `params.entry_rules` з `calibrator_sha256` фолду. (5) `recipe_trial` звіряє витрати й таргет з `MetaRun.backtest`. (3, текст) Рішення 0020 доповнено розділом «Обмеження». **Відкрито:** (3) виміряти завищення проти правила лише з минулих фолдів; (6) ранні фолди можуть мати більше колонок деривативів, ніж схема рецепта (0019) — вирішити, чи G1 має відмовляти при різних схемах; тест з деривативами і різними схемами; (7) виняток не `MetaTrainError` у `train_meta` після навченого фолду спробою не пишеться. Дрібніше: перегляд пропускає `_check_model`; `RuleResult.passed` не показує `beats_abstain`; `test_iteration_one_never_opens_the_holdout` перевіряє константу.
+  - **Відкрито після рев'ю:** умова `G1_ENTRY_RULE` не записана в ТЗ §5А.10 дослівно (випливає з §5А.3 п. 9–10, §5А.8) — дописати з підтвердженням людини; `rule_only` (§5А.11 п. 4) — власний експеримент `rule_only`, не експеримент каталогу (T2.13).
+  - **Відкрито (лишається в T2.12):** (а) завантажувач історій, що будує розбивку з `PRIMARY_CANDIDATES` (зараз `load_optuna_inputs` рахує за стратегією задачі); (б) запуск на реальних даних ринку — команда і результат для людини; (в) рецепт з ранньою зупинкою: яке число дерев брати для моделі на всіх даних, рішення в `docs/decisions/`; (г) перерахунок трьох звітів G1 з сирих даних (T2.8, T2.9 у нотатках); (д) перевірка `ml-leakage-auditor` після змін у `app/ml/` не виконана.
+  - **Передано в T2.13:** ітерація 2 (пряме 3-класове прогнозування); для неї немає навчання `label_type=direct`.
+#### T2.13 · Дослідницький цикл, ітерація 2 (пряме 3-класове прогнозування) `[ ]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5.1, §5А.3 п. 13, §5А.11 п. 2
+- **Зробити:** після ітерації 1 без проходження G1 (або якщо вона не пройшла) — пряме 3-класове прогнозування (LONG/SHORT/FLAT, `label_direct`) на тих самих фолдах; спроби — в тому ж журналі лінії; G1 для `direct` (без умови «фільтр краще правила», яка стосується лише `meta`). Вирішити рецепт з ранньою зупинкою (T2.12, відкрито).
+- **Готово, коли:** навчання `label_type=direct` записує спроби з рецептом і `feature_schema_hash`; G1 для `direct` перевіряється тестом; рішення людини про hold-out — окремо. Рев'ю: `ml-leakage-auditor`.
+- **Передано з попередніх задач:**
+  - (T2.12) оркестратор ітерації 1 — `run_iteration_one`; `iteration_one_verdict` повертає `iteration_two`, коли жодне правило не пройшло перегляд G1. Його можна викликати для `direct` після додавання навчання.
+  - (T2.11) `direct` ще не перенавчається в `retrain_registered_recipe` (ТЗ §5.4.1).
+  - (T2.12, рішення 0020) журнальний G1 для `meta` вимагає перехресної оцінки правила входу (`G1_ENTRY_RULE`); для `direct` правило входу теж є (§5.5.1) — вирішити, як його оцінювати на walk-forward перед G1. `rule_only` (§5А.11 п. 4) — власним експериментом `rule_only` зі своєю спробою в N, не експериментом каталогу (`label_type=meta`).
+
 
 ### Етап 3. Біржовий шар
 
