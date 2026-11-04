@@ -78,10 +78,12 @@ from app.ml.validation import (
     ResearchSplit,
     SplitLeakError,
     build_split,
+    costs_payload,
     create_experiment,
     holdout_bounds,
     record_trial,
     split_from_payload,
+    target_payload,
     validation_payload,
 )
 from app.risk.costs import CostModel, FundingEvent
@@ -312,14 +314,6 @@ def search_space_payload() -> dict[str, Any]:
     }
 
 
-def target_payload(target: TargetParams) -> dict[str, Any]:
-    return {
-        "tp_atr_mult": format(target.tp_atr_mult, "f"),
-        "sl_atr_mult": format(target.sl_atr_mult, "f"),
-        "horizon_bars": target.horizon_bars,
-    }
-
-
 def parse_optuna_job(params: Mapping[str, Any]) -> OptunaJobRequest:
     """Параметри задачі. Зайвий ключ, період правила або гіперпараметр моделі — відмова.
 
@@ -461,7 +455,8 @@ async def load_optuna_inputs(sessions: SessionFactory, request: OptunaJobRequest
         rows = await _load_rows(session, request.symbols)
         if request.experiment_id is not None:
             experiment = await _experiment(session, request.experiment_id)
-            _match_experiment(experiment, request, target)
+            # Задача воркера вчить з витратами за замовчуванням, як і `run_optuna_search(costs=None)`.
+            _match_experiment(experiment, request, target, CostModel())
             validation = experiment.params.get("validation")
             if not isinstance(validation, Mapping):
                 raise OptunaDataError("у експерименту немає розбивки")
@@ -589,6 +584,7 @@ async def run_optuna_study(
         trading_symbol=trading_symbol,
         seed=seed,
         target=target,
+        costs=model_costs,
         experiment_id=experiment_id,
         on_created=on_created,
     )
@@ -818,7 +814,9 @@ async def _experiment(session: AsyncSession, experiment_id: str) -> Experiment:
     return found
 
 
-def _match_experiment(experiment: Experiment, request: OptunaJobRequest, target: TargetParams) -> None:
+def _match_experiment(
+    experiment: Experiment, request: OptunaJobRequest, target: TargetParams, costs: CostModel
+) -> None:
     if experiment.label_type != "meta" or experiment.research_line != request.trading_symbol:
         raise OptunaParamsError("експеримент не цієї meta-лінії")
     if list(experiment.symbols) != list(request.symbols):
@@ -829,6 +827,8 @@ def _match_experiment(experiment: Experiment, request: OptunaJobRequest, target:
         raise OptunaParamsError("правило експерименту не збігається із задачею")
     if experiment.params.get("target") != target_payload(target):
         raise OptunaParamsError("таргет експерименту не збігається із задачею")
+    if experiment.params.get("costs") != costs_payload(costs):
+        raise OptunaParamsError("витрати експерименту не збігаються із задачею")
     if experiment.params.get("optuna_search") != search_space_payload():
         raise OptunaParamsError("діапазони пошуку експерименту не збігаються з ТЗ §5А.7")
 
@@ -1075,6 +1075,7 @@ async def _ensure_experiment(
     trading_symbol: str,
     seed: int,
     target: TargetParams,
+    costs: CostModel,
     experiment_id: str | None,
     on_created: CreatedHook | None,
 ) -> str:
@@ -1097,11 +1098,12 @@ async def _ensure_experiment(
                 max_notional_per_symbol_usd=Decimal(1),
                 experiment_id=experiment_id,
             )
-            _match_experiment(experiment, request, target)
+            _match_experiment(experiment, request, target, costs)
         return experiment_id
     recipe = meta_recipe(shuffled_labels=False, min_probability=META_MIN_PROBABILITY)
     recipe["optuna_search"] = search_space_payload()
     recipe["target"] = target_payload(target)
+    recipe["costs"] = costs_payload(costs)
     async with sessions() as session, session.begin():
         created = await create_experiment(
             session,

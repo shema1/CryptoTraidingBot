@@ -61,7 +61,9 @@ from app.ml.validation import (
     RecordedTrial,
     ResearchSplit,
     SampleRow,
+    SplitLeakError,
     SplitPurpose,
+    costs_payload,
     create_experiment,
     guard_sample_weights,
     is_test_row,
@@ -71,6 +73,7 @@ from app.ml.validation import (
     reject_holdout,
     require_train_coverage,
     rows_for,
+    target_payload,
     train_coverage_ms,
 )
 from app.risk.costs import CostModel
@@ -422,6 +425,157 @@ def train_meta(
     )
 
 
+_HOLDOUT_SEAL = object()
+
+
+class HoldoutGrant:
+    """Дозвіл навчатись на hold-out `[holdout_from_ms, holdout_to_ms)` після допуску відкриття `opening_id`.
+
+    Конструктор приймає лише приватну печатку, тож грант видає `_grant_holdout`. Це домовленість модуля,
+    а не криптографія: у `app/` `_grant_holdout` кличе лише `artifacts.retrain_registered_recipe` після
+    рядка допуску в БД (тест `test_holdout_grant_is_issued_only_by_artifacts`).
+    """
+
+    __slots__ = ("holdout_from_ms", "holdout_to_ms", "opening_id")
+
+    def __init__(self, opening_id: int, holdout_from_ms: int, holdout_to_ms: int, *, _seal: object) -> None:
+        if _seal is not _HOLDOUT_SEAL:
+            raise ValueError("допуск hold-out видає лише запис у БД")
+        for value in (opening_id, holdout_from_ms, holdout_to_ms):
+            if type(value) is not int or isinstance(value, bool) or value < 0:
+                raise ValueError("грант hold-out зіпсований")
+        if opening_id < 1 or holdout_to_ms <= holdout_from_ms:
+            raise ValueError("грант hold-out зіпсований")
+        self.opening_id = opening_id
+        self.holdout_from_ms = holdout_from_ms
+        self.holdout_to_ms = holdout_to_ms
+
+
+def _grant_holdout(opening_id: int, holdout_from_ms: int, holdout_to_ms: int) -> HoldoutGrant:
+    """Лише після рядка `holdout_openings` з успішним допуском. Кличе `retrain_registered_recipe`."""
+    return HoldoutGrant(opening_id, holdout_from_ms, holdout_to_ms, _seal=_HOLDOUT_SEAL)
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenFit:
+    """Одна модель за вже обраним рецептом. Калібратор і поріг сюди не входять і не перебираються.
+
+    `include_holdout` — рядки навчання заходять у hold-out. Це лише фінальне перенавчання після допуску.
+    `row_times_ms` — час входу кожного навчального рядка. Ранньої зупинки немає.
+    """
+
+    model: MetaFoldModel
+    n_rows: int
+    row_times_ms: tuple[int, ...]
+    lgbm: dict[str, Any]
+    include_holdout: bool
+    coverage_ms: tuple[int, int]
+
+
+def fit_frozen_meta(
+    histories: Sequence[SymbolHistory],
+    *,
+    spec: StrategySpec,
+    split: ResearchSplit,
+    trading_symbol: str,
+    seed: int,
+    costs: CostModel | None = None,
+    params: TargetParams | None = None,
+    feature_data: Mapping[str, SymbolData] | None = None,
+    lgbm: Mapping[str, Any] | None = None,
+    holdout_grant: HoldoutGrant | None = None,
+    expected_schema_hash: str | None = None,
+) -> FrozenFit:
+    """Навчити один бустинг за фіксованими параметрами, без Optuna і без ранньої зупинки.
+
+    Без `holdout_grant` свічки й мітки обрізаються до hold-out: цією моделлю його перевіряють.
+    Грант видає лише `_grant_holdout` після рядка допуску в БД (`retrain_registered_recipe`), і його вікно
+    має збігтися з hold-out розбивки. Прапорця «включити hold-out» немає. Поріг і калібратор не чіпає.
+    """
+    if holdout_grant is not None:
+        if type(holdout_grant) is not HoldoutGrant:
+            raise ValueError("допуск hold-out зіпсований")
+        if (holdout_grant.holdout_from_ms, holdout_grant.holdout_to_ms) != (split.holdout_from_ms, split.holdout_to_ms):
+            raise SplitLeakError("грант не цього hold-out")
+    include_holdout = holdout_grant is not None
+    books = _books(histories, trading_symbol)
+    _spec(spec)
+    _seed(seed)
+    if split.bar_ms != HOUR_MS:
+        raise ValueError("meta-модель рахується на свічках 1h")
+    model_costs = costs if costs is not None else CostModel()
+    if type(model_costs) is not CostModel:
+        raise ValueError("costs має бути CostModel")
+    target = params if params is not None else TargetParams(horizon_bars=split.horizon_bars)
+    if type(target) is not TargetParams or target.horizon_bars != split.horizon_bars:
+        raise ValueError("горизонт таргета і розбивки різний")
+    candle_cut = split.data_to_ms if include_holdout else split.holdout_from_ms
+    decision_cut = split.data_to_ms if include_holdout else split.decision_end_ms
+    # Покриття колонок — завжди до hold-out: дірка в ньому не має міняти склад фіч рецепта.
+    coverage = (split.data_from_ms, split.holdout_from_ms)
+    if coverage[0] >= coverage[1]:
+        raise ValueError("покриття фіч порожнє")
+    series = _feature_series(books, feature_data, split.holdout_from_ms, cutoff_ms=candle_cut)
+    found = {
+        history.symbol: _candidates(
+            spec,
+            history,
+            split,
+            target,
+            model_costs,
+            seed,
+            candle_before_ms=candle_cut,
+            decision_before_ms=decision_cut,
+        )
+        for history in books
+    }
+    by_key = {(item.row.symbol, item.row.index): item for history in books for item in found[history.symbol]}
+    candidates = tuple(
+        sorted((item.row for item in by_key.values()), key=lambda row: (row.time_ms, row.symbol, row.index))
+    )
+    features = compute_features(series, coverage_start_ms=coverage[0], coverage_end_ms=coverage[1])
+    if expected_schema_hash is not None and features.schema_hash != expected_schema_hash:
+        raise MetaTrainError("схема фіч не збігається з моделлю, що пройшла hold-out")
+    train = [item for item in _join(candidates, by_key, features) if item.candidate.sample is not None]
+    if not include_holdout:
+        reject_holdout(tuple(item.candidate.row for item in train), split, purpose=SplitPurpose.TRAIN)
+    if not train:
+        raise MetaTrainError("немає навчальних рядків із фічами")
+    train_samples = tuple(_train_sample(item) for item in train)
+    labels = [sample.label for sample in train_samples]
+    if len(set(labels)) < 2:
+        raise MetaTrainError("у навчанні один клас, бінарну модель не навчити")
+    times = tuple(sample.trade.entry_open_time_ms for sample in train_samples)
+    seen_holdout = any(time >= split.holdout_from_ms for time in times)
+    if include_holdout and not seen_holdout:
+        raise MetaTrainError("перенавчання не бачить жодного рядка hold-out")
+    if not include_holdout and seen_holdout:
+        raise MetaTrainError("модель допуску заходить у hold-out")
+    spans = tuple(label_span(sample.symbol, sample.trade) for sample in train_samples)
+    weights = sample_weights(spans, labels)
+    if not weights or any(weight <= 0 for weight in weights):
+        raise MetaTrainError("без ваг унікальності навчати не можна")
+    checked = lgbm_journal_params() if lgbm is None else dict(lgbm)
+    estimator = _estimator(seed, checked)
+    estimator.fit(_matrix(train), np.asarray(labels, dtype=np.int32), sample_weight=_weight_array(weights))
+    model = MetaFoldModel(
+        fold_index=0,
+        columns=(*features.columns, SIDE_COLUMN),
+        feature_columns=features.columns,
+        schema_hash=features.schema_hash,
+        preprocessing_version=features.preprocessing_version,
+        estimator=estimator,
+    )
+    return FrozenFit(
+        model=model,
+        n_rows=len(train),
+        row_times_ms=times,
+        lgbm=checked,
+        include_holdout=include_holdout,
+        coverage_ms=coverage,
+    )
+
+
 async def run_meta_experiment(
     session: AsyncSession,
     histories: Sequence[SymbolHistory],
@@ -445,6 +599,10 @@ async def run_meta_experiment(
     `primary_strategy` — `StrategySpec.metadata()` цього правила, не словник вибору з T2.7.
     """
     recipe = meta_recipe(shuffled_labels=shuffled_labels, min_probability=min_probability)
+    # Таргет і витрати — частина рецепта (ТЗ §5.3): допуск hold-out звіряє з ними модель допуску (T2.11).
+    target = params if params is not None else TargetParams(horizon_bars=split.horizon_bars)
+    recipe["target"] = target_payload(target)
+    recipe["costs"] = costs_payload(costs if costs is not None else CostModel())
     symbols = tuple(history.symbol for history in _books(histories, trading_symbol))
     experiment_id = await create_experiment(
         session,
@@ -953,12 +1111,15 @@ def _feature_series(
     books: Sequence[SymbolHistory],
     feature_data: Mapping[str, SymbolData] | None,
     holdout_from_ms: int,
+    *,
+    cutoff_ms: int | None = None,
 ) -> dict[str, SymbolData]:
     if feature_data is not None and set(feature_data) != {history.symbol for history in books}:
         raise ValueError("feature_data має бути на кожен символ історії")
     built: dict[str, SymbolData] = {}
     for history in books:
-        prefix = tuple(bar for bar in history.candles if bar.open_time_ms < holdout_from_ms)
+        candle_before = holdout_from_ms if cutoff_ms is None else cutoff_ms
+        prefix = tuple(bar for bar in history.candles if bar.open_time_ms < candle_before)
         if len(prefix) < 2:
             raise ValueError("немає свічок до hold-out")
         extra = None if feature_data is None else feature_data[history.symbol]
@@ -979,11 +1140,11 @@ def _feature_series(
             continue
         built[history.symbol] = SymbolData(
             candles=candles,
-            open_interest=_before(extra.open_interest, holdout_from_ms),
-            premium=_before(extra.premium, holdout_from_ms),
-            long_short=tuple(point for point in extra.long_short if point.ts_ms < holdout_from_ms),
-            liquidations=tuple(bar for bar in extra.liquidations if bar.ts_ms < holdout_from_ms),
-            funding=_before(extra.funding, holdout_from_ms),
+            open_interest=_before(extra.open_interest, candle_before),
+            premium=_before(extra.premium, candle_before),
+            long_short=tuple(point for point in extra.long_short if point.ts_ms < candle_before),
+            liquidations=tuple(bar for bar in extra.liquidations if bar.ts_ms < candle_before),
+            funding=_before(extra.funding, candle_before),
             gaps=extra.gaps,
         )
     return built
@@ -1015,17 +1176,22 @@ def _candidates(
     target: TargetParams,
     costs: CostModel,
     seed: int,
+    *,
+    candle_before_ms: int | None = None,
+    decision_before_ms: int | None = None,
 ) -> tuple[_Candidate, ...]:
-    prefix = tuple(bar for bar in history.candles if bar.open_time_ms < split.holdout_from_ms)
+    candle_cut = split.holdout_from_ms if candle_before_ms is None else candle_before_ms
+    decision_cut = split.decision_end_ms if decision_before_ms is None else decision_before_ms
+    prefix = tuple(bar for bar in history.candles if bar.open_time_ms < candle_cut)
     found = tuple(
         candidate
         for candidate in primary_candidates(spec, prefix, symbol=history.symbol, seed=seed)
-        if prefix[candidate.entry_index].open_time_ms < split.decision_end_ms
+        if prefix[candidate.entry_index].open_time_ms < decision_cut
     )
     marks = None
     if history.mark_candles is not None:
-        marks = tuple(bar for bar in history.mark_candles if bar.open_time_ms < split.holdout_from_ms)
-    funding = tuple(event for event in history.funding if event.time_ms < split.holdout_from_ms)
+        marks = tuple(bar for bar in history.mark_candles if bar.open_time_ms < candle_cut)
+    funding = tuple(event for event in history.funding if event.time_ms < candle_cut)
     labeled = label_meta(prefix, found, params=target, costs=costs, mark_candles=marks, funding=funding)
     if len(labeled.samples) + len(labeled.skipped) != len(found):
         raise RuntimeError("label_meta загубив кандидата")

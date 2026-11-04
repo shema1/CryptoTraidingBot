@@ -260,6 +260,24 @@ class ProbabilityCalibrator:
         """Одна сира ймовірність → калібрована. Та сама функція в дослідженні і в live."""
         return self._apply((probability,))[0]
 
+    def payload(self) -> dict[str, Any]:
+        """Числа калібратора рядками hex. У файл артефакту, без pickle і без float у JSON."""
+        if self.method == "isotonic":
+            estimator = self.estimator
+            return {
+                "method": "isotonic",
+                "x_thresholds": [_float_hex(value) for value in estimator.X_thresholds_],
+                "y_thresholds": [_float_hex(value) for value in estimator.y_thresholds_],
+            }
+        if self.method == "platt":
+            estimator = self.estimator
+            return {
+                "method": "platt",
+                "coef": _float_hex(float(estimator.coef_[0, 0])),
+                "intercept": _float_hex(float(estimator.intercept_[0])),
+            }
+        raise RuntimeError("невідомий метод калібрування")
+
     # Округлення до `_PROBABILITY_QUANTUM` не залежить від контексту потоку (CCXT лишає HALF_UP).
     @fixed_context
     def _apply(self, probabilities: Sequence[Decimal]) -> tuple[Decimal, ...]:
@@ -679,6 +697,83 @@ def _oof(
         for row, probability in zip(group, probabilities, strict=True):
             mapped[(row.symbol, row.time_ms)] = probability
     return mapped
+
+
+def calibrator_from_payload(payload: Mapping[str, Any]) -> ProbabilityCalibrator:
+    """Той самий калібратор, що `payload()`. Новий fit не відбувається: поріг уже обрано на walk-forward."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("калібратор має бути об'єктом")
+    method = payload.get("method")
+    if method == "isotonic":
+        x_raw = payload.get("x_thresholds")
+        y_raw = payload.get("y_thresholds")
+        if (
+            not isinstance(x_raw, list)
+            or not isinstance(y_raw, list)
+            or not x_raw
+            or len(x_raw) != len(y_raw)
+            or set(payload) != {"method", "x_thresholds", "y_thresholds"}
+        ):
+            raise ValueError("isotonic-калібратор зіпсований")
+        x_values = np.array([_float_from_hex(item) for item in x_raw], dtype=np.float64)
+        y_values = np.array([_float_from_hex(item) for item in y_raw], dtype=np.float64)
+        if np.any(np.diff(x_values) <= 0):
+            raise ValueError("пороги isotonic не зростають")
+        estimator = IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip")
+        estimator.X_thresholds_ = x_values
+        estimator.y_thresholds_ = y_values
+        estimator.X_min_ = float(x_values[0])
+        estimator.X_max_ = float(x_values[-1])
+        estimator.increasing_ = True
+        # sklearn clips to the end knots, then interpolates. np.interp does the same clip.
+        estimator.f_ = _PiecewiseLinear(x_values, y_values)
+        return ProbabilityCalibrator(method="isotonic", estimator=estimator)
+    if method == "platt":
+        if set(payload) != {"method", "coef", "intercept"}:
+            raise ValueError("Platt-калібратор зіпсований")
+        estimator = LogisticRegression(
+            C=1.0,
+            solver="lbfgs",
+            max_iter=_PLATT_MAX_ITER,
+            class_weight=None,
+            random_state=0,
+        )
+        estimator.classes_ = np.array([0, 1], dtype=np.int64)
+        estimator.coef_ = np.array([[_float_from_hex(payload["coef"])]], dtype=np.float64)
+        estimator.intercept_ = np.array([_float_from_hex(payload["intercept"])], dtype=np.float64)
+        estimator.n_features_in_ = 1
+        return ProbabilityCalibrator(method="platt", estimator=estimator)
+    raise ValueError("метод калібрування — isotonic або platt")
+
+
+class _PiecewiseLinear:
+    """Лінійна інтерполяція вузлів isotonic. Поза крайніми вузлами — значення краю."""
+
+    def __init__(self, knots: np.ndarray, values: np.ndarray) -> None:
+        self._knots = knots
+        self._values = values
+
+    def __call__(self, raw: np.ndarray) -> np.ndarray:
+        return np.interp(np.asarray(raw, dtype=np.float64), self._knots, self._values)
+
+
+def _float_hex(value: float) -> str:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("коефіцієнт калібратора не скінченний")
+    return number.hex()
+
+
+def _float_from_hex(value: object) -> float:
+    if type(value) is not str:
+        raise ValueError("коефіцієнт калібратора має бути hex-рядком")
+    try:
+        number = float.fromhex(value)
+    except ValueError as exc:
+        raise ValueError("коефіцієнт калібратора не hex") from exc
+    if not math.isfinite(number):
+        raise ValueError("коефіцієнт калібратора не скінченний")
+    return number
 
 
 def _fit(method: str, rows: Sequence[OosObservation]) -> ProbabilityCalibrator:

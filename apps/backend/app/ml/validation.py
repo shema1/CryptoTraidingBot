@@ -37,7 +37,8 @@ from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestMetrics, BacktestReport, BacktestTrade
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, TRIAL_STATES, Experiment, ExperimentTrial, HoldoutOpening, TrialInvalidation
-from app.ml.trade_sim import DirectSample, ExitReason, MetaSample, StopPriceSource
+from app.ml.trade_sim import DirectSample, ExitReason, MetaSample, StopPriceSource, TargetParams
+from app.risk.costs import CostModel
 from app.risk.numbers import FrozenModel, fixed_context, require_decimal
 
 # 90 і 180 діб — наближення «3 і 6 місяців» без прив'язки до календаря.
@@ -432,6 +433,35 @@ def label_diagnostics(samples: Sequence[MetaSample | DirectSample]) -> LabelStat
         if _both_reached(sample):
             both += 1
     return LabelStats(n_labels=len(samples), n_last_stop=last, n_both_reached_tp=both)
+
+
+def target_payload(target: TargetParams) -> dict[str, Any]:
+    """Таргет у журналі експерименту: множники рядками Decimal, горизонт — int. Той самий формат у `model_metadata`."""
+    if type(target) is not TargetParams:
+        raise ValueError("params має бути TargetParams")
+    return {
+        "tp_atr_mult": format(target.tp_atr_mult, "f"),
+        "sl_atr_mult": format(target.sl_atr_mult, "f"),
+        "horizon_bars": target.horizon_bars,
+    }
+
+
+def costs_payload(costs: CostModel) -> dict[str, Any]:
+    """Модель витрат у журналі: кожне поле `CostModel` рядком Decimal або `null`.
+
+    Той самий формат у `model_metadata.cost_model`.
+    """
+    if type(costs) is not CostModel:
+        raise ValueError("costs має бути CostModel")
+    payload: dict[str, Any] = {}
+    for key, value in costs.model_dump().items():
+        if value is None:
+            payload[key] = None
+        elif type(value) is Decimal:
+            payload[key] = format(value, "f")
+        else:
+            raise ValueError("модель витрат містить не Decimal")
+    return payload
 
 
 def validation_payload(split: ResearchSplit) -> dict[str, Any]:

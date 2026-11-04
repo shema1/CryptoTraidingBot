@@ -92,6 +92,8 @@ bash ai-setup/install.sh                            # лише якщо в ко�
 
 На macOS офіційне колесо LightGBM шукає `libomp`. Якщо `import lightgbm` падає з `Library not loaded: libomp.dylib`, поставте `brew install libomp` і повторіть `uv sync`. Рецепт meta-моделі фіксує `n_jobs=1`, тож OpenMP на результат навчання не впливає, але без бібліотеки колесо просто не імпортується.
 
+Якщо `brew install libomp` зупиняється з `Refusing to load formula … from untrusted tap …`, справа не в libomp (він з `homebrew/core`): Homebrew 7 вимагає явної довіри до сторонніх tap-ів, з яких уже щось встановлено. Довіртеся лише тим формулам, які brew перелічить у попередженні (`brew trust --formula <user>/<tap>/<formula> …`), або приберіть непотрібний tap (`brew untap <user>/<tap>`), і повторіть `brew install libomp`.
+
 Працюєте з AI-агентами (Claude Code, Cursor) — після кроку 4 задайте `MCP_DATABASE_URI` для MCP `postgres-readonly`
 (агент читає dev-БД через роль `ctb_readonly`): `docs/ai/AI_SETUP.md`, «Встановлення», крок 2. Змінна живе в профілі
 shell, а не в `.env`; без неї бекенд працює, лише агент не бачить БД.
