@@ -83,6 +83,9 @@ REASON_UNUSABLE_EXIT: str = "UNUSABLE_EXIT"
 # Як оцінено угоди фолдів спроби meta для G1 (рішення 0020): правилом входу рецепта (`decide_entry`),
 # калібратор і поріг якого для фолду k підігнані на інших фолдах. Без цієї позначки G1 відмовляє.
 ENTRY_EVALUATION: str = "decision_cross_fold"
+# Для `direct` (рішення 0022): правило фолду k підігнане лише на OOF-рядках фолдів `< k`, ніколи на пізніших.
+# Фолд 0 має правило `None` — його угод немає. Інша позначка, щоб `meta` не прийняв її за свою перехресну оцінку.
+ENTRY_EVALUATION_PAST_FOLDS: str = "past_folds"
 
 _METHODS: tuple[str, ...] = ("isotonic", "platt")
 _SKIP_REASONS: tuple[str, ...] = (

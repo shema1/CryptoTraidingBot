@@ -1,7 +1,7 @@
 """Артефакти моделі, статуси і перенавчання рецепта (ТЗ §5.3, §5.4, §5.4.1, §5.7, T2.11).
 
 Каталог `models/<model_version>/` пише лише цей модуль: `model_metadata.json`, для `meta` ще
-`model.txt` і `calibrator.json`, для `direct` — лише `model.txt`. `rule_only` файлу моделі не має.
+`model.txt` і `calibrator.json`; `direct` має той самий склад (рішення 0022). `rule_only` файлу моделі не має.
 
 Статуси: `TRAINED → CANDIDATE → APPROVED → RETIRED`. `CANDIDATE` ще можна зняти в `RETIRED`,
 не проходячи Live. `APPROVED` ставить лише людина підтвердженим `audit_log` `model.approve`.
@@ -67,9 +67,7 @@ from app.ml.decision import (
 from app.ml.features import PREPROCESSING_VERSION, SymbolData, feature_schema_hash
 from app.ml.meta_model import (
     SIDE_COLUMN,
-    FrozenFit,
     HoldoutGrant,
-    MetaFoldModel,
     MetaTrainError,
     _grant_holdout,
     fit_frozen_meta,
@@ -88,6 +86,7 @@ from app.ml.statistics import (
 from app.ml.strategy import PRIMARY_CANDIDATES, StrategySpec, SymbolHistory
 from app.ml.trade_sim import TargetParams
 from app.ml.validation import (
+    DIRECT_STAGE,
     ResearchSplit,
     SampleRow,
     SplitLeakError,
@@ -158,6 +157,8 @@ _LGBM_INT = frozenset({"num_leaves", "max_depth", "n_estimators", "min_child_sam
 _LGBM_BOOL = frozenset({"deterministic", "force_col_wise"})
 _LGBM_KEYS = _LGBM_DECIMAL | _LGBM_INT | _LGBM_BOOL | {"boosting_type", "class_weight"}
 _SYMBOL = re.compile(SYMBOL_RE)
+# Порядок класів моделі direct (`direct_model.CLASS_LABELS`). Тест звіряє, бо імпорт звідти дав би цикл.
+_DIRECT_CLASSES: tuple[str, ...] = ("FLAT", "LONG", "SHORT")
 _PROBABILITY_QUANTUM = Decimal("0.0000000001")
 
 
@@ -235,7 +236,7 @@ class AdmissionDecision:
 
 @dataclass(frozen=True, slots=True)
 class LoadedModel:
-    """Прочитаний каталог. Бустер є лише в `meta` і `direct`, калібратор — лише в `meta`.
+    """Прочитаний каталог. Бустер і калібратор є в `meta` і `direct`; `rule_only` — ні.
 
     `db_status` ставить лише `load_registered_model`: статус із БД на момент читання. `load_model` лишає
     `None`, і така модель не торгує (`infer_entry`, `accept_primary`).
@@ -380,7 +381,7 @@ def build_metadata(
     *,
     model_version: str,
     label_type: str,
-    spec: StrategySpec,
+    spec: StrategySpec | None,
     trade_symbol: str,
     train_symbols: Sequence[str],
     feature_columns: Sequence[str],
@@ -408,10 +409,17 @@ def build_metadata(
     """
     if label_type not in LABEL_TYPES:
         raise ArtifactError("невідомий label_type")
-    if type(spec) is not StrategySpec or spec not in PRIMARY_CANDIDATES:
-        raise ArtifactError("артефакт лише для зафіксованого кандидата")
-    if spec.metadata()["name"] != spec.name:
-        raise ArtifactError("primary_strategy зіпсований")
+    # `direct` не має первинного правила (рішення 0022): поле `primary_strategy` — `{}`, як у `experiments`.
+    if label_type == "direct":
+        if spec is not None:
+            raise ArtifactError("direct не має первинного правила")
+        primary: dict[str, Any] = {}
+    else:
+        if type(spec) is not StrategySpec or spec not in PRIMARY_CANDIDATES:
+            raise ArtifactError("артефакт лише для зафіксованого кандидата")
+        if spec.metadata()["name"] != spec.name:
+            raise ArtifactError("primary_strategy зіпсований")
+        primary = spec.metadata()
     columns = tuple(feature_columns)
     if not columns or len(columns) != len(set(columns)):
         raise ArtifactError("колонки фіч порожні або повторюються")
@@ -448,8 +456,9 @@ def build_metadata(
             raise ArtifactError("meta потребує рецепт LightGBM і калібратор")
         algorithm = "lightgbm"
     else:
-        if recipe_lgbm is None or calibrator_method is not None:
-            raise ArtifactError("direct потребує рецепт LightGBM і не має калібратора meta")
+        # Калібратор direct — той самий, що в журналі (`decision_payload`), файл `calibrator.json` (рішення 0022).
+        if recipe_lgbm is None or calibrator_method not in ("isotonic", "platt"):
+            raise ArtifactError("direct потребує рецепт LightGBM і калібратор")
         algorithm = "lightgbm"
     if validated_by is not None and (
         type(validated_by) is not str or not validated_by or validated_by == model_version
@@ -462,7 +471,7 @@ def build_metadata(
         "model_version": model_version,
         "algorithm": algorithm,
         "label_type": label_type,
-        "primary_strategy": spec.metadata(),
+        "primary_strategy": primary,
         "trade_symbol": trade_symbol,
         "train_symbols": list(symbols),
         "timeframe": "1h",
@@ -514,12 +523,10 @@ def write_artifact(
     if label == "rule_only":
         if booster is not None or calibrator is not None:
             raise ArtifactError("rule_only без файлу моделі")
-    elif label == "meta":
+    elif label in ("meta", "direct"):
+        # `direct` має той самий файловий склад, що `meta` (рішення 0022): бустер і калібратор.
         if not isinstance(booster, lgb.Booster) or type(calibrator) is not ProbabilityCalibrator:
-            raise ArtifactError("meta потребує бустер і калібратор")
-    elif label == "direct":
-        if not isinstance(booster, lgb.Booster) or calibrator is not None:
-            raise ArtifactError("direct потребує лише бустер")
+            raise ArtifactError(f"{label} потребує бустер і калібратор")
     else:
         raise ArtifactError("невідомий label_type")
     if metadata.get("model_version") != directory.name or metadata.get("status") != "TRAINED":
@@ -613,8 +620,8 @@ def assert_runtime(
         raise InferenceBlocked("версія lightgbm не збігається")
     if "xgboost" in recorded and recorded["xgboost"] != current.get("xgboost"):
         raise InferenceBlocked("версія xgboost не збігається")
-    # Калібратор meta відновлюється в об'єкти scikit-learn: інша версія може змінити калібровану ймовірність.
-    if metadata.get("label_type") == "meta" and recorded.get("scikit-learn") != current.get("scikit-learn"):
+    # Калібратор meta і direct відновлюється в об'єкти scikit-learn: інша версія може змінити калібровану ймовірність.
+    if metadata.get("label_type") in ("meta", "direct") and recorded.get("scikit-learn") != current.get("scikit-learn"):
         raise InferenceBlocked("версія scikit-learn (калібратор) не збігається")
 
 
@@ -1018,6 +1025,8 @@ async def approve_model(session: AsyncSession, *, model_version: str, confirmed_
     Умова 5 ТЗ §5.3 (7 днів Testnet без аномалій) — на людині, що підтверджує.
     """
     row = await _model(session, model_version)
+    if row.label_type == "direct":
+        raise ArtifactError("direct не стає APPROVED до T5.x (рішення 0022)")
     if row.status != "CANDIDATE":
         raise ArtifactError("APPROVED ставиться лише з CANDIDATE")
     audit = await session.get(AuditLog, confirmed_audit_id)
@@ -1056,10 +1065,15 @@ async def retire_model(session: AsyncSession, *, model_version: str) -> None:
 
 
 async def require_model_for_start(session: AsyncSession, *, model_version: str, mode: str) -> ModelArtifact:
-    """Чи можна підняти бота з цією моделлю. Live — лише APPROVED. Demo і Testnet — ще й CANDIDATE."""
+    """Чи можна підняти бота з цією моделлю. Live — лише APPROVED. Demo і Testnet — ще й CANDIDATE.
+
+    `direct` до T5.x не торгує в жодному режимі (рішення 0022): інференсу для нього немає.
+    """
     if mode not in MODES:
         raise ArtifactError("режим — demo, testnet або live")
     row = await _model(session, model_version)
+    if row.label_type == "direct":
+        raise ModelNotTradable(f"{mode}: direct не торгує до T5.x (рішення 0022)")
     if row.status not in _TRADABLE[mode]:
         raise ModelNotTradable(f"{mode} не стартує з моделлю у статусі {row.status}")
     return row
@@ -1142,13 +1156,45 @@ async def retrain_registered_recipe(
         fit_columns = fit.model.feature_columns
         booster = booster_of(fit.model)
         calibrator = loaded.calibrator
+    elif meta["label_type"] == "direct":
+        # Імпорт тут: `direct_model` імпортує `artifacts` (`decision_payload`), на рівні модуля був би цикл.
+        from app.ml.direct_model import DirectTrainError, fit_frozen_direct
+
+        loaded = await load_registered_model(session, validation_version)
+        if loaded.booster is None or loaded.calibrator is None:
+            raise ArtifactError("немає файлу моделі допуску")
+        recipe_lgbm = _lgbm_from_payload(meta["recipe"]["lgbm"])
+        direct_common: dict[str, Any] = {
+            "split": split,
+            "trading_symbol": str(evidence.trade_symbol),
+            "seed": seed,
+            "costs": recipe_costs,
+            "params": recipe_target,
+            "feature_data": feature_data,
+            "lgbm": recipe_lgbm,
+            "expected_schema_hash": str(evidence.feature_schema_hash),
+        }
+        try:
+            direct_replay = await asyncio.to_thread(fit_frozen_direct, histories, **direct_common)
+        except (DirectTrainError, ValueError) as exc:
+            raise ArtifactError(f"модель допуску не відтворюється рецептом: {exc}") from exc
+        if _booster_sha256(booster_of(direct_replay.model)) != evidence.artifact_sha256:
+            raise ArtifactError("модель допуску не відтворюється рецептом: інший файл моделі")
+        direct_fit = await asyncio.to_thread(fit_frozen_direct, histories, holdout_grant=grant, **direct_common)
+        _guard_retrain(direct_fit, meta)
+        fit_rows = direct_fit.n_rows
+        fit_lgbm = direct_fit.lgbm
+        fit_coverage = direct_fit.coverage_ms
+        fit_columns = direct_fit.model.feature_columns
+        booster = booster_of(direct_fit.model)
+        calibrator = loaded.calibrator
     else:
-        raise ArtifactError("пряме прогнозування ще не перенавчається")
+        raise ArtifactError("невідомий label_type для перенавчання")
     version = allocate_version(root, str(evidence.label_type), at_ms=at_ms)
     fresh = build_metadata(
         model_version=version,
         label_type=str(evidence.label_type),
-        spec=strategy_from_metadata(meta["primary_strategy"]),
+        spec=None if meta["label_type"] == "direct" else strategy_from_metadata(meta["primary_strategy"]),
         trade_symbol=str(evidence.trade_symbol),
         train_symbols=tuple(meta["train_symbols"]),
         feature_columns=fit_columns,
@@ -1184,7 +1230,7 @@ async def retrain_registered_recipe(
     return registered
 
 
-def booster_of(model: MetaFoldModel) -> lgb.Booster:
+def booster_of(model: Any) -> lgb.Booster:
     """Файл моделі — бустер LightGBM, не pickle класифікатора."""
     booster = model.estimator.booster_
     if not isinstance(booster, lgb.Booster):
@@ -1310,9 +1356,18 @@ async def _g1_trial(session: AsyncSession, opening: HoldoutOpening, result: Mapp
 def _recipe_matches_trial(meta: Mapping[str, Any], trial: ExperimentTrial) -> None:
     """Hold-out перевіряє саме рецепт спроби, що пройшла G1, а не інший варіант того самого експерименту."""
     params = trial.params if isinstance(trial.params, Mapping) else {}
-    if params.get("strategy") != meta.get("primary_strategy"):
-        raise ArtifactError("правило моделі допуску не те, що в спробі G1")
     recipe_lgbm = meta.get("recipe", {}).get("lgbm")
+    if meta.get("label_type") == "direct":
+        # `direct` без первинного правила (рішення 0022): ідентичність рецепта — стадія, роль, клас і objective.
+        if (
+            params.get("stage") != DIRECT_STAGE
+            or params.get("role") != "direct"
+            or params.get("objective") != "multiclass"
+            or params.get("classes") != list(_DIRECT_CLASSES)
+        ):
+            raise ArtifactError("спроба G1 не прямого прогнозування (stage, role, objective, classes)")
+    elif params.get("strategy") != meta.get("primary_strategy"):
+        raise ArtifactError("правило моделі допуску не те, що в спробі G1")
     if meta.get("label_type") == "rule_only":
         if recipe_lgbm is not None:
             raise ArtifactError("rule_only без LightGBM")
@@ -1511,7 +1566,7 @@ def _holdout_report(report: BacktestReport, trade_symbol: str, holdout_from_ms: 
             raise ArtifactError("вихід угоди за кінцем hold-out")
 
 
-def _guard_retrain(fit: FrozenFit, evidence: Mapping[str, Any]) -> None:
+def _guard_retrain(fit: Any, evidence: Mapping[str, Any]) -> None:
     if fit.include_holdout is not True:
         raise ArtifactError("перенавчання має включати hold-out")
     if _lgbm_payload(fit.lgbm) != evidence["recipe"]["lgbm"]:
@@ -1666,17 +1721,13 @@ def _load_directory(directory: Path) -> LoadedModel:
             raise ArtifactError("rule_only не має файлу моделі")
         if reproducibility.get("model_sha256") is not None or reproducibility.get("calibrator_sha256") is not None:
             raise ArtifactError("rule_only не має хеша файлу моделі")
-    elif label == "meta":
+    elif label in ("meta", "direct"):
         booster = _load_booster(model_path, payload)
         if not calibrator_path.is_file() or _sha256_file(calibrator_path) != reproducibility.get("calibrator_sha256"):
             raise ArtifactError("хеш калібратора не збігається")
         calibrator = calibrator_from_payload(json.loads(calibrator_path.read_text(encoding="utf-8")))
         if calibrator.method != payload.get("recipe", {}).get("calibrator"):
             raise ArtifactError("метод калібратора не збігається з метаданими")
-    elif label == "direct":
-        if calibrator_path.exists() or reproducibility.get("calibrator_sha256") is not None:
-            raise ArtifactError("direct не має калібратора meta")
-        booster = _load_booster(model_path, payload)
     else:
         raise ArtifactError("невідомий label_type")
     _rule(payload["decision_rule"])

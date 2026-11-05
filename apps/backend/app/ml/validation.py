@@ -50,6 +50,8 @@ MIN_TRADES_PER_FOLD: int = 20
 HOLDOUT_FRACTION_MIN: Decimal = Decimal("0.15")
 HOLDOUT_FRACTION_MAX: Decimal = Decimal("0.20")
 DEFAULT_HOLDOUT_FRACTION: Decimal = Decimal("0.20")
+# Ознака спроби прямого прогнозування (T2.13) в `params`. Для G1 відрізняє її від meta-спроби.
+DIRECT_STAGE: str = "direct_model"
 
 _TIMEFRAME = "1h"
 _SYMBOL = re.compile(SYMBOL_RE)
@@ -191,16 +193,27 @@ class MetaFoldRuns(FrozenModel):
     stress: BacktestReport
 
 
+class DirectFoldRuns(FrozenModel):
+    """Стрес прямого прогнозу торгового символу (T2.13): ті самі сигнали з подвоєними витратами.
+
+    G1 бере його з журналу, а не від викликача, — так само, як стрес `meta` (рішення 0017).
+    """
+
+    stress: BacktestReport
+
+
 class FoldRecord(FrozenModel):
     """Прогони одного фолду. Кожен символ експерименту — рівно один `run_backtest`.
 
     `meta` — лише для експерименту `label_type=meta`: правило без фільтра і стрес того самого фолду.
+    `direct` — лише для експерименту `label_type=direct`: стрес сигналів того самого фолду.
     """
 
     reports: tuple[BacktestReport, ...]
     train_labels: LabelStats
     test_labels: LabelStats
     meta: MetaFoldRuns | None = None
+    direct: DirectFoldRuns | None = None
 
 
 class RecordedTrial(FrozenModel):
@@ -1089,6 +1102,17 @@ def _fold_block(
             seed=seed,
             research_line=research_line,
         )
+    if record.direct is not None:
+        if label_type != "direct":
+            raise ValueError("стрес прямого прогнозу пишеться лише в експеримент direct")
+        block["direct"] = _direct_block(
+            record.direct,
+            trading,
+            split=split,
+            fold_index=fold_index,
+            seed=seed,
+            research_line=research_line,
+        )
     return block, series, entries, any_last, any_both
 
 
@@ -1128,6 +1152,34 @@ def _meta_block(
         "scored_unfiltered": _report_json(runs.scored_unfiltered),
         "stress": {**_report_json(runs.stress), "cost_factor": runs.stress.cost_factor},
     }
+
+
+def _direct_block(
+    runs: DirectFoldRuns,
+    trading: BacktestReport,
+    *,
+    split: ResearchSplit,
+    fold_index: int,
+    seed: int,
+    research_line: str,
+) -> dict[str, Any]:
+    """Стрес прямого прогнозу — той самий прогін торгового символу з дорожчими витратами і тими самими сигналами."""
+    stress = runs.stress
+    if stress.symbol != research_line:
+        raise ValueError("стрес прямого прогнозу — лише торгового символу")
+    if stress.seed != seed:
+        raise ValueError("seed прогону не збігається з експериментом")
+    _report_matches_trades(stress)
+    for trade in stress.trades:
+        _trade_inside(trade, split, fold_index)
+    if stress.cost_factor <= trading.cost_factor:
+        raise ValueError("стрес має бути дорожчим за прогін фолду")
+    for report in (trading, stress):
+        if len(_signal_keys(report)) != report.n_signals:
+            raise ValueError("сигнал повторюється в прогоні: `run_backtest` дає одне рішення на свічку")
+    if _signal_keys(stress) != _signal_keys(trading) or stress.n_signals != trading.n_signals:
+        raise ValueError("стрес — ті самі сигнали, що прогін фолду")
+    return {"stress": {**_report_json(stress), "cost_factor": stress.cost_factor}}
 
 
 def _signal_keys(report: BacktestReport) -> set[tuple[int, PositionSide]]:

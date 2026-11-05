@@ -31,11 +31,18 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.backtest import BacktestReport, BacktestTrade
-from app.ml.decision import ENTRY_EVALUATION
+from app.ml.decision import ENTRY_EVALUATION, ENTRY_EVALUATION_PAST_FOLDS
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact, TrialInvalidation
 from app.ml.strategy import is_reference_baseline
-from app.ml.validation import MIN_TRADES_PER_FOLD, RecordedOpening, SplitLeakError, _lock_line, _open_holdout
+from app.ml.validation import (
+    DIRECT_STAGE,
+    MIN_TRADES_PER_FOLD,
+    RecordedOpening,
+    SplitLeakError,
+    _lock_line,
+    _open_holdout,
+)
 from app.risk.limits import next_consecutive_losses
 from app.risk.numbers import FrozenModel, require_decimal
 
@@ -788,12 +795,14 @@ def evaluate_gate(
 
 
 def entry_rule_evaluated(params: Any) -> bool:
-    """Спроба meta оцінена правилом входу рецепта перехресно по фолдах і несе саме правило (рішення 0020)."""
-    return (
-        isinstance(params, Mapping)
-        and params.get("entry_evaluation") == ENTRY_EVALUATION
-        and isinstance(params.get("decision"), Mapping)
-    )
+    """Спроба оцінена правилом входу рецепта і несе саме правило: meta — перехресно (рішення 0020),
+    direct — лише минулими фолдами (рішення 0022)."""
+    if not isinstance(params, Mapping) or not isinstance(params.get("decision"), Mapping):
+        return False
+    marker = params.get("entry_evaluation")
+    if params.get("stage") == DIRECT_STAGE:
+        return marker == ENTRY_EVALUATION_PAST_FOLDS
+    return marker == ENTRY_EVALUATION
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,6 +850,11 @@ async def _evaluate_g1(
     if experiment.label_type != "meta" and _is_meta_trial(trial.params):
         # Інакше спроба meta, записана в `direct` / `rule_only`, обійшла б порівняння з правилом (рішення 0017).
         raise ValueError("спроба meta-моделі в експерименті іншого label_type не буває кандидатом")
+    if experiment.label_type == "direct" and not _is_direct_trial(trial.params):
+        raise ValueError("спроба не прямого прогнозу в експерименті direct не буває кандидатом")
+    if experiment.label_type != "direct" and _is_direct_trial(trial.params):
+        # Симетрично до meta: спроба direct у meta- чи rule_only-експерименті не буває кандидатом (рішення 0022).
+        raise ValueError("спроба direct в експерименті іншого label_type не буває кандидатом")
     stored = experiment.params.get("validation")
     if not isinstance(stored, dict):
         raise SplitLeakError("в експерименту немає розбивки")
@@ -873,6 +887,12 @@ async def _evaluate_g1(
         if stress is not None and checked_stress != recorded:
             recorded = None
         checked_stress = () if recorded is None else recorded
+    elif experiment.label_type == "direct":
+        # Стрес прямого прогнозу — з журналу (T2.13); переданий викликачем має збігатися з ним.
+        recorded_direct = _journal_direct_stress(trial.metrics)
+        if stress is not None and checked_stress != recorded_direct:
+            recorded_direct = None
+        checked_stress = () if recorded_direct is None else recorded_direct
     decision = evaluate_gate(
         label_type=experiment.label_type,
         folds=folds,
@@ -884,9 +904,10 @@ async def _evaluate_g1(
         scored_unfiltered_total_net=scored_unfiltered_total_net,
         thresholds=effective,
     )
-    if experiment.label_type == "meta" and not entry_rule_evaluated(trial.params):
+    if experiment.label_type in ("meta", "direct") and not entry_rule_evaluated(trial.params):
         # Угоди відібрані `keep(0.5)` або правила входу немає: G1 оцінив би не те правило, що піде
-        # в модель допуску і live (рішення 0020). Відмова, а не тихий пропуск.
+        # в модель допуску і live (рішення 0020). Відмова, а не тихий пропуск. Для direct — той самий
+        # перехресний перерахунок правила входу (T2.13).
         decision = decision.model_copy(update={"passed": False, "reasons": (*decision.reasons, G1_ENTRY_RULE)})
     return _G1(
         experiment=experiment,
@@ -985,7 +1006,9 @@ async def open_holdout_after_gate(
     Для `meta` обидва правила без фільтра і стрес G1 рахує зі звітів бектесту, які `record_trial` перевірив
     і поклав у `metrics` фолду (`meta`, рішення 0017). Стрес викликача можна не передавати; переданий
     має збігатися із записаним. Звітів немає або стрес інший — `G1_FILTER` / `G1_STRESS`, без запису.
-    Для `direct` і `rule_only` стрес передає викликач; без нього — `G1_STRESS`.
+    Для `direct` стрес рахується зі звітів `metrics.folds[].direct` (T2.13), як для `meta`; переданий
+    викликачем має збігатися з ними (рішення 0022: допуск і статуси direct — T2.11-розширення).
+    Для `rule_only` стрес передає викликач; без нього — `G1_STRESS`.
     `model_version` обов'язкова: `None` у `_evaluate_g1` означає перегляд без перевірки моделі, тож
     відкриття без неї відмовляє (`ValueError`) до будь-якого розрахунку.
     """
@@ -1210,6 +1233,31 @@ def _journal_net(block: object) -> Decimal:
 def _is_meta_trial(params: Mapping[str, Any]) -> bool:
     """Ознаки спроби meta-моделі в параметрах — те, що пише `MetaRun.trial_params()`."""
     return params.get("stage") == "meta_model" or params.get("role") == "meta" or "comparison" in params
+
+
+def _is_direct_trial(params: Mapping[str, Any]) -> bool:
+    """Ознака спроби прямого прогнозу (`direct_trial_params`, T2.13)."""
+    return params.get("stage") == DIRECT_STAGE
+
+
+def _journal_direct_stress(metrics: Mapping[str, Any]) -> tuple[FoldOutcome, ...] | None:
+    """Стрес сигналів кожного фолду з `metrics.folds[].direct`. Хоч одного фолду без нього — `None`."""
+    folds = metrics.get("folds")
+    if not isinstance(folds, list) or not folds:
+        return None
+    stress: list[FoldOutcome] = []
+    try:
+        for fold in folds:
+            runs = fold.get("direct") if isinstance(fold, Mapping) else None
+            if not isinstance(runs, Mapping):
+                return None
+            block = runs.get("stress")
+            cost = block.get("cost_factor") if isinstance(block, Mapping) else None
+            below = fold.get("below_min_trades")
+            stress.append(_fold_outcome({"trading": block, "below_min_trades": below, "cost_factor": cost}))
+    except ValueError:
+        return None
+    return tuple(stress)
 
 
 def _fold_outcome(fold: object) -> FoldOutcome:

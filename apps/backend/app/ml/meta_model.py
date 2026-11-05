@@ -1281,12 +1281,13 @@ def _score(
     return tuple(scored)
 
 
-def _estimator(seed: int, raw: Mapping[str, Any] | None) -> lgb.LGBMClassifier:
+def _estimator(seed: int, raw: Mapping[str, Any] | None, *, objective: str = "binary") -> lgb.LGBMClassifier:
+    """Класифікатор за журнальним рецептом. `objective`: `binary` для meta, `multiclass` для direct (T2.13)."""
     source = lgbm_journal_params() if raw is None else raw
     if source.get("n_jobs") != 1 or source.get("class_weight") is not None or source.get("deterministic") is not True:
         raise MetaTrainError("рецепт LightGBM змінився: очікувались n_jobs=1, deterministic і порожній class_weight")
     model = lgb.LGBMClassifier(
-        objective="binary",
+        objective=objective,
         boosting_type=str(source["boosting_type"]),
         num_leaves=int(source["num_leaves"]),
         max_depth=int(source["max_depth"]),
