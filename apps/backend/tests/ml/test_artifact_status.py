@@ -16,7 +16,6 @@ from app.api.models import AuditLog
 from app.exchange.types import PositionSide
 from app.ml.artifacts import (
     CALIBRATOR_FILE,
-    DEFAULT_BOOTSTRAP_REPLICATES,
     METADATA_FILE,
     MODEL_FILE,
     REASON_DRAWDOWN,
@@ -47,6 +46,7 @@ from app.ml.decision import DecisionRule
 from app.ml.features import HOUR_MS, feature_columns, feature_schema_hash
 from app.ml.meta_model import _grant_holdout, fit_frozen_meta, lgbm_journal_params
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening, ModelArtifact
+from app.ml.statistics import DEFAULT_BOOTSTRAP_REPLICATES
 from app.ml.strategy import BREAKOUT, EMA_CROSS, StrategySpec, SymbolHistory
 from app.ml.trade_sim import TargetParams
 from app.ml.validation import (

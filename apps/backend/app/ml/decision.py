@@ -80,12 +80,14 @@ SKIP: str = "SKIP"
 REASON_CONFIDENCE_BELOW_MIN: str = "CONFIDENCE_BELOW_MIN"
 REASON_EDGE_BELOW_MIN: str = "EDGE_BELOW_MIN"
 REASON_UNUSABLE_EXIT: str = "UNUSABLE_EXIT"
-# Як оцінено угоди фолдів спроби meta для G1 (рішення 0020): правилом входу рецепта (`decide_entry`),
-# калібратор і поріг якого для фолду k підігнані на інших фолдах. Без цієї позначки G1 відмовляє.
-ENTRY_EVALUATION: str = "decision_cross_fold"
-# Для `direct` (рішення 0022): правило фолду k підігнане лише на OOF-рядках фолдів `< k`, ніколи на пізніших.
-# Фолд 0 має правило `None` — його угод немає. Інша позначка, щоб `meta` не прийняв її за свою перехресну оцінку.
+# Як оцінено угоди фолдів спроби для G1 (рішення 0024, змінює 0020 і 0022): правилом входу рецепта
+# (`decide_entry`), калібратор і поріг якого для фолду k підігнані лише на OOF-рядках фолдів `< k`
+# (`past_fold_pool`), ніколи на пізніших. Однаково для `meta` і `direct`. Без цієї позначки G1 відмовляє;
+# стару перехресну позначку `decision_cross_fold` (калібрування і на майбутніх фолдах) G1 теж не приймає.
 ENTRY_EVALUATION_PAST_FOLDS: str = "past_folds"
+# Перші фолди walk-forward — прогрів калібрування: калібратор потребує щонайменше двох фолдів OOF-рядків,
+# тож у фолдів 0 і 1 правила входу немає і угод теж. G1 рахує умови фолдів без них (рішення 0024).
+ENTRY_RULE_WARMUP_FOLDS: int = 2
 
 _METHODS: tuple[str, ...] = ("isotonic", "platt")
 _SKIP_REASONS: tuple[str, ...] = (
@@ -191,6 +193,28 @@ class OosObservation(FrozenModel):
         require_decimal("entry", self.entry, positive=True)
         require_decimal("atr", self.atr, positive=True)
         return self
+
+
+def past_fold_pool(
+    rows: Sequence[OosObservation],
+    split: ResearchSplit,
+    fold_index: int,
+) -> tuple[OosObservation, ...]:
+    """OOF-рядки фолдів `< fold_index`, чия мітка закінчується строго до початку тесту фолду `fold_index`.
+
+    Пул правила входу фолду k (рішення 0024). Мітка рядка читає свічки до `open[time + horizon_bars]` включно
+    (time-stop і геп), тож рядок з `time + horizon == test_start` уже читає ціну тесту — його виключено, як і в
+    walk-forward (`label_overlaps_test`: `label_end >= test_start` — перетин). Пізніші фолди в пул не входять ніколи.
+    """
+    if type(fold_index) is not int or isinstance(fold_index, bool) or not 0 <= fold_index < len(split.folds):
+        raise ValueError("немає такого фолду")
+    test_start = split.folds[fold_index].test_start_ms
+    horizon_ms = split.horizon_bars * split.bar_ms
+    return tuple(
+        observation
+        for observation in rows
+        if observation.fold_index < fold_index and observation.time_ms + horizon_ms < test_start
+    )
 
 
 class ReliabilityBin(FrozenModel):
@@ -317,6 +341,10 @@ class DecisionFit:
     n_unlabeled: int
     oof_brier: Decimal
     oof_probability: Mapping[tuple[str, int], Decimal]
+    # З яких даних підігнано правило (рішення 0024): фолди рядків переданого пулу і найпізніший кінець їхніх міток
+    # (`open[time + horizon]`). G1 звіряє їх із межею тесту фолду, який правило оцінює: доказ з даних, не декларація.
+    fit_folds: tuple[int, ...] = ()
+    label_end_ms: int | None = None
 
     @property
     def rule(self) -> DecisionRule:
@@ -560,6 +588,8 @@ def fit_decision(
         n_unlabeled=len(unlabeled),
         oof_brier=brier,
         oof_probability=MappingProxyType(dict(oof_cal)),
+        fit_folds=tuple(sorted({row.fold_index for row in rows})),
+        label_end_ms=max(row.time_ms for row in rows) + split.horizon_bars * split.bar_ms,
     )
 
 
@@ -760,7 +790,8 @@ class _PiecewiseLinear:
         self._values = values
 
     def __call__(self, raw: np.ndarray) -> np.ndarray:
-        return np.interp(np.asarray(raw, dtype=np.float64), self._knots, self._values)
+        result: np.ndarray = np.interp(np.asarray(raw, dtype=np.float64), self._knots, self._values)
+        return result
 
 
 def _float_hex(value: float) -> str:
@@ -880,7 +911,8 @@ def _bin_index(probability: Decimal) -> int:
 
 def _logit(values: np.ndarray) -> np.ndarray:
     clipped = np.clip(values, _PLATT_CLIP, 1.0 - _PLATT_CLIP)
-    return np.log(clipped / (1.0 - clipped)).reshape(-1, 1)
+    result: np.ndarray = np.log(clipped / (1.0 - clipped)).reshape(-1, 1)
+    return result
 
 
 def _as_probability(value: float) -> Decimal:

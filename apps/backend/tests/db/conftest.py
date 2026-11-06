@@ -2,13 +2,21 @@
 
 Без запущеної БД тести пропускаються з причиною; `CTB_REQUIRE_DB=1` перетворює пропуск на помилку.
 Кожен тест працює у власній транзакції, яка відкочується (дані між тестами не протікають).
+
+Тестова БД одна на комп'ютер, а `migrated_db` на старті робить `downgrade base` → `upgrade head`: другий
+одночасний прогін pytest зніс би схему першому посеред тестів (T0.8). Тому сесія тримає міжпроцесне
+блокування файла `ctb-test-db-<назва БД>.lock` у тимчасовій теці ОС: другий прогін чекає, доки перший завершиться.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import IO
 
 import pytest
 import pytest_asyncio
@@ -52,9 +60,61 @@ def test_db_url() -> URL:
     return url
 
 
+def db_lock_path(database: str) -> Path:
+    """Файл міжпроцесного блокування тестової БД (один на назву БД)."""
+    return Path(tempfile.gettempdir()) / f"ctb-test-db-{database}.lock"
+
+
+# Блокування тримається до кінця процесу pytest. Фікстури `tests/db/conftest.py` реекспортують `tests/{ml,data,jobs}`,
+# і pytest створює окремий екземпляр сесійної фікстури на кожен conftest, а сам модуль буває завантажений двічі
+# (як conftest і як `tests.db.conftest`), тож кеш у модулі не спільний. Другий `flock` того самого файла з нового
+# дескриптора в тому самому процесі чекав би сам на себе. Тому власник пише в файл свій PID: збіг — блокування вже
+# в цього процесу (інший прогін, взявши блокування, перезаписав би PID своїм).
+_HELD: dict[str, IO[str]] = {}
+
+
+def hold_test_db_lock(database: str) -> IO[str] | None:
+    """Ексклюзивне блокування тестової БД до кінця процесу. Чекає, поки інший прогін його відпустить.
+
+    Повторний виклик у тому самому процесі не чекає. `None` — блокування вже в цього процесу (з іншої копії модуля)
+    або ОС без `fcntl` (нативна Windows; проєкт запускається на macOS і WSL2). Відпускає його ОС, коли процес pytest
+    завершується.
+    """
+    if sys.platform == "win32":
+        return None
+    held = _HELD.get(database)
+    if held is not None:
+        return held
+    import fcntl
+
+    path = db_lock_path(database)
+    me = str(os.getpid())
+    if path.exists() and path.read_text(encoding="utf-8").strip() == me:
+        return None
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.stderr.write(f"\nТестова БД {database} зайнята іншим прогоном pytest — чекаю, поки він завершиться…\n")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle.seek(0)
+    handle.truncate()
+    handle.write(me)
+    handle.flush()
+    _HELD[database] = handle
+    return handle
+
+
 @pytest.fixture(scope="session")
-def migrated_db(test_db_url: URL) -> URL:
-    """Тестова БД на `head`, починаючи з порожньої схеми."""
+def test_db_lock(test_db_url: URL) -> IO[str] | None:
+    """Блокування на весь прогін: міграції й тести одного прогону не перетинаються з іншим прогоном."""
+    assert test_db_url.database is not None
+    return hold_test_db_lock(test_db_url.database)
+
+
+@pytest.fixture(scope="session")
+def migrated_db(test_db_url: URL, test_db_lock: IO[str] | None) -> URL:
+    """Тестова БД на `head`, починаючи з порожньої схеми. Лише під блокуванням `test_db_lock`."""
     asyncio.run(run_alembic(test_db_url, "downgrade", "base"))
     asyncio.run(run_alembic(test_db_url, "upgrade", "head"))
     return test_db_url

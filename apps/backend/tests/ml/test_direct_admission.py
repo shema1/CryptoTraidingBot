@@ -41,12 +41,17 @@ from app.ml.artifacts import (
     retrain_registered_recipe,
     write_artifact,
 )
-from app.ml.decision import ENTRY_EVALUATION_PAST_FOLDS, DecisionRule, OosObservation
+from app.ml.decision import (
+    ENTRY_EVALUATION_PAST_FOLDS,
+    ENTRY_RULE_WARMUP_FOLDS,
+    DecisionRule,
+    OosObservation,
+    past_fold_pool,
+)
 from app.ml.direct_model import (
     CLASS_LABELS,
     FrozenDirectFit,
     _holdout_signals,
-    _past_pool,
     direct_recipe,
     direct_trial_params,
     evaluate_direct,
@@ -360,9 +365,10 @@ async def test_direct_holdout_opens_only_through_g1_and_a_refusal_writes_nothing
 ) -> None:
     """Fail-closed для direct знято (рішення 0022): відкриття йде через Gate G1 з моделлю допуску.
 
-    Сценарна спроба з метриками фолдів не проходить G1: фолди 0 і 1 без угод (правило минулих фолдів), тож
-    відмова називає `G1_MIN_TRADES_FOLD`. Відмова `GateRejected` без жодного запису в `holdout_openings`.
-    Без `model_version` — `ValueError` до будь-якого розрахунку.
+    Сценарна спроба з метриками фолдів не проходить G1: з трьох фолдів два — прогрів (рішення 0024), тож
+    оцінений лише один (`G1_EVALUATED_FOLDS`) і угод замало. Прогрів визнано (`warmup_folds` = 2), тож фолди без
+    угод більше не валять `G1_MIN_TRADES_FOLD`, як було за рішенням 0022 (a). Відмова `GateRejected` без жодного
+    запису в `holdout_openings`. Без `model_version` — `ValueError` до будь-якого розрахунку.
     """
     books, split = _three_folds()
     async with AsyncSession(bind=conn, expire_on_commit=False) as session:
@@ -394,7 +400,11 @@ async def test_direct_holdout_opens_only_through_g1_and_a_refusal_writes_nothing
             await open_holdout_after_gate(
                 session, experiment_id=experiment_id, trial_id=trial_id, model_version=model_version
             )
-        assert "G1_MIN_TRADES_FOLD" in refused.value.decision.reasons
+        decision = refused.value.decision
+        assert decision.warmup_folds == ENTRY_RULE_WARMUP_FOLDS
+        assert "G1_EVALUATED_FOLDS" in decision.reasons
+        assert "G1_ENTRY_RULE" not in decision.reasons
+        assert "G1_MIN_TRADES_FOLD" not in decision.reasons
         openings = (await session.execute(select(func.count()).select_from(HoldoutOpening))).scalar_one()
     assert openings == 0
 
@@ -458,7 +468,7 @@ def test_past_pool_drops_rows_whose_label_reaches_the_next_test_fold() -> None:
     """Purge: рядок минулого фолду, чия мітка (до `horizon_bars` свічок) заходить у тест фолду k, у пул не йде."""
     horizon = 4
     test_start = 10 * HOUR
-    split = SimpleNamespace(horizon_bars=horizon, folds=[None] * 3)
+    split = SimpleNamespace(horizon_bars=horizon, bar_ms=HOUR, folds=[None] * 3)
     split.folds[2] = SimpleNamespace(test_start_ms=test_start)
 
     def row(fold: int, time_ms: int) -> OosObservation:
@@ -475,7 +485,9 @@ def test_past_pool_drops_rows_whose_label_reaches_the_next_test_fold() -> None:
         )
 
     inside = row(1, test_start - horizon * HOUR + HOUR)  # мітка заходить у тест
-    ends_before = row(1, test_start - horizon * HOUR)  # мітка закінчується рівно на межі
+    on_boundary = row(1, test_start - horizon * HOUR)  # мітка дочитує open першого бару тесту — теж перетин
+    ends_before = row(1, test_start - horizon * HOUR - HOUR)  # мітка закінчується до тесту
     later = row(2, test_start - 10 * HOUR)  # фолд ≥ k не входить ніколи
-    pool = _past_pool([inside, ends_before, later], split, 2)  # type: ignore[arg-type]
+    pool = past_fold_pool([inside, on_boundary, ends_before, later], split, 2)  # type: ignore[arg-type]
+    # Та сама межа, що в walk-forward: `label_overlaps_test` вважає `label_end == test_start` перетином.
     assert pool == (ends_before,)

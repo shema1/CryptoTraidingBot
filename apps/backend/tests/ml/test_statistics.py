@@ -21,6 +21,7 @@ from app.ml.features import HOUR_MS
 from app.ml.statistics import (
     DAY_MS,
     DSR_SPREAD_MIN_TRADES,
+    G1_EVALUATED_FOLDS,
     WEEK_MS,
     BlockBootstrapPf,
     FoldOutcome,
@@ -805,10 +806,11 @@ def test_gate_passes_on_the_boundary_and_names_every_miss() -> None:
     assert _gate(dsr=Decimal("0.95")).passed is True
     assert _gate(pbo=Decimal("0.5")).passed is False
     assert _gate(dsr=Decimal("0.949")).reasons == ("G1_DSR",)
-    even = (_fold("1", "1.14", n_trades=50), _fold("1", "1.16", n_trades=50))
-    even_stress = tuple(_fold("1", "1.05", n_trades=50, cost="2") for _ in range(2))
+    # Медіана рівно на межі 1.15. Чотири фолди — мінімум оцінених фолдів G1 (рішення 0024).
+    even = tuple(_fold("1", pf, n_trades=50) for pf in ("1.14", "1.14", "1.16", "1.16"))
+    even_stress = tuple(_fold("1", "1.05", n_trades=50, cost="2") for _ in range(4))
     assert _gate(folds=even, stress=even_stress).passed is True
-    below = (_fold("1", "1.10", n_trades=50), _fold("1", "1.16", n_trades=50))
+    below = tuple(_fold("1", pf, n_trades=50) for pf in ("1.10", "1.10", "1.16", "1.16"))
     assert "G1_MEDIAN_PF" in _gate(folds=below, stress=even_stress).reasons
     no_loss = tuple(_fold("3", None) for _ in range(5))
     assert _gate(folds=no_loss).median_pf_unbounded is True
@@ -859,8 +861,9 @@ def test_net_sums_do_not_depend_on_the_thread_decimal_context() -> None:
 
 def test_gate_uses_the_thresholds_the_caller_passes() -> None:
     loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=5)
-    folds = tuple(_fold("2", "1.20", n_trades=5) for _ in range(2))
-    stress = tuple(_fold("1", "1.10", n_trades=5, cost="2") for _ in range(2))
+    # Чотири фолди — мінімум оцінених фолдів G1 (рішення 0024); угод — менше за пороги ТЗ, але не за пороги викликача.
+    folds = tuple(_fold("2", "1.20", n_trades=5) for _ in range(4))
+    stress = tuple(_fold("1", "1.10", n_trades=5, cost="2") for _ in range(4))
     assert (
         evaluate_gate(
             label_type="rule_only",
@@ -886,3 +889,39 @@ def test_bootstrap_result_is_a_model_instance() -> None:
         block_bootstrap_pf((_trade(0, Decimal("-1")), _trade(1, Decimal("2"))), n_replicates=_REPLICATES, seed=0),
         BlockBootstrapPf,
     )
+
+
+def _good_folds(count: int, *, cost_factor: Decimal = Decimal("1")) -> tuple[FoldOutcome, ...]:
+    return tuple(
+        FoldOutcome(
+            n_trades=40,
+            n_signals=40,
+            total_net_usd=Decimal("50"),
+            profit_factor=Decimal("1.6"),
+            below_min_trades=False,
+            cost_factor=cost_factor,
+        )
+        for _ in range(count)
+    )
+
+
+def test_too_few_evaluated_folds_do_not_pass() -> None:
+    """Після прогріву G1 вимагає щонайменше `min_evaluated_folds` оцінених фолдів (рішення 0024)."""
+
+    def gate(count: int, thresholds: GateThresholds | None = None) -> tuple[str, ...]:
+        return evaluate_gate(
+            label_type="rule_only",
+            folds=_good_folds(count),
+            stress=_good_folds(count, cost_factor=Decimal("2")),
+            dsr=Decimal("0.99"),
+            pbo=Decimal("0.1"),
+            n_trials=3,
+            thresholds=thresholds,
+        ).reasons
+
+    assert gate(3) == (G1_EVALUATED_FOLDS,)
+    assert gate(4) == ()
+    # Менший мінімум — послаблення, і запис відкриття його покаже.
+    assert gate(3, GateThresholds(min_evaluated_folds=3)) == ()
+    assert loosened_thresholds(GateThresholds(min_evaluated_folds=3)) == ("min_evaluated_folds",)
+    assert loosened_thresholds(GateThresholds(min_evaluated_folds=6)) == ()

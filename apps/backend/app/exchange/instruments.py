@@ -67,7 +67,9 @@ INSTRUMENT_REFRESH_REJECTION_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
-RefreshReason = Literal["startup", "scheduled", "filter_rejection"]
+RefreshReason = Literal["startup", "scheduled", "filter_rejection", "research"]
+# Знімок для досліджень (воркер, T1.11, рішення 0023): лише правила, паузи ботів не зводяться ніколи.
+RESEARCH_INSTRUMENTS_MODE: Final = "demo"
 
 _RULE_COLUMNS: Final[tuple[str, ...]] = (
     "tick_size",
@@ -189,15 +191,30 @@ class InstrumentCache:
         self._mode = mode
         self._symbols = tracked
 
-    async def refresh(self, *, reason: RefreshReason, symbols: Collection[str] | None = None) -> InstrumentSyncResult:
-        """Перечитати правила і звести паузи. `symbols=None` — повний знімок категорії."""
-        if reason not in ("startup", "scheduled", "filter_rejection"):
-            raise ValueError("reason має бути startup, scheduled або filter_rejection")
+    async def refresh(
+        self,
+        *,
+        reason: RefreshReason,
+        symbols: Collection[str] | None = None,
+        apply_pauses: bool = True,
+    ) -> InstrumentSyncResult:
+        """Перечитати правила і звести паузи. `symbols=None` — повний знімок категорії.
+
+        `apply_pauses=False` — лише правила, без жодного запису в `bots` (воркер для досліджень, причина `research`):
+        паузи зводить тільки торговий процес, інакше знімок поза ним міг би повернути бота в `RUNNING` до звірки
+        (ТЗ §11.1). Причина `research` — лише з `apply_pauses=False`, і навпаки.
+        """
+        if reason not in ("startup", "scheduled", "filter_rejection", "research"):
+            raise ValueError("reason має бути startup, scheduled, filter_rejection або research")
+        if type(apply_pauses) is not bool or (reason == "research") == apply_pauses:
+            raise ValueError("знімок research — і лише він — не зводить паузи ботів (apply_pauses=False)")
         requested = _requested(symbols)
         bind = self._sessions.kw["bind"]
         if isinstance(bind, AsyncConnection):
             async with self._sessions() as session:
-                return await self._refresh_locked(session, reason=reason, requested=requested)
+                return await self._refresh_locked(
+                    session, reason=reason, requested=requested, apply_pauses=apply_pauses
+                )
         if not isinstance(bind, AsyncEngine):
             raise TypeError("InstrumentCache потребує sessionmaker з engine або connection")
         # Окреме з'єднання тримається відкритим на час читання біржі: commit lock-а не повертає його в пул
@@ -211,7 +228,9 @@ class InstrumentCache:
             try:
                 session = AsyncSession(bind=connection, expire_on_commit=False)
                 try:
-                    return await self._refresh_fetched(session, reason=reason, requested=requested)
+                    return await self._refresh_fetched(
+                        session, reason=reason, requested=requested, apply_pauses=apply_pauses
+                    )
                 finally:
                     await session.close()
             finally:
@@ -227,11 +246,12 @@ class InstrumentCache:
         *,
         reason: RefreshReason,
         requested: tuple[str, ...] | None,
+        apply_pauses: bool,
     ) -> InstrumentSyncResult:
         """Знімок на вже відкритому з'єднанні (тестова транзакція). Lock переживає savepoint."""
         await _lock_refresh(session, exchange=self._exchange, mode=self._mode)
         try:
-            return await self._refresh_fetched(session, reason=reason, requested=requested)
+            return await self._refresh_fetched(session, reason=reason, requested=requested, apply_pauses=apply_pauses)
         finally:
             await _unlock_refresh(session, exchange=self._exchange, mode=self._mode)
 
@@ -241,6 +261,7 @@ class InstrumentCache:
         *,
         reason: RefreshReason,
         requested: tuple[str, ...] | None,
+        apply_pauses: bool,
     ) -> InstrumentSyncResult:
         fetched = await self._source.fetch_instruments(symbols=requested)
         found = _unique(fetched)
@@ -262,10 +283,13 @@ class InstrumentCache:
             scope = self._symbols if requested is None else requested
             for symbol in scope:
                 tradable.setdefault(symbol, False)
-            pauses = await apply_instrument_pauses(
-                session, mode=self._mode, tradable_by_symbol=tradable, now_ms_value=current
-            )
-        log_instrument_pauses(pauses, mode=self._mode, tradable_by_symbol=tradable)
+            pauses: tuple[PauseChange, ...] = ()
+            if apply_pauses:
+                pauses = await apply_instrument_pauses(
+                    session, mode=self._mode, tradable_by_symbol=tradable, now_ms_value=current
+                )
+        if apply_pauses:
+            log_instrument_pauses(pauses, mode=self._mode, tradable_by_symbol=tradable)
         _LOG.info(
             "instruments_refreshed",
             reason=reason,

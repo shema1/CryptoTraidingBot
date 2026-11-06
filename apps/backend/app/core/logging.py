@@ -5,8 +5,9 @@
 - `orders` — ордери (`orders.log`);
 - `errors.log` — усі записи рівня ERROR і вище з будь-якого логера, зокрема сторонніх бібліотек.
 
-Файли: `<log_dir>/<process>/{app,trading,orders,errors}.log`. Кожен процес (торговий, воркер, колектор) пише
-у власну підтеку, бо `RotatingFileHandler` не розрахований на кілька процесів в одному файлі.
+Файли: `<log_dir>/<process>/{app,trading,orders,errors}.log`. Кожен процес (торговий, воркер, колектор,
+команди `enqueue` і `research`) пише у власну підтеку, бо `RotatingFileHandler` не розрахований на кілька
+процесів в одному файлі.
 
 Маскування (`SecretMasker`) застосовується до **кожного** запису після рендера трасування винятку:
 structlog-записи маскуються ще до передачі в stdlib (тож і чужі хендлери бачать лише маски), а в спільному
@@ -44,7 +45,9 @@ from structlog.typing import EventDict, Processor, WrappedLogger
 from app.core import clock
 from app.core.config import Settings
 
-Process = Literal["backend", "worker", "collector"]
+# `enqueue` і `research` — команди `python -m app.jobs.enqueue` і `python -m app.ml.research`: кожна у своїй підтеці,
+# бо `RotatingFileHandler` не розрахований на кілька процесів в одному файлі (прогін і постановка задач — паралельно).
+Process = Literal["backend", "worker", "collector", "enqueue", "research"]
 
 APP: Final = "app"
 TRADING: Final = "trading"

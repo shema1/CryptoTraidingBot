@@ -26,16 +26,24 @@ from app.ml.artifacts import (
     register_model,
     write_artifact,
 )
-from app.ml.decision import ENTER, ENTRY_EVALUATION, CalibrationError, decide_entry, fit_decision
+from app.ml.decision import (
+    ENTER,
+    ENTRY_EVALUATION_PAST_FOLDS,
+    ENTRY_RULE_WARMUP_FOLDS,
+    CalibrationError,
+    decide_entry,
+    fit_decision,
+    past_fold_pool,
+)
 from app.ml.features import HOUR_MS
 from app.ml.meta_model import (
     META_MIN_PROBABILITY,
     MetaRun,
-    cross_fold_entry,
     decision_observations,
     fit_entry_rule,
     fit_frozen_meta,
     g1_recipe_fields,
+    past_fold_entry,
     recipe_trial,
     run_meta_experiment,
 )
@@ -209,7 +217,7 @@ def _two_fold_setup() -> tuple[tuple[SymbolHistory, ...], ResearchSplit]:
 
 
 def _three_fold_setup() -> tuple[tuple[SymbolHistory, ...], ResearchSplit]:
-    """Три фолди: перехресна оцінка правила входу калібрує кожен фолд на двох інших."""
+    """Три фолди: два прогрівні й один, чиє правило входу калібрується на двох минулих (рішення 0024)."""
     count = 6400
     candles = _flat(count)
     _paint(candles, 100, good=lambda step: step % 2 == 0)
@@ -228,23 +236,37 @@ def _three_fold_setup() -> tuple[tuple[SymbolHistory, ...], ResearchSplit]:
     return books, split
 
 
-def test_cross_fold_entry_takes_what_decide_entry_takes_with_a_rule_from_other_folds() -> None:
-    # G1 має бачити правило рецепта (`decide_entry`), а не keep(0.5). Правило фолду k — з інших фолдів.
+def test_past_fold_entry_takes_what_decide_entry_takes_with_a_rule_from_past_folds() -> None:
+    # G1 має бачити правило рецепта (`decide_entry`), а не keep(0.5). Правило фолду k — лише з фолдів < k
+    # (рішення 0024): фолди 0 і 1 — прогрів калібрування, без правила і без угод.
     books, split = _three_fold_setup()
     run = _train(books, split)
-    evaluated = cross_fold_entry(run, books)
+    evaluated = past_fold_entry(run, books)
     rows = decision_observations(run, books)
     target = TargetParams(horizon_bars=4)
     assert len(evaluated.entry_rules) == len(run.folds)
     for fold, before, fit in zip(evaluated.folds, run.folds, evaluated.entry_rules, strict=True):
-        pool = tuple(row for row in rows if row.fold_index != fold.fold_index)
+        assert [(row.symbol, row.time_ms) for row in fold.scored] == [
+            (row.symbol, row.time_ms) for row in before.scored
+        ]
+        assert fold.record.meta is not None
+        assert before.record.meta is not None
+        # Правило без фільтра від рішення не залежить і лишається як було — і на прогріві теж.
+        assert fold.record.meta.unfiltered == before.record.meta.unfiltered
+        assert fold.record.meta.scored_unfiltered == before.record.meta.scored_unfiltered
+        if fold.fold_index < ENTRY_RULE_WARMUP_FOLDS:
+            assert fit is None
+            assert not any(row.taken for row in fold.scored)
+            assert all(report.metrics.n_trades == 0 for report in fold.record.reports)
+            assert fold.stress.n_signals == 0
+            continue
+        assert fit is not None
+        pool = past_fold_pool(rows, split, fold.fold_index)
+        assert {row.fold_index for row in pool} <= set(range(fold.fold_index))
         expected = fit_decision(pool, split, costs=_zero_costs(), params=target)
         assert fit.rule == expected.rule
         assert decision_payload(fit.rule, fit.calibrator) == decision_payload(expected.rule, expected.calibrator)
         own = {(row.symbol, row.time_ms): row for row in rows if row.fold_index == fold.fold_index}
-        assert [(row.symbol, row.time_ms) for row in fold.scored] == [
-            (row.symbol, row.time_ms) for row in before.scored
-        ]
         for row in fold.scored:
             observation = own[(row.symbol, row.time_ms)]
             verdict = decide_entry(
@@ -259,43 +281,83 @@ def test_cross_fold_entry_takes_what_decide_entry_takes_with_a_rule_from_other_f
             )
             assert row.taken is (verdict.decision == ENTER)
             assert row.probability == observation.raw_probability
-        # Правило без фільтра від рішення не залежить; стрес — ті самі сигнали, що прийняв фільтр.
-        assert fold.record.meta is not None
-        assert before.record.meta is not None
-        assert fold.record.meta.unfiltered == before.record.meta.unfiltered
-        assert fold.record.meta.scored_unfiltered == before.record.meta.scored_unfiltered
+        # Стрес — ті самі сигнали, що прийняв фільтр.
         assert fold.stress.n_signals == sum(1 for row in fold.scored if row.symbol == BTC and row.taken)
 
 
-def test_cross_fold_rule_does_not_see_its_own_fold_labels() -> None:
-    # Прямий витік: якби правило фолду k бачило мітки k, їх зміна змінила б його поріг чи калібратор.
-    books, split = _three_fold_setup()
-    run = _train(books, split)
-    flipped_fold = run.folds[1]
-    flipped = dataclasses.replace(
-        flipped_fold,
+def _flip_labels(run: MetaRun, fold_index: int) -> MetaRun:
+    folds = list(run.folds)
+    target = folds[fold_index]
+    folds[fold_index] = dataclasses.replace(
+        target,
         scored=tuple(
             row.model_copy(update={"true_label": None if row.true_label is None else 1 - row.true_label})
-            for row in flipped_fold.scored
+            for row in target.scored
         ),
     )
-    changed = dataclasses.replace(run, folds=(run.folds[0], flipped, run.folds[2]))
-    before = cross_fold_entry(run, books).entry_rules
-    after = cross_fold_entry(changed, books).entry_rules
-    payloads_before = [decision_payload(fit.rule, fit.calibrator) for fit in before]
-    payloads_after = [decision_payload(fit.rule, fit.calibrator) for fit in after]
-    # Правило фолду 1 напряму його мітки не бачить: те саме до і після.
-    assert payloads_after[1] == payloads_before[1]
-    # Тест не порожній: ті самі мітки в пулі змінюють правила інших фолдів.
-    assert payloads_after[0] != payloads_before[0] or payloads_after[2] != payloads_before[2]
-    # Опосередкований шлях (моделі пізніших фолдів вчились на рядках фолду 1) цей тест не ловить — рішення 0020.
+    return dataclasses.replace(run, folds=tuple(folds))
 
 
-def test_cross_fold_entry_needs_three_folds() -> None:
+def _four_fold_setup() -> tuple[tuple[SymbolHistory, ...], ResearchSplit]:
+    """Чотири фолди: два прогрівні, правило фолду 2 має пізніший фолд 3, якого не сміє бачити."""
+    count = 6700
+    candles = _flat(count)
+    _paint(candles, 100, good=lambda step: step % 2 == 0)
+    books = (_history(BTC, candles),)
+    split = build_split(
+        data_from_ms=0,
+        data_to_ms=count * HOUR_MS,
+        horizon_bars=4,
+        count_trades=lambda _start, _end: 20,
+        min_train_ms=_entry_index(60) * HOUR_MS,
+        test_segment_ms=400 * HOUR_MS,
+        test_segment_extended_ms=440 * HOUR_MS,
+        min_trades_per_fold=1,
+    )
+    assert len(split.folds) == 4
+    return books, split
+
+
+def test_a_rule_ignores_every_later_fold() -> None:
+    """Відмінність від старої перехресної оцінки (0020): мітки фолду 3 не змінюють правило фолду 2 (рішення 0024)."""
+    books, split = _four_fold_setup()
+    run = _train(books, split)
+    base = past_fold_entry(run, books).entry_rules
+    later = past_fold_entry(_flip_labels(run, 3), books).entry_rules
+    assert base[2] is not None
+    assert later[2] is not None
+    assert decision_payload(later[2].rule, later[2].calibrator) == decision_payload(base[2].rule, base[2].calibrator)
+    # Тест не порожній: правило фолду 3 підігнане й на фолді 2, тож мітки фолду 2 його змінюють.
+    earlier = past_fold_entry(_flip_labels(run, 2), books).entry_rules
+    assert base[3] is not None
+    assert earlier[3] is not None
+    assert decision_payload(earlier[3].rule, earlier[3].calibrator) != decision_payload(
+        base[3].rule, base[3].calibrator
+    )
+
+
+def test_past_fold_rule_never_sees_its_own_or_later_fold_labels() -> None:
+    # Ні прямого, ні опосередкованого витоку з майбутнього: мітки фолду ≥ k у правило k не входять.
+    books, split = _three_fold_setup()
+    run = _train(books, split)
+    last = len(run.folds) - 1
+    before = past_fold_entry(run, books).entry_rules[last]
+    after_own = past_fold_entry(_flip_labels(run, last), books).entry_rules[last]
+    assert before is not None
+    assert after_own is not None
+    assert decision_payload(after_own.rule, after_own.calibrator) == decision_payload(before.rule, before.calibrator)
+    # Тест не порожній: мітки минулого фолду правило змінюють.
+    after_past = past_fold_entry(_flip_labels(run, last - 1), books).entry_rules[last]
+    assert after_past is not None
+    assert decision_payload(after_past.rule, after_past.calibrator) != decision_payload(before.rule, before.calibrator)
+
+
+def test_past_fold_entry_needs_three_folds() -> None:
+    # Два фолди — обидва прогрівні: оцінювати правило нема на чому.
     books, split = _two_fold_setup()
     run = _train(books, split)
-    with pytest.raises(CalibrationError, match="два фолди"):
-        cross_fold_entry(run, books)
+    with pytest.raises(CalibrationError, match="минулих фолдів"):
+        past_fold_entry(run, books)
 
 
 @pytest.mark.integration
@@ -583,23 +645,29 @@ async def test_comparison_records_the_same_target_and_costs_as_the_meta_runs(con
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_trial_folds_are_the_cross_fold_entry_rule(conn: AsyncConnection) -> None:
-    # Журнал спроби — угоди правила рецепта, оцінені перехресно; G1 читає саме їх.
+async def test_trial_folds_are_the_past_fold_entry_rule(conn: AsyncConnection) -> None:
+    # Журнал спроби — угоди правила рецепта, оцінені лише минулими фолдами; G1 читає саме їх (рішення 0024).
     books, split = _three_fold_setup()
     async with AsyncSession(bind=conn) as session:
         recorded = await _record(session, books, split)
         trial = await session.get(ExperimentTrial, recorded.trial.trial_id)
     assert trial is not None
-    assert trial.params["entry_evaluation"] == ENTRY_EVALUATION
+    assert trial.params["entry_evaluation"] == ENTRY_EVALUATION_PAST_FOLDS
     assert [item["fold_index"] for item in trial.params["entry_rules"]] == [0, 1, 2]
     assert len(recorded.run.entry_rules) == 3
-    # Правило кожного фолду відтворюване: пороги і sha256 саме того калібратора, що відібрав угоди.
+    # Правило кожного фолду відтворюване: пороги, sha256 саме того калібратора і фолди, на яких його підігнано.
     for item, fit in zip(trial.params["entry_rules"], recorded.run.entry_rules, strict=True):
+        if fit is None:
+            assert item == {"fold_index": item["fold_index"], "method": None, "fit_on_folds": []}
+            continue
         payload = decision_payload(fit.rule, fit.calibrator)
         assert item["decision_rule"] == payload["decision_rule"]
         assert item["calibrator_sha256"] == payload["calibrator_sha256"]
         assert item["method"] == fit.method
-    expected = cross_fold_entry(_train(books, split), books)
+        assert item["fit_on_folds"] == list(range(item["fold_index"]))
+        # Кінець міток пулу — строго до тесту фолду, який правило оцінює (purge, рішення 0024).
+        assert item["label_end_ms"] < split.folds[item["fold_index"]].test_start_ms
+    expected = past_fold_entry(_train(books, split), books)
     assert [fold.record for fold in recorded.run.folds] == [fold.record for fold in expected.folds]
     assert trial.params["comparison"]["filtered_total_net"] == format(expected.filtered_total_net, "f")
 
@@ -607,7 +675,7 @@ async def test_trial_folds_are_the_cross_fold_entry_rule(conn: AsyncConnection) 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_two_folds_leave_no_entry_rule_and_g1_refuses(conn: AsyncConnection) -> None:
-    # Без перехресної оцінки G1 бачив би keep(0.5), а не правило рецепта: відмова, а не тихий пропуск.
+    # Без оцінки минулими фолдами G1 бачив би keep(0.5), а не правило рецепта: відмова, а не тихий пропуск.
     books, split = _two_fold_setup()
     async with AsyncSession(bind=conn) as session:
         recorded = await _record(session, books, split)
@@ -620,7 +688,7 @@ async def test_two_folds_leave_no_entry_rule_and_g1_refuses(conn: AsyncConnectio
         )
     assert recorded.decision is None
     assert recorded.decision_error is not None
-    assert recorded.decision_error.startswith("перехресна оцінка правила входу")
+    assert recorded.decision_error.startswith("правило входу минулих фолдів")
     assert trial is not None
     assert "decision" not in trial.params
     assert "entry_evaluation" not in trial.params
@@ -666,7 +734,7 @@ async def test_recorded_folds_come_from_the_entry_rule_not_keep(
     conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # На синтетиці `decide_entry` і `keep(0.5)` беруть ті самі рядки. Тут правило не бере нічого:
-    # якщо журнал пише угоди `keep`, у ньому лишаться угоди — і проводка 0020 зламана.
+    # якщо журнал пише угоди `keep`, у ньому лишаться угоди — і проводка 0020/0024 зламана.
     books, split = _three_fold_setup()
     kept = _train(books, split)
     assert any(row.taken for fold in kept.folds for row in fold.scored), "keep(0.5) щось бере"

@@ -12,9 +12,16 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from app.api.models import AUDIT_ACTION_TRIAL_INVALIDATE
 from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestDecision, BacktestMetrics, BacktestReport, BacktestTrade
-from app.ml.decision import ENTRY_EVALUATION
+from app.ml.decision import ENTRY_EVALUATION_PAST_FOLDS, ENTRY_RULE_WARMUP_FOLDS
 from app.ml.models import Experiment, ExperimentTrial, HoldoutOpening
-from app.ml.statistics import G1_ENTRY_RULE, FoldOutcome, GateRejected, GateThresholds, open_holdout_after_gate
+from app.ml.statistics import (
+    G1_ENTRY_RULE,
+    FoldOutcome,
+    GateRejected,
+    GateThresholds,
+    open_holdout_after_gate,
+    preview_gate_g1,
+)
 from app.ml.strategy import ALWAYS_FLAT
 from app.ml.trade_sim import ExitReason, StopPriceSource
 from app.ml.validation import (
@@ -102,6 +109,8 @@ def _report(
     cost_factor: Decimal = Decimal("1"),
 ) -> BacktestReport:
     """Кожна угода — рішення ENTER; ще один сигнал на наступній свічці відкинуто cooldown."""
+    if not trades:
+        return _empty_report(symbol, cost_factor=cost_factor)
     total = sum((trade.net_usd for trade in trades), Decimal(0))
     wins = sum(1 for trade in trades if trade.net_usd > 0)
     loss = sum((-trade.net_usd for trade in trades if trade.net_usd < 0), Decimal(0))
@@ -131,6 +140,33 @@ def _report(
     )
 
 
+def _empty_report(symbol: str, *, cost_factor: Decimal = Decimal("1")) -> BacktestReport:
+    """Фолд прогріву правила входу (рішення 0024): фільтр не отримав жодного сигналу, угод немає."""
+    return BacktestReport(
+        symbol=symbol,
+        seed=7,
+        cost_factor=cost_factor,
+        trades=(),
+        decisions=(),
+        metrics=BacktestMetrics(
+            n_trades=0,
+            total_r=Decimal(0),
+            total_net_usd=Decimal(0),
+            profit_factor=None,
+            max_drawdown_pct=Decimal(0),
+            hit_rate=None,
+            sharpe=None,
+            max_consecutive_losses=0,
+            n_incomplete=0,
+            n_unusable=0,
+            n_funding_gaps=0,
+            ending_equity=Decimal("100"),
+            peak_equity=Decimal("100"),
+            halted=False,
+        ),
+    )
+
+
 def _paths(n_trades: int) -> tuple[tuple[Decimal, ...], tuple[Decimal, ...]]:
     """Фіксований ряд: достатній розкид, щоб PSR лишався визначеним, і перевага над шумом."""
     rng = np.random.default_rng(3)
@@ -146,15 +182,27 @@ def _pair(fold: Fold, values: tuple[Decimal, ...]) -> tuple[BacktestTrade, ...]:
     )
 
 
-def _meta_runs(fold: Fold, pair: tuple[Decimal, ...], *, scored_shift: Decimal = Decimal("0")) -> MetaFoldRuns:
-    """Прогони для G1 (рішення 0017): усе правило дає нуль, стрес — PF 1.1 на тих самих сигналах."""
-    flat = _report(BTC, _pair(fold, (Decimal("0"), Decimal("0"))))
+def _meta_runs(
+    fold: Fold,
+    pair: tuple[Decimal, ...],
+    *,
+    scored_shift: Decimal = Decimal("0"),
+    warm: bool = False,
+    warm_unfiltered: Decimal = Decimal("0"),
+) -> MetaFoldRuns:
+    """Прогони для G1 (рішення 0017): усе правило дає нуль, стрес — PF 1.1 на тих самих сигналах.
+
+    На прогріві (рішення 0024) правило без фільтра торгує як завжди, а фільтр — ні: стрес без сигналів.
+    """
+    rule = warm_unfiltered if warm else Decimal("0")
+    flat = _report(BTC, _pair(fold, (rule, rule)))
     scored = flat if not scored_shift else _report(BTC, _pair(fold, tuple(value + scored_shift for value in pair)))
-    return MetaFoldRuns(
-        unfiltered=flat,
-        scored_unfiltered=scored,
-        stress=_report(BTC, _pair(fold, (Decimal("2.2"), Decimal("-2"))), cost_factor=Decimal("2")),
+    stress = (
+        _empty_report(BTC, cost_factor=Decimal("2"))
+        if warm
+        else _report(BTC, _pair(fold, (Decimal("2.2"), Decimal("-2"))), cost_factor=Decimal("2"))
     )
+    return MetaFoldRuns(unfiltered=flat, scored_unfiltered=scored, stress=stress)
 
 
 def _records(
@@ -163,37 +211,58 @@ def _records(
     *,
     meta: bool = False,
     scored_shift: Decimal = Decimal("0"),
+    warmup: int = 0,
+    warm_unfiltered: Decimal = Decimal("0"),
 ) -> list[FoldRecord]:
+    """Дві угоди BTC на фолд з `series`. Перші `warmup` фолдів — прогрів (рішення 0024): угод немає,
+    їхні значення ряду не використовуються."""
     if len(series) != len(split.folds) * 2:
         raise ValueError("ряд має містити дві угоди на фолд")
     records: list[FoldRecord] = []
     for index, fold in enumerate(split.folds):
         pair = series[index * 2 : index * 2 + 2]
+        warm = index < warmup
         eth = (_trade(fold.test_start_ms, Decimal("9"), entry_index=0),)
+        reports = (
+            (_empty_report(BTC), _empty_report(ETH)) if warm else (_report(BTC, _pair(fold, pair)), _report(ETH, eth))
+        )
         records.append(
             FoldRecord(
-                reports=(_report(BTC, _pair(fold, pair)), _report(ETH, eth)),
+                reports=reports,
                 train_labels=_LABELS,
                 test_labels=_LABELS,
-                meta=_meta_runs(fold, pair, scored_shift=scored_shift) if meta else None,
+                meta=(
+                    _meta_runs(fold, pair, scored_shift=scored_shift, warm=warm, warm_unfiltered=warm_unfiltered)
+                    if meta
+                    else None
+                ),
             )
         )
     return records
 
 
-def _stress(split: ResearchSplit) -> tuple[FoldOutcome, ...]:
-    """Те, що G1 прочитає зі стресу `_meta_runs`: дві угоди з тих самих трьох сигналів, одна збиткова."""
-    return tuple(
-        FoldOutcome(
-            n_trades=2,
-            n_signals=3,
-            total_net_usd=Decimal("0.2"),
-            profit_factor=Decimal("1.1"),
-            below_min_trades=False,
-            cost_factor=Decimal("2"),
-        )
-        for _ in split.folds
+def _stress(split: ResearchSplit, *, warmup: int = ENTRY_RULE_WARMUP_FOLDS) -> tuple[FoldOutcome, ...]:
+    """Те, що G1 прочитає зі стресу `_meta_runs` кандидата: дві угоди з тих самих трьох сигналів, одна збиткова.
+
+    Фолди прогріву (рішення 0024) — без сигналів. Викликач передає стрес усіх фолдів, як `MetaRun.stress`.
+    """
+    warm = FoldOutcome(
+        n_trades=0,
+        n_signals=0,
+        total_net_usd=Decimal("0"),
+        profit_factor=None,
+        below_min_trades=False,
+        cost_factor=Decimal("2"),
     )
+    hot = FoldOutcome(
+        n_trades=2,
+        n_signals=3,
+        total_net_usd=Decimal("0.2"),
+        profit_factor=Decimal("1.1"),
+        below_min_trades=False,
+        cost_factor=Decimal("2"),
+    )
+    return tuple(warm if index < warmup else hot for index in range(len(split.folds)))
 
 
 async def _line(session: AsyncSession, split: ResearchSplit, *, research_line: str = BTC) -> str:
@@ -209,12 +278,33 @@ async def _line(session: AsyncSession, split: ResearchSplit, *, research_line: s
     )
 
 
-def _candidate(name: str) -> dict[str, object]:
-    """Параметри кандидата meta: угоди оцінені правилом входу рецепта перехресно, правило — у спробі (0020)."""
+_DECISION = {"decision_rule": {"min_confidence": "0.40", "min_edge_atr": "0.10"}, "calibrator_sha256": None}
+
+
+def _entry_rules(split: ResearchSplit, *, warmup: int = ENTRY_RULE_WARMUP_FOLDS) -> list[dict[str, object]]:
+    """Записи `entry_rules` журналу (рішення 0024): прогрів без правила, далі правило k на фолдах 0…k−1,
+    мітки пулу закінчились за годину до тесту фолду k."""
+    return [
+        {"fold_index": index, "method": None, "fit_on_folds": []}
+        if index < warmup
+        else {
+            "fold_index": index,
+            "method": "platt",
+            "fit_on_folds": list(range(index)),
+            "label_end_ms": fold.test_start_ms - HOUR,
+            **_DECISION,
+        }
+        for index, fold in enumerate(split.folds)
+    ]
+
+
+def _candidate(name: str, split: ResearchSplit) -> dict[str, object]:
+    """Параметри кандидата meta: угоди оцінені правилом входу рецепта лише минулими фолдами, правило — у спробі."""
     return {
         "name": name,
-        "entry_evaluation": ENTRY_EVALUATION,
-        "decision": {"decision_rule": {"min_confidence": "0.40", "min_edge_atr": "0.10"}, "calibrator_sha256": None},
+        "entry_evaluation": ENTRY_EVALUATION_PAST_FOLDS,
+        "entry_rules": _entry_rules(split),
+        "decision": _DECISION,
     }
 
 
@@ -239,8 +329,8 @@ async def _strong_and_junk(session: AsyncSession, split: ResearchSplit) -> tuple
         experiment_id=experiment_id,
         split=split,
         state="COMPLETE",
-        params=_candidate("strong"),
-        folds=_records(split, strong_r, meta=True),
+        params=_candidate("strong", split),
+        folds=_records(split, strong_r, meta=True, warmup=ENTRY_RULE_WARMUP_FOLDS),
     )
     return experiment_id, strong.trial_id, junk.trial_id
 
@@ -252,10 +342,15 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
         experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
         stored = await session.get(ExperimentTrial, strong_id)
         assert stored is not None
-        assert stored.oos_results == [format(value, "f") for value in strong_r]
+        # Прогрів (рішення 0024): два перші фолди без угод, ряд — лише оцінені фолди.
+        warm = ENTRY_RULE_WARMUP_FOLDS
+        assert stored.oos_results == [format(value, "f") for value in strong_r[warm * 2 :]]
         assert "9" not in stored.oos_results
-        assert stored.oos_entry_ms == [fold.test_start_ms + offset * HOUR for fold in split.folds for offset in (0, 1)]
-        assert stored.metrics["folds"][0]["trading"]["n_signals"] == 3
+        assert stored.oos_entry_ms == [
+            fold.test_start_ms + offset * HOUR for fold in split.folds[warm:] for offset in (0, 1)
+        ]
+        assert stored.metrics["folds"][0]["trading"]["n_signals"] == 0
+        assert stored.metrics["folds"][warm]["trading"]["n_signals"] == 3
         with pytest.raises(GateRejected) as caught:
             await open_holdout_after_gate(
                 session,
@@ -353,14 +448,15 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
         result = row.result
         assert result is not None
         assert result["n_trials_line"] == 5
-        # Розкид DSR — з рядів ≥ 30 угод: кандидат, junk і сусідня спроба (по 94); обрізана (6) — ні.
+        # Розкид DSR — з рядів ≥ 30 угод: кандидат (90), junk і сусідня спроба (по 94); обрізана (6) — ні.
         assert result["dsr_spread_trials"] == 3
         assert result["dsr_spread_floor"] is False
         assert Decimal(result["dsr_benchmark_sharpe"]) > 0
-        # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 47 (кратно 16), усі розбиття.
+        # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 45 оцінених (кратно 16), усі розбиття.
+        # Відрізок — від першого оціненого фолду кандидата, без прогріву (рішення 0024).
         assert result["pbo_strategies"] == 3
         assert result["pbo_splits"] == 12870
-        start = split.folds[0].test_start_ms
+        start = split.folds[ENTRY_RULE_WARMUP_FOLDS].test_start_ms
         assert (result["pbo_span_from_ms"], result["pbo_span_to_ms"]) == (start, start + 32 * 24 * HOUR)
 
 
@@ -388,8 +484,8 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
             experiment_id=moved,
             split=shifted,
             state="COMPLETE",
-            params=_candidate("strong"),
-            folds=_records(shifted, strong_r, meta=True),
+            params=_candidate("strong", shifted),
+            folds=_records(shifted, strong_r, meta=True, warmup=ENTRY_RULE_WARMUP_FOLDS),
         )
         opened = await open_holdout_after_gate(
             session,
@@ -402,9 +498,11 @@ async def test_shifted_geometry_does_not_shed_rivals(conn: AsyncConnection) -> N
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
         result = row.result
         assert result is not None
-        # Відрізок PBO — walk-forward кандидата; старі спроби змагаються на добах, які покрили.
+        # Відрізок PBO — оцінений walk-forward кандидата (без прогріву, рішення 0024); старі спроби змагаються
+        # на добах, які покрили.
         assert result["pbo_strategies"] == 3
-        assert result["pbo_span_from_ms"] == shifted.folds[0].test_start_ms
+        assert result["pbo_span_from_ms"] == shifted.folds[ENTRY_RULE_WARMUP_FOLDS].test_start_ms
+        assert result["warmup_folds"] == ENTRY_RULE_WARMUP_FOLDS
 
 
 async def test_later_rejection_keeps_the_snapshot_of_the_opening(conn: AsyncConnection) -> None:
@@ -476,11 +574,14 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
         assert result["thresholds"]["min_trades_per_fold"] == 1
         assert result["thresholds"]["stress_cost_factor"] == "2"
         assert result["loosened"] == ["min_trades_per_fold", "min_oos_trades"]
-        assert result["n_trades"] == len(split.folds) * 2
+        # Умови фолдів — без двох прогрівних (рішення 0024): угоди й стрес лише оцінених фолдів.
+        evaluated = len(split.folds) - ENTRY_RULE_WARMUP_FOLDS
+        assert result["warmup_folds"] == ENTRY_RULE_WARMUP_FOLDS
+        assert result["n_trades"] == evaluated * 2
         assert result["unfiltered_total_net"] == "0"
         assert result["scored_unfiltered_total_net"] == "0"
         assert result["invalidated_trials"] == []
-        assert len(result["stress"]) == len(split.folds)
+        assert len(result["stress"]) == evaluated
         assert result["stress"][0] == {
             "n_trades": 2,
             "n_signals": 3,
@@ -492,9 +593,10 @@ async def test_passed_gate_opens_only_this_holdout(conn: AsyncConnection) -> Non
 
 
 async def test_meta_trial_not_evaluated_by_the_entry_rule_does_not_pass(conn: AsyncConnection) -> None:
-    """Ті самі угоди без позначки перехресної оцінки правилом входу — G1 відмовляє лише з цієї причини (0020).
+    """Ті самі угоди без оцінки правилом входу лише минулими фолдами — G1 відмовляє лише з цієї причини.
 
-    Інакше G1 оцінював би `keep(0.5)`, а в модель допуску і live пішло б інше правило (`decide_entry`).
+    Інакше G1 оцінював би `keep(0.5)` (рішення 0020) або правило, підігнане й на пізніших фолдах (стара
+    перехресна оцінка, рішення 0024), а в модель допуску і live пішло б правило `decide_entry`.
     """
     split = _split()
     strong_r, _junk_r = _paths(len(split.folds) * 2)
@@ -504,7 +606,9 @@ async def test_meta_trial_not_evaluated_by_the_entry_rule_does_not_pass(conn: As
         model = await _model(conn, experiment_id)
         for name, params in (
             ("keep", {"name": "keep"}),
-            ("no-rule", {"name": "no-rule", "entry_evaluation": ENTRY_EVALUATION}),
+            ("no-rule", {"name": "no-rule", "entry_evaluation": ENTRY_EVALUATION_PAST_FOLDS}),
+            # Стара перехресна оцінка (0020): калібратор фолду k бачив пізніші фолди.
+            ("cross-fold", {"name": "cross-fold", "entry_evaluation": "decision_cross_fold", "decision": _DECISION}),
         ):
             trial = await record_trial(
                 session,
@@ -901,3 +1005,119 @@ async def test_reference_baseline_counts_in_n_but_not_in_pbo(conn: AsyncConnecti
         assert result["n_trials_line"] == 3
         assert result["baseline_trials"] == [baseline.trial_id]
         assert result["pbo_strategies"] == 2
+
+
+async def test_warmup_folds_are_left_out_of_every_fold_condition(conn: AsyncConnection) -> None:
+    """Прогрів (рішення 0024): два перші фолди без угод не валять умову «кожен фолд ≥ N угод» і частку фолдів.
+
+    Якби G1 рахував їх, `min_trades_per_fold = 1` відмовив би (`G1_MIN_TRADES_FOLD`), а частка прибуткових
+    фолдів упала б нижче за 70% лише через прогрів.
+    """
+    split = _split()
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, strong_id, _junk_id = await _strong_and_junk(session, split)
+        preview = await preview_gate_g1(
+            session,
+            experiment_id=experiment_id,
+            trial_id=strong_id,
+            stress=_stress(split),
+            thresholds=GateThresholds(min_trades_per_fold=1, min_oos_trades=1),
+        )
+    decision = preview.decision
+    assert decision.passed, decision.reasons
+    assert decision.warmup_folds == ENTRY_RULE_WARMUP_FOLDS
+    assert decision.n_trades == (len(split.folds) - ENTRY_RULE_WARMUP_FOLDS) * 2
+
+
+async def test_a_warmup_the_journal_does_not_prove_is_an_entry_rule_failure(conn: AsyncConnection) -> None:
+    """Спроба не може оголосити прогрівом довільні фолди: інакше прибрала б з G1 незручні фолди.
+
+    Прогрів визнається лише як префікс без жодного сигналу, а правило фолду k — рівно на фолдах 0…k−1.
+    """
+    split = _split()
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    n_folds = len(split.folds)
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    # Прогрів зсунуто на фолди 1–2, а фолд 0 має правило ні на чому.
+    first: dict[str, object] = {"fold_index": 0, "method": "platt", "fit_on_folds": [], **_DECISION}
+    shifted_rules: list[dict[str, object]] = [first]
+    shifted_rules.extend({**item, "fold_index": index + 1} for index, item in enumerate(_entry_rules(split)[:-1]))
+    own_fold = _entry_rules(split)
+    own_fold[2] = {**own_fold[2], "fit_on_folds": [0, 1, 2]}
+    future = _entry_rules(split)
+    future[3] = {**future[3], "fit_on_folds": list(range(n_folds))}
+    # Фолди пулу минулі, але мітки пулу дочитують open першого бару тесту, який правило оцінює.
+    reaching = _entry_rules(split)
+    reaching[3] = {**reaching[3], "label_end_ms": split.folds[3].test_start_ms}
+    no_pool = _entry_rules(split)
+    no_pool[4] = {**no_pool[4], "fit_on_folds": []}
+    cases: tuple[tuple[str, list[dict[str, object]], int], ...] = (
+        # Прогрів не з початку walk-forward.
+        ("shifted", shifted_rules, ENTRY_RULE_WARMUP_FOLDS),
+        # Правило фолду бачило власний фолд.
+        ("own-fold", own_fold, ENTRY_RULE_WARMUP_FOLDS),
+        # Правило фолду бачило пізніші фолди.
+        ("future", future, ENTRY_RULE_WARMUP_FOLDS),
+        # Мітки пулу дочитують тест фолду.
+        ("label-reaches-test", reaching, ENTRY_RULE_WARMUP_FOLDS),
+        # Правило без пулу (нема з чого підганяти).
+        ("no-pool", no_pool, ENTRY_RULE_WARMUP_FOLDS),
+        # Записи кажуть «прогрів», а у фолдах прогріву є угоди.
+        ("traded-warmup", _entry_rules(split), 0),
+        # Записів менше, ніж фолдів.
+        ("short", _entry_rules(split)[:-1], ENTRY_RULE_WARMUP_FOLDS),
+    )
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, _strong_id, _junk_id = await _strong_and_junk(session, split)
+        for name, rules, warmup in cases:
+            trial = await record_trial(
+                session,
+                experiment_id=experiment_id,
+                split=split,
+                state="COMPLETE",
+                params={
+                    "name": name,
+                    "entry_evaluation": ENTRY_EVALUATION_PAST_FOLDS,
+                    "entry_rules": rules,
+                    "decision": _DECISION,
+                },
+                folds=_records(split, strong_r, meta=True, warmup=warmup),
+            )
+            preview = await preview_gate_g1(
+                session,
+                experiment_id=experiment_id,
+                trial_id=trial.trial_id,
+                thresholds=loose,
+            )
+            assert G1_ENTRY_RULE in preview.decision.reasons, name
+            assert preview.decision.warmup_folds == 0, name
+            assert not preview.decision.passed, name
+
+
+async def test_rule_without_filter_on_warmup_folds_does_not_enter_the_filter_comparison(conn: AsyncConnection) -> None:
+    """На прогріві фільтр не торгує, а правило без фільтра торгує (рішення 0024). Його виграш там не має робити
+    фільтр «гіршим», а програш — «кращим»: обидві суми — лише по оцінених фолдах."""
+    split = _split()
+    strong_r, _junk_r = _paths(len(split.folds) * 2)
+    loose = GateThresholds(min_trades_per_fold=1, min_oos_trades=1)
+    async with AsyncSession(bind=conn) as session:
+        experiment_id, _strong_id, _junk_id = await _strong_and_junk(session, split)
+        for name, warm_rule in (("warm-wins", Decimal("1000")), ("warm-loses", Decimal("-1000"))):
+            trial = await record_trial(
+                session,
+                experiment_id=experiment_id,
+                split=split,
+                state="COMPLETE",
+                params=_candidate(name, split),
+                folds=_records(split, strong_r, meta=True, warmup=ENTRY_RULE_WARMUP_FOLDS, warm_unfiltered=warm_rule),
+            )
+            preview = await preview_gate_g1(
+                session,
+                experiment_id=experiment_id,
+                trial_id=trial.trial_id,
+                stress=_stress(split),
+                thresholds=loose,
+            )
+            # Сума правила на прогріві — 4000 або −4000: увійди вона в порівняння, «warm-wins» не пройшов би фільтр.
+            assert "G1_FILTER" not in preview.decision.reasons, name
+            assert preview.decision.warmup_folds == ENTRY_RULE_WARMUP_FOLDS, name

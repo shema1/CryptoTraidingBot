@@ -6,8 +6,8 @@
 `.env.example`.
 
 > Стан проєкту: працюють БД, міграції, торговий процес із локальним API (`GET /system/health`), воркер публічного
-> backfill і колектор ліквідацій та деривативів (публічні WebSocket і REST Bybit, без ордерів і без ключів). Боти, ML і екрани UI — ще не
-> реалізовані (`docs/ai/TASKS.md`).
+> backfill, колектор ліквідацій та деривативів (публічні WebSocket і REST Bybit, без ордерів і без ключів) і
+> дослідницький ML-конвеєр на історії з БД (крок 5А). Боти, торгівля й екрани UI — ще не реалізовані (`docs/ai/TASKS.md`).
 
 ## 1. Встановити
 
@@ -167,6 +167,45 @@ cd apps/backend && uv run python -m app.data.collector
 
 Зупинка — Ctrl+C (код 0).
 
+## 5А. Історія ринку і дослідницький прогін (етап 2)
+
+**1. Поставити задачі історії** (лише БД, без мережі й ключів; повтор — безпечний і докачує лише нове):
+
+```bash
+cd apps/backend && uv run python -m app.jobs.enqueue market-data
+```
+
+Ставить три задачі воркера: `refresh_instruments` (кеш правил інструментів без зміни пауз ботів; пропускається, поки в БД є
+боти режиму `demo` — тоді кеш оновлює торговий процес), `backfill_candles` (свічки 1h і funding від `BACKFILL_START_MS`) і
+`backfill_derivatives`. Виконує їх воркер (крок 5). Перший прохід — кілька хвилин; стан — `SELECT kind, status, result FROM jobs`.
+
+**2. Тримати колектор і воркер запущеними (macOS).** Ноутбук, що засинає, не збирає ліквідації: агенти launchd
+стартують процеси при вході, перезапускають після збою і тримають заборону сну (`caffeinate -i -s`, лише від мережі
+живлення; закрита кришка без зовнішнього монітора однаково присипляє Mac). Без sudo, у `~/Library/LaunchAgents`:
+
+```bash
+scripts/macos/launch_agents.sh install
+```
+
+```bash
+scripts/macos/launch_agents.sh status
+```
+
+Прибрати — `scripts/macos/launch_agents.sh uninstall`. Логи процесів — як і раніше в `logs/collector/` і
+`logs/worker/`; вивід launchd — `logs/launchd/`. Якщо колектор чи воркер уже запущені вручну, агент чекає lock і
+перезапускається кожні 30 с, доки ручний процес не зупиниться. Після `git pull` — `install` ще раз (перезапуск).
+
+**3. Дослідницький прогін ітерації 1** (бейзлайни → вибір правила → meta-модель → перегляд Gate G1):
+
+```bash
+cd apps/backend && uv run python -m app.ml.research iteration-one
+```
+
+Важливо: **кожен прогін назавжди пише спроби в журнал лінії** (N для DSR росте), тож запускати свідомо, не «для
+перевірки». Перший прогін фіксує hold-out лінії (останні 20% вікна): повторний прогін зі свіжішими даними
+відмовить з кодом 14. Hold-out прогін не відкриває. Тривалість — десятки хвилин (CPU). Звіт — `docs/research/<дата>-iteration-one-btc.md`,
+шлях — у лозі `research_report_written` (`logs/research/`).
+
 ## 6. Веб-інтерфейс (поки каркас)
 
 ```bash
@@ -197,6 +236,12 @@ cd apps/web && npm run dev    # http://127.0.0.1:5173
 | колектор → `liquidation_save_failed` / `liquidation_gap_sync_failed` (error, `retry_in_ms`) | БД недоступна | крок 4; колектор сам повторює запис з паузою до 60 с, готові години чекають у пам'яті |
 | колектор → `derivatives_sync_failed` (error) або `derivatives_sync_retry` | БД чи біржа недоступні під час проходу деривативів | нічого: повтор після паузи (від 30 с до `BACKFILL_INTERVAL_S`), ліквідації збираються далі; якщо повторюється — дивитися `error_type` |
 | колектор → `derivatives_enqueued`, а дані деривативів не з'являються | історії бракує більше ніж 168 год — її качає воркер | запустити воркер (крок вище) |
+| колектор → `clock_jump_detected` кожні ~15 хв, жодного `liquidations_sealed` | Mac засинає (стрибок ~900 с) | крок 5А.2 (агенти з `caffeinate`), живлення від мережі |
+| `python -m app.jobs.enqueue` → код 11 | БД не запущена | крок 4 |
+| воркер → `instruments_refresh_skipped` (`bots_exist`) | у БД є боти режиму `demo`: кеш оновлює торговий процес | нічого; для досліджень кеш уже є |
+| `python -m app.ml.research` → код 13, `research_data_insufficient` | немає свічок або інструментів для символів | крок 5А.1 і воркер |
+| `python -m app.ml.research` → код 10, `research_lock_held` | уже йде інший дослідницький прогін на цій БД | дочекатися його завершення |
+| `python -m app.ml.research` → код 14, `research_split_rejected` | hold-out лінії вже зафіксований першим прогоном, а свіжі дані дають інше вікно | не запускати повторно «для перевірки»: повторний прогін лінії — рішення T2.17 (кожен прогін додає спроби в N) |
 | health → 503, `"database": false` | БД недоступна | `docker compose ps`, крок 4 |
 | змінюючий запит → 503 `IDEMPOTENCY_STORE_UNAVAILABLE` | не застосовано міграції або БД недоступна | `uv run alembic upgrade head` |
 | 403 `HOST_NOT_ALLOWED` / `ORIGIN_NOT_ALLOWED` | запит не на `127.0.0.1:<API_PORT>` або UI з адреси поза `API_ALLOWED_ORIGINS` | відкривати UI з `http://127.0.0.1:5173` або додати адресу в `API_ALLOWED_ORIGINS` |

@@ -58,6 +58,7 @@ from app.core.logging import get_logger
 from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestReport, BacktestTrade
 from app.ml.decision import (
+    DecisionFit,
     DecisionRule,
     EntryDecision,
     ProbabilityCalibrator,
@@ -339,6 +340,31 @@ def decision_payload(rule: DecisionRule, calibrator: ProbabilityCalibrator) -> d
     return {
         "decision_rule": rule.metadata(),
         "calibrator_sha256": "sha256:" + hashlib.sha256(text.encode()).hexdigest(),
+    }
+
+
+def entry_rule_record(fold_index: int, fit: DecisionFit | None) -> dict[str, Any]:
+    """Правило входу одного фолду в журналі спроби G1 (`params.entry_rules[k]`, рішення 0024).
+
+    Спільне для `meta` і `direct`. `fit_on_folds` і `label_end_ms` — з самого пулу, на якому підігнано правило
+    (`DecisionFit.fit_folds`, `DecisionFit.label_end_ms`), а не з номера фолду: G1 перевіряє, що всі ці фолди
+    `< k`, а кінець міток — строго до тесту фолду k. Прогрівні фолди правила не мають (`method` = `None`,
+    `fit_on_folds` = `[]`).
+    """
+    if type(fold_index) is not int or isinstance(fold_index, bool) or fold_index < 0:
+        raise ArtifactError("fold_index має бути невід'ємний int")
+    if fit is None:
+        return {"fold_index": fold_index, "method": None, "fit_on_folds": []}
+    if type(fit) is not DecisionFit:
+        raise ArtifactError("правило фолду — DecisionFit або None")
+    if not fit.fit_folds or fit.label_end_ms is None:
+        raise ArtifactError("правило фолду без даних пулу: fit_on_folds і label_end_ms обов'язкові")
+    return {
+        "fold_index": fold_index,
+        "method": fit.method,
+        "fit_on_folds": list(fit.fit_folds),
+        "label_end_ms": fit.label_end_ms,
+        **decision_payload(fit.rule, fit.calibrator),
     }
 
 
@@ -1292,6 +1318,9 @@ def _require_tradable(loaded: LoadedModel, mode: str) -> None:
         raise ArtifactError("режим — demo, testnet або live")
     if type(loaded) is not LoadedModel or loaded.db_status is None:
         raise ModelNotTradable(f"{mode}: модель не прочитана з БД (load_registered_model)")
+    if loaded.metadata.get("label_type") == "direct":
+        # Запас міцності (рішення 0022): live-інференсу direct немає до T5.x, тож вхід не пропускає його ніколи.
+        raise ModelNotTradable(f"{mode}: direct не торгує до T5.x (рішення 0022)")
     status = loaded.db_status
     if status not in _TRADABLE[mode] or loaded.metadata.get("status") != status:
         raise ModelNotTradable(f"{mode}: вхід не читає модель у статусі {status}")
@@ -1723,9 +1752,13 @@ def _load_directory(directory: Path) -> LoadedModel:
             raise ArtifactError("rule_only не має хеша файлу моделі")
     elif label in ("meta", "direct"):
         booster = _load_booster(model_path, payload)
-        if not calibrator_path.is_file() or _sha256_file(calibrator_path) != reproducibility.get("calibrator_sha256"):
+        if not calibrator_path.is_file():
             raise ArtifactError("хеш калібратора не збігається")
-        calibrator = calibrator_from_payload(json.loads(calibrator_path.read_text(encoding="utf-8")))
+        # Калібратор, як і бустер, розбирається з тих самих байтів, що хешувались (без підміни між читаннями).
+        calibrator_bytes = calibrator_path.read_bytes()
+        if "sha256:" + hashlib.sha256(calibrator_bytes).hexdigest() != reproducibility.get("calibrator_sha256"):
+            raise ArtifactError("хеш калібратора не збігається")
+        calibrator = calibrator_from_payload(json.loads(calibrator_bytes.decode("utf-8")))
         if calibrator.method != payload.get("recipe", {}).get("calibrator"):
             raise ArtifactError("метод калібратора не збігається з метаданими")
     else:

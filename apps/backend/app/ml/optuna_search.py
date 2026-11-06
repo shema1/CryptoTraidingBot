@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.db import SYMBOL_RE
 from app.core.logging import get_logger
+from app.data.backfill import EXCHANGE
 from app.data.gaps import GapRange
 from app.data.models import (
     Candle,
@@ -47,6 +48,7 @@ from app.data.models import (
     OpenInterest,
     PremiumIndex,
 )
+from app.exchange.instruments import RESEARCH_INSTRUMENTS_MODE
 from app.exchange.models import Instrument as StoredInstrument
 from app.exchange.types import Instrument
 from app.jobs.models import Job
@@ -100,9 +102,9 @@ OPTUNA_TRIALS_MIN: int = 100
 OPTUNA_TRIALS_MAX: int = 200
 OBJECTIVE_NAME: str = "median_fold_net_minus_spread"
 SPREAD_PENALTY: Decimal = Decimal(1)
-_EXCHANGE: str = "bybit"
+_EXCHANGE: str = EXCHANGE
 _TIMEFRAME: str = "1h"
-_INSTRUMENT_MODE: str = "demo"
+_INSTRUMENT_MODE: str = RESEARCH_INSTRUMENTS_MODE
 _ACTIVE: tuple[str, ...] = ("QUEUED", "RUNNING")
 _MONEY_KEYS: tuple[str, ...] = (
     "initial_equity",
@@ -468,8 +470,8 @@ async def load_optuna_inputs(sessions: SessionFactory, request: OptunaJobRequest
     return OptunaInputs(histories=histories, feature_data=features, split=split)
 
 
-def _prepare_new(rows: Sequence[_SymbolRows], request: OptunaJobRequest, target: TargetParams) -> OptunaInputs:
-    """Нова розбивка. Межу hold-out дає лише спільне вікно свічок; ряди ріжуться по ній до бектестів розбивки."""
+def _common_window(rows: Sequence[_SymbolRows]) -> tuple[int, int, int]:
+    """Спільне вікно свічок усіх символів `[start, end)` і початок hold-out у ньому."""
     start = max(item.candles[0][0].open_time_ms for item in rows)
     end = min(item.candles[-1][0].open_time_ms for item in rows) + HOUR_MS
     if end <= start:
@@ -478,8 +480,89 @@ def _prepare_new(rows: Sequence[_SymbolRows], request: OptunaJobRequest, target:
         cut, _holdout_to = holdout_bounds(start, end)
     except ValueError as exc:
         raise OptunaDataError("з наявної історії не виходить розбивка") from exc
+    return start, end, cut
+
+
+def _prepare_new(rows: Sequence[_SymbolRows], request: OptunaJobRequest, target: TargetParams) -> OptunaInputs:
+    """Нова розбивка. Межу hold-out дає лише спільне вікно свічок; ряди ріжуться по ній до бектестів розбивки."""
+    start, end, cut = _common_window(rows)
     histories, features = _assemble(rows, cut)
     split = _new_split(histories, request, target, data_from_ms=start, data_to_ms=end)
+    if split.holdout_from_ms != cut:
+        raise OptunaDataError("межа hold-out розбивки не збіглась зі зрізом рядів")
+    return OptunaInputs(histories=histories, feature_data=features, split=split)
+
+
+async def load_research_inputs(
+    sessions: SessionFactory,
+    *,
+    symbols: Sequence[str],
+    trading_symbol: str,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    target: TargetParams,
+    costs: CostModel | None = None,
+) -> OptunaInputs:
+    """Історії, фічі й нова розбивка для дослідницького циклу (T2.12 (а), T2.14). Hold-out не відкривається.
+
+    Той самий завантажувач, що в Optuna: свічки, mark, funding, деривативи і кеш інструментів режиму `demo`
+    однією короткою транзакцією; ряди ріжуться по початку hold-out до вирівнювання mark (`_assemble`).
+    Різниця — фолди: подовжуються за найрідшим кандидатом `PRIMARY_CANDIDATES` (`executed_trade_count` за
+    замовчуванням), тож геометрія не залежить від того, хто виграє порівняння каталогу (рішення 2026-11-02).
+    """
+    chosen = tuple(symbols)
+    if trading_symbol not in chosen or len(set(chosen)) != len(chosen):
+        raise OptunaParamsError("торговий символ має бути серед символів дослідження, без дублів")
+    async with sessions() as session, session.begin():
+        rows = await _load_rows(session, chosen)
+    return await asyncio.to_thread(
+        _prepare_research,
+        rows,
+        trading_symbol=trading_symbol,
+        limits=limits,
+        initial_equity=initial_equity,
+        maintenance_margin_rate=maintenance_margin_rate,
+        seed=seed,
+        target=target,
+        costs=costs,
+    )
+
+
+def _prepare_research(
+    rows: Sequence[_SymbolRows],
+    *,
+    trading_symbol: str,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    target: TargetParams,
+    costs: CostModel | None,
+) -> OptunaInputs:
+    start, end, cut = _common_window(rows)
+    histories, features = _assemble(rows, cut)
+    trading = next(item for item in histories if item.symbol == trading_symbol)
+    try:
+        split = build_split(
+            data_from_ms=start,
+            data_to_ms=end,
+            horizon_bars=target.horizon_bars,
+            count_trades=executed_trade_count(
+                trading,
+                horizon_bars=target.horizon_bars,
+                limits=limits,
+                initial_equity=initial_equity,
+                maintenance_margin_rate=maintenance_margin_rate,
+                seed=seed,
+                costs=costs,
+                params=target,
+                specs=PRIMARY_CANDIDATES,
+            ),
+        )
+    except (ValueError, SplitLeakError) as exc:
+        raise OptunaDataError("з наявної історії не виходить розбивка") from exc
     if split.holdout_from_ms != cut:
         raise OptunaDataError("межа hold-out розбивки не збіглась зі зрізом рядів")
     return OptunaInputs(histories=histories, feature_data=features, split=split)

@@ -47,68 +47,79 @@
 | 4 | T0.4 | Схема БД і базові міграції (ТЗ §15) | R2 | opus / xhigh | T0.2, T0.3 |
 | 5 | T0.6 | Single-instance advisory lock | R3 | fable / xhigh | T0.4 |
 | 6 | T0.7 | Каркас FastAPI і безпека локального API | R2 | opus / high | T0.3 |
-| 7 | T1.1 | Доменні типи, інтерфейс `ExchangeAdapter`, `FakeExchangeAdapter` | R3 | fable / xhigh | T0.3 |
-| 8 | T1.2 | Централізований rate limiter з пріоритетами | R2 | opus / xhigh | T1.1 |
-| 9 | T1.3 | Bybit: публічні дані та `fetch_time` | R2 | opus / high | T1.1, T1.2 |
-| 10 | T1.4 | Backfill свічок і funding | R2 | opus / high | T0.4, T1.3 |
-| 11 | T1.5 | Виявлення прогалин (`data_gaps`) | R2 | opus / high | T1.4 |
-| 12 | T1.6 | Синхронізація та стрибки часу | R2 | opus / high | T1.3 |
-| 13 | T1.7 | Кеш `instruments` і округлення | R3 | fable / xhigh | T1.3 |
-| 14 | T1.8 | Воркер задач (`jobs`) | R1 | sonnet / high | T0.4 |
-| 15 | T1.9 | Backfill даних деривативів | R2 | opus / high | T1.4 |
-| 16 | T1.10 | Колектор ліквідацій (запустити якомога раніше) | R1 | sonnet / high | T0.4, T1.3 |
-| 17 | T2.1 | `compute_features()` + буфер (1h, 4h/1d, деривативи, кілька символів) | R2 | opus / xhigh | T1.5, T1.9 |
-| 18 | T2.2 | Модель витрат, `calc_position_size()`, ліміти `risk/limits.py` | R3 | fable / xhigh | T1.7 |
-| 19 | T2.3 | Симулятор угоди, розмітка і ваги унікальності | R2 | opus / xhigh | T2.1, T2.2, T1.9 |
-| 20 | T2.4 | Бектестер (виконання і ліміти = live) | R2 | opus / xhigh | T2.3 |
-| 21 | T2.5 | Валідація: walk-forward, embargo, hold-out, журнал спроб | R2 | opus / xhigh | T2.4 |
-| 22 | T2.6 | Статистика: блочний bootstrap, DSR, PBO, коридор, Gate G1 | R2 | opus / xhigh | T2.5 |
-| 23 | T2.7 | Бейзлайни і первинна стратегія | R2 | opus / high | T2.4, T2.5 |
-| 24 | T2.8 | Meta-модель LightGBM і метрики | R2 | opus / high | T2.6, T2.7 |
-| 25 | T2.9 | Калібрування і правило очікуваної вигоди | R2 | opus / high | T2.8 |
-| 26 | T2.10 | Optuna як задача воркера | R1 | sonnet / high | T1.8, T2.8 |
-| 27 | T2.11 | Артефакти, відтворюваність, статуси, перенавчання рецепта | R3 | fable / xhigh | T2.9 |
-| 28 | T2.12 | Дослідницький цикл моделі (з людиною) | R2 | opus / high | T2.6–T2.11 |
-| 29 | T2.13 | Дослідницький цикл, ітерація 2 (пряме 3-класове прогнозування) | R2 | opus / high | T2.12 |
-| 30 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
-| 31 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
-| 32 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
-| 33 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
-| 34 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
-| 35 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
-| 36 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
-| 37 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
-| 38 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
-| 39 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
-| 40 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
-| 41 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
-| 42 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
-| 43 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
-| 44 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
-| 45 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
-| 46 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
-| 47 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
-| 48 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
-| 49 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
-| 50 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
-| 51 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
-| 52 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
-| 53 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
-| 54 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
-| 55 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
-| 56 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
-| 57 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
-| 58 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
-| 59 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
-| 60 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
-| 61 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
-| 62 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
-| 63 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
-| 64 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
-| 65 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
-| 66 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
-| 67 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
-| 68 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
+| 7 | T0.8 | Ізоляція тестової БД між прогонами pytest | R1 | sonnet / high | T0.4 |
+| 8 | T0.9 | strict mypy для гейту ML (`app.ml.artifacts`, `app.ml.decision`) | R1 | sonnet / medium | T2.11 |
+| 9 | T0.10 | Винести примітки задач з `TASKS.md` в окремі файли | R0 | haiku / medium | — |
+| 10 | T1.1 | Доменні типи, інтерфейс `ExchangeAdapter`, `FakeExchangeAdapter` | R3 | fable / xhigh | T0.3 |
+| 11 | T1.2 | Централізований rate limiter з пріоритетами | R2 | opus / xhigh | T1.1 |
+| 12 | T1.3 | Bybit: публічні дані та `fetch_time` | R2 | opus / high | T1.1, T1.2 |
+| 13 | T1.4 | Backfill свічок і funding | R2 | opus / high | T0.4, T1.3 |
+| 14 | T1.5 | Виявлення прогалин (`data_gaps`) | R2 | opus / high | T1.4 |
+| 15 | T1.6 | Синхронізація та стрибки часу | R2 | opus / high | T1.3 |
+| 16 | T1.7 | Кеш `instruments` і округлення | R3 | fable / xhigh | T1.3 |
+| 17 | T1.8 | Воркер задач (`jobs`) | R1 | sonnet / high | T0.4 |
+| 18 | T1.9 | Backfill даних деривативів | R2 | opus / high | T1.4 |
+| 19 | T1.10 | Колектор ліквідацій (запустити якомога раніше) | R1 | sonnet / high | T0.4, T1.3 |
+| 20 | T1.11 | Історія ринку для етапу 2 до T5 (`python -m app.jobs.enqueue market-data`) | R2 | opus / high | T1.4, T1.7, T1.8, T1.9 |
+| 21 | T1.12 | Безперервна робота колектора й воркера на macOS (launchd + `caffeinate`) | R1 | sonnet / medium | T1.8, T1.10 |
+| 22 | T2.1 | `compute_features()` + буфер (1h, 4h/1d, деривативи, кілька символів) | R2 | opus / xhigh | T1.5, T1.9 |
+| 23 | T2.2 | Модель витрат, `calc_position_size()`, ліміти `risk/limits.py` | R3 | fable / xhigh | T1.7 |
+| 24 | T2.3 | Симулятор угоди, розмітка і ваги унікальності | R2 | opus / xhigh | T2.1, T2.2, T1.9 |
+| 25 | T2.4 | Бектестер (виконання і ліміти = live) | R2 | opus / xhigh | T2.3 |
+| 26 | T2.5 | Валідація: walk-forward, embargo, hold-out, журнал спроб | R2 | opus / xhigh | T2.4 |
+| 27 | T2.6 | Статистика: блочний bootstrap, DSR, PBO, коридор, Gate G1 | R2 | opus / xhigh | T2.5 |
+| 28 | T2.7 | Бейзлайни і первинна стратегія | R2 | opus / high | T2.4, T2.5 |
+| 29 | T2.8 | Meta-модель LightGBM і метрики | R2 | opus / high | T2.6, T2.7 |
+| 30 | T2.9 | Калібрування і правило очікуваної вигоди | R2 | opus / high | T2.8 |
+| 31 | T2.10 | Optuna як задача воркера | R1 | sonnet / high | T1.8, T2.8 |
+| 32 | T2.11 | Артефакти, відтворюваність, статуси, перенавчання рецепта | R3 | fable / xhigh | T2.9 |
+| 33 | T2.12 | Дослідницький цикл моделі (з людиною) | R2 | opus / high | T2.6–T2.11 |
+| 34 | T2.13 | Дослідницький цикл, ітерація 2 (пряме 3-класове прогнозування) | R2 | opus / high | T2.12 |
+| 35 | T2.11-р | Допуск, артефакт і перенавчання для `direct` (T2.11-розширення) | R3 | fable / xhigh | T2.11, T2.13 |
+| 36 | T2.14 | Дослідницький раннер і перший прогін ітерації 1 на ринкових даних | R2 | opus / high | T1.11, T2.12, T2.15 |
+| 37 | T2.15 | Правило входу для G1 лише з минулих фолдів (meta і direct), прогрів, ≥ 4 оцінених фолди | R2 | opus / xhigh | T2.12, T2.13 |
+| 38 | T2.16 | Продуктивність конвеєра: кеш фіч між спробами Optuna, векторизація | R2 | opus / high | T2.14 |
+| 39 | T2.17 | Рішення про таргет, таймфрейм і список символів за результатами T2.14 | R2 | opus / high | T2.14 |
+| 40 | T2.18 | Звіт hold-out для допуску рахує сам допуск (до першого відкриття hold-out) | R3 | fable / xhigh | T2.11, T2.15 |
+| 41 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
+| 42 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
+| 43 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
+| 44 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
+| 45 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
+| 46 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
+| 47 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
+| 48 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
+| 49 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
+| 50 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
+| 51 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
+| 52 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
+| 53 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
+| 54 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
+| 55 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
+| 56 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
+| 57 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
+| 58 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
+| 59 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
+| 60 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
+| 61 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
+| 62 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
+| 63 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
+| 64 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
+| 65 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
+| 66 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
+| 67 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
+| 68 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
+| 69 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
+| 70 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
+| 71 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
+| 72 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
+| 73 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
+| 74 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
+| 75 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
+| 76 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
+| 77 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
+| 78 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
+| 79 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
 
 ---
 
@@ -151,6 +162,22 @@
 - **Зробити:** бінд `127.0.0.1`; bearer-токен; перевірка `Origin`/`Host` (DNS rebinding, CSRF); суворий CORS; middleware `Idempotency-Key` для змінюючих запитів; `audit_log`; `/system/health`.
 - **Готово, коли:** тести: запит з чужим `Origin`/`Host` → 403; без токена → 401; повтор з тим самим `Idempotency-Key` не виконує дію двічі.
 - **Примітки (2026-10-29):** `app/api/`: `security.py` — чисті ASGI-middleware `LocalOriginGuard` (`Host` рівно `127.0.0.1|localhost:<API_PORT>`, `Origin` точно з allowlist, `Sec-Fetch-Site: cross-site|same-site` без `Origin` → 403; WebSocket — закриття 1008 до accept; `Cache-Control: no-store`, `nosniff`) і `BearerAuth` (SHA-256 + `hmac.compare_digest`, 401 `AUTH_REQUIRED`/`AUTH_INVALID` з `WWW-Authenticate`, без токена лише CORS-preflight); порядок: ServerError → Guard → CORS (Starlette, без credentials і PNA) → Auth → Idempotency → роутер. `idempotency.py` — обов'язковий `Idempotency-Key` для POST/PUT/PATCH/DELETE (16–128 `[A-Za-z0-9_.:-]`), тіло ≤ 1 MiB, відбиток SHA-256 (метод, шлях, query, тіло), запис `IN_PROGRESS` комітиться до обробника (нова таблиця `api_idempotency_keys`, міграція `0002`), повтор → збережена відповідь + `Idempotency-Replayed`, інший запит → 422, `FAILED`/`IN_PROGRESS` іншого `owner` → 409 `IDEMPOTENCY_RESULT_UNKNOWN` (ніколи не виконується вдруге), БД недоступна → 503 без виконання. `audit.py` — `AuditWriter` у транзакції викликача з маскуванням (`SecretMasker.mask`, новий публічний метод). `system.py` — `GET /system/health` (lock + `SELECT 1` ≤ 2 с, 503 при деградації). `errors.py` — єдиний формат `{"error": {"code", "message"}}`. `server.py` — власний сокет `127.0.0.1:API_PORT` після lock (`ApiBindError`), uvicorn без `capture_signals`, `log_config=None`, без access-логу, `proxy_headers=False`, `lifespan="off"`, `ws="none"`, керована зупинка: сервер і обробники запитів дочікуються (бюджет 4,5 с), застряглі — дедлайн `run_exclusive` (5 с) → аварійний вихід; після втрати lock — без graceful-очікування. Swagger UI/ReDoc вимкнені, `/openapi.json` — з токеном; OpenAPI описує `bearerAuth` і обов'язковий заголовок. Конфіг: `API_PORT` (8000, 1024…65535), `API_TOKEN` (`SecretStr`, ≥ 32 token68), `API_ALLOWED_ORIGINS` (лише loopback, default `http://127.0.0.1:5173`); `API_BIND_HOST` не налаштовується. `__main__`: без `API_TOKEN` — код 15 до БД; порт зайнятий — код 16. strict-mypy поширено на `app.api.*`. Рішення з власником (`docs/decisions/0007-local-api.md`, ТЗ §14/§15/§16 оновлено): ключі в БД, токен для всіх ендпоінтів, процес без токена не стартує, невідомий результат не повторюється. Нові залежності: `fastapi` 0.162 (тягне `starlette` 1.10 і `opentelemetry-api` — лише API, без SDK), `uvicorn` 0.54 (без extras), dev `httpx` 0.28 (Starlette 1.10 радить `httpx2` для TestClient — лише попередження). Рев'ю `trading-safety-reviewer` (Opus — Fable недоступна), три раунди, фінальний вердикт — ПРОЙДЕНО: блокерів немає; зауваження «важливо» виправлено з регресійними тестами — 500 усередині CORS (`CatchUnhandled`), `serve_api` дочікується обробників запитів (lock не віддається, поки вони працюють), обмежений лог відмов (`RejectionLog`), `Connection: close` на 401/403; другий раунд: `limit_concurrency` прибрано (дозволяв чужій сторінці відрізати UI відповіддю 503), повтор, поки переможець ще в `begin()`, — `IN_PROGRESS`, після втрати lock обробники скасовуються на початку зупинки (самим `serve_api`, незалежно від версії Python) без graceful-очікування, підсумок придушених відмов — на першому запиті після вікна; дрібниці — `IN_PROGRESS` без виконання → `RESULT_UNKNOWN`, невідомі небезпечні методи → 405, тригер `ctb_api_idempotency_guard()` у 0002, маскування `reason`/`target`, `UUID` рядком у маскері, слабкий токен (< 10 різних символів) відхиляється, межі ключа з одного джерела, `curl` без токена в argv. **Відкриті рішення власника** (`docs/decisions/0007-local-api.md`): збій API зупиняє весь процес (T4.3/T5.1), недоступне сховище ключів блокує й захисні команди (T6.2), стандартний порт Vite як origin (T6.7). Перевірено вручну: `python -m app` на `ctb_test` — 200/401/403/400/повтор/404 `/docs`, слухає лише 127.0.0.1, SIGTERM → код 0 за 0,3 с, токена в логах немає. Тести: 676 passed (з БД); ruff, mypy, `alembic check` — чисто. Документація: `app/api/README.md`, `app/core/README.md`, `apps/backend/README.md`, `README.md`, `.env.example`, `AGENTS.md`, `.claude/rules/backend-python.md`, `AppInfo.md` §14/§15/§16, `docs/decisions/0007-local-api.md`. **Для наступних задач:** T6.1 — обробники беруть ключ із `request.state.idempotency_key`, пишуть `audit_log` через `AuditWriter` у тій самій транзакції; ендпоінти, що збільшують експозицію, — `Depends(require_instance_lock)`; помилки — `ApiError(status, ErrorCode, message)`; T6.2 — `confirmed=True` лише після підтвердження людини; T6.3 — браузерний WebSocket не задає `Authorization` (вирішити, напр., підпротоколом), `ws="none"` → увімкнути й додати `websockets`; T6.4 — схема офлайн з `create_app(ctx).openapi()` (без сервера і токена); T6.7 — як UI отримує токен (не в URL); T5.10 — `API_TOKEN` для служби лише з `.env`; після оновлення — `uv run alembic upgrade head` на dev-БД (таблиця `api_idempotency_keys`).
+
+#### T0.8 · Ізоляція тестової БД між прогонами pytest `[x]`
+- **Ризик:** R1 · **Модель:** Sonnet 5.5 (`sonnet`, `high`) · **ТЗ:** §18 · **Аудит:** `docs/audits/2026-11-05-audit-T0.1-T2.13.md` (I3)
+- **Зробити:** другий одночасний прогін pytest не зносить схему першому: фікстура `migrated_db` робить `downgrade base` → `upgrade head` на спільній `<POSTGRES_DB>_test`.
+- **Готово, коли:** сесія тримає міжпроцесне блокування; другий прогін чекає; тест на блокування.
+- **Примітки (2026-11-05):** `tests/db/conftest.py` — фікстура `test_db_lock` (сесія) тримає `fcntl.flock` файла `ctb-test-db-<БД>.lock` у тимчасовій теці ОС; `migrated_db` залежить від неї; другий прогін пише в stderr, що чекає, і чекає. Причина п'яти падінь у першому прогоні T2.13. Тест: `tests/db/test_test_db_lock.py`. Фікстура експортується в `tests/{ml,data,jobs}/conftest.py`, а pytest створює окремий екземпляр сесійної фікстури на кожен conftest — тому дескриптор блокування один на процес (`_HELD`): перша версія без цього в повному прогоні чекала сама на себе (знайдено 2026-11-06, тест `test_the_same_process_takes_the_lock_again_without_waiting`). Документація: `apps/backend/README.md`.
+
+#### T0.9 · strict mypy для гейту ML `[x]`
+- **Ризик:** R1 · **Модель:** Sonnet 5.5 (`sonnet`, `medium`) · **ТЗ:** §14 · **Аудит:** I4
+- **Зробити:** `app.ml.artifacts` (Live лише `APPROVED`, блок інференсу) і `app.ml.decision` (правило входу live) — під тими самими прапорцями strict, що торгове ядро.
+- **Примітки (2026-11-05):** `pyproject.toml` (`[[tool.mypy.overrides]]`); виправлено два `no-any-return` у `decision.py`, тест імпортує `DEFAULT_BOOTSTRAP_REPLICATES` з модуля-джерела (`statistics.py`), а не через реекспорт. `mypy app tests` — чисто. Документація: `AGENTS.md` (перелік strict), `.claude/rules/backend-python.md`.
+
+#### T0.10 · Винести примітки задач з `TASKS.md` `[ ]`
+- **Ризик:** R0 · **Модель:** Haiku 5.5 (`haiku`, `medium`) · **Аудит:** «Документація»
+- **Зробити:** `TASKS.md` (338 КБ, рядки до 7 тис. символів) вантажиться в кожну сесію `/next-task`. Примітки виконаних задач — у `docs/ai/tasks/T<ID>.md` дослівно (скриптом, без переписування); у `TASKS.md` лишаються «Ризик», «Зробити», «Готово, коли», «Передано з попередніх задач» і посилання на файл приміток. Оновити skill `next-task`, якщо він читає примітки.
+- **Готово, коли:** `TASKS.md` < 80 КБ; скрипт перевіряє, що текст приміток збережено без втрат.
 
 ### Етап 1. Дані
 
@@ -228,6 +255,21 @@
 - **Виправлено після перевірки, 2-й прохід (2026-10-30):** (а) Підписка: mainnet (перевірено наживо, публічний WS без ключів) відхиляє спільний запит цілком, якщо хоч одна тема невідома (`success: false`, `ret_msg: "error:handler not found,topic:…"`, без `failTopics`) — один поганий символ у `RESEARCH_SYMBOLS` зупиняв збір усіх. Тепер кожен символ — окремий запит із `req_id` = темою (`req_id` повертається у відповіді — документація v5 і mainnet); відхилений символ — `liquidation_topic_rejected` (error) і прогалини лише для нього, відхилено всі — реконект; таймаут підписки — `liquidation_subscribe_timeout` з переліком символів без відповіді. `LiquidationBook.subscribed(symbol, at_ms)` — по символу. (б) Запис у БД винесено з циклу читання в окрему задачу `_Writer`: після помилки БД пауза 1 с ×2 до 60 с (`db_retry_delay_ms`, лог із `failures` і `retry_in_ms` раз на паузу, а не на кожен кадр; `liquidation_db_recovered`); зависла БД більше не робить здорове з'єднання stale; останній запис при зупинці ≤ `FINAL_FLUSH_TIMEOUT_MS` 3 с (< `BODY_STOP_TIMEOUT_MS`). `run_collector` тепер приймає `book` (символи — з нього). (в) Годинник (ТЗ §4.3): колектор тримає `ClockGuard` (`fetch_time` через `BybitAdapter` з лімітером ролі `COLLECTOR` — частка §6.5 тепер справді використовується), `watch_clock` звіряє книгу після кожного тіку, `collect_with_clock` зупиняє колектор, якщо контроль часу впав. Години закриваються лише коли годиннику вірять (немає `CLOCK_UNVERIFIED`/`CLOCK_DRIFT`; стрибок — за `jump_epoch`), з запасом `CLOCK_MARGIN_MS` 1 с з обох боків години; втрата довіри відкидає відкриті години. Поведінка змінилась: підписка рівно на межі години більше не робить її повною — потрібна ≥ 1 с до межі. (г) Handshake WS: `HANDSHAKE_TIMEOUT_S` 15 с на все відкриття з'єднання (aiohttp без `sock_read` чекав відповіді на upgrade вічно; перевірено в коді aiohttp 3.14). Також виміряно: без ping mainnet закриває з'єднання за ~60 с (код 1006), а не за ~10 хв, як було в документації. Тести: `tests/data/test_liquidations.py` (51 разом з повідомленнями: запас 1 с, довіра й стрибок, `watch_clock` зі справжнім `ClockGuard`, відхилений символ, усі відхилені, таймаут підписки, stale після двох ping, БД недоступна і зависла, `collect_with_clock`), `tests/exchange/test_liquidation_messages.py` (записані з mainnet відмова і pong, `req_id`, таймаут handshake). Живий прогін без БД на mainnet: `clock_drift_ok` (зсув 5 мс), відхилено лише вигаданий символ, BTC/ETH/SOL працювали, зупинка за 3 мс. Документація: `docs/data/liquidations.md`, `app/data/README.md`, `app/exchange/README.md`, `apps/backend/README.md`, `docs/runbooks/getting-started.md`, docstring `ClockGuard`. **Запущений колектор працює зі старим кодом — його треба перезапустити, і добова перевірка починається заново.**
 - **Деривативи в колекторі (2026-10-30, рішення власника — як у ТЗ §4.4, §6.4):** `run_derivatives` крутить `DerivativesSync.run_if_due` поруч із потоком ліквідацій, з того самого `BybitAdapter` (лімітер `COLLECTOR`); опитування розкладу — `DERIVATIVES_POLL_MS` 5 с, інтервал — `BACKFILL_INTERVAL_S`, пауза після збою — сам `DerivativesSync`. Хвіст ≤ 168 год качає колектор, довшу історію — воркер (задачу `backfill_derivatives` ставить той самий прохід). Прохід лише коли годиннику вірять (`derivatives_waiting_for_clock`): незакриту біржову годину `ON CONFLICT DO NOTHING` уже не виправив би. Збій проходу — `derivatives_sync_failed` (несподіваний виняток — з трасуванням), колектор ліквідацій працює далі; `stop` перериває прохід (`derivatives_sync_interrupted`). Раніше `DerivativesSync` ніхто не викликав (планувався торговий процес, T5). Funding лишається в `MarketDataSync` разом зі свічками (торговий процес, T5) — рішення власника, `docs/decisions/0011-funding-with-candles.md`, ТЗ §4.1/§4.4/§6.4 уточнено з його підтвердження. Тести: `tests/data/test_collector_derivatives.py` (годинник, збій БД і несподіваний, зупинка посеред проходу, лог підсумку, запис хвоста в тестову БД справжнім `DerivativesSync`). Живий прогін усього процесу не робився: запущений колектор тримає lock, а прохід писав би в робочу БД. Документація: `app/data/README.md`, `apps/backend/README.md`, `docs/runbooks/getting-started.md`. Код тепер відповідає ТЗ §4.4/§6.4 щодо OI, premium, mark/index і long/short.
 - **Відкрито (2026-10-30):** (1) `serve()` і `main()` колектора (коди виходу, lock, сигнал, склад задач) тестами не покриті.
+- **Оновлення (2026-11-06, аудит C2):** до цього дня колектор не запечатав жодної години (`liquidations_hourly` — 0 рядків): працював 30.10 ~4 год і 3.11 2 хв на Mac, що засинав кожні ~15 хв (`clock_jump_detected` зі зсувом ~898 с, втрата lock через heartbeat). Перезапущено 2026-11-06 під `caffeinate -i -s` (зсув годинника 12 мс); постійна робота — launchd-агенти T1.12. Добова перевірка за `data_gaps` починається з цього запуску.
+
+#### T1.11 · Історія ринку для етапу 2 до T5 `[x]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §4.1, §4.4, §6.4, §17 · **Рішення:** `docs/decisions/0023-market-data-bootstrap.md` · **Аудит:** C1
+- **Зробити:** спосіб отримати історію свічок, funding, деривативів і кеш `instruments` без торгового процесу (T5), не змінюючи розподіл обов'язків процесів ТЗ §6.4.
+- **Готово, коли:** у БД історія всіх `research_symbols` з зафіксованими прогалинами; повтор не створює дублів.
+- **Примітки (2026-11-05):** `app/jobs/enqueue.py` — `python -m app.jobs.enqueue market-data` (лише БД, без мережі й ключів; коди 0/1/2/11/15) ставить `refresh_instruments` (190), `backfill_candles` (200), `backfill_derivatives` (210); повтор — активна задача (`dedup_key`) або інкрементальний прохід. `app/jobs/worker.py` — `refresh_instruments` (`handle_instruments`, `enqueue_instruments_job`): `InstrumentCache.refresh` режиму `demo` лише коли в `bots` немає ботів цього режиму (інакше `skipped`, бо refresh зводить паузи ботів, T1.7, ТЗ §11.1); паузи, змінені всупереч цьому, — `RuntimeError`. Канали логів `enqueue` і `research` (`app/core/logging.py`). Виконано на робочій БД 2026-11-05: свічки 396 748 (BTC з 2020-03-25, SOL з 2021-10-15), funding 50 713, OI 399 627, premium 396 758, mark/index 793 618, long/short 399 327, кеш — 819 інструментів; після кешу прогалини свічок починаються від лістингу. Після спільного старту (2021-10-15) прогалини лише в long/short (24, разом 32 год — дірки біржі) і в ліквідаціях. Тести: `tests/jobs/test_enqueue.py` (3 задачі, ідемпотентність, без мережі, кеш без ботів і з ботом). Документація: `app/jobs/README.md`, `docs/runbooks/getting-started.md`, `README.md`, `apps/backend/README.md`, рішення 0023.
+- **Передано:** T5.1/T5.2 — свічки й кеш за розкладом оновлює торговий процес; до того перед дослідницьким прогоном виконати `python -m app.jobs.enqueue market-data` ще раз.
+- **Рев'ю `trading-safety-reviewer` (2026-11-06), частина B — «потребує змін», виправлено:** (1) гонка «перевірка ботів → refresh, що зводить паузи і комітить»: воркер тепер викликає `InstrumentCache.refresh(reason="research", apply_pauses=False)` — лише правила, жодного запису в `bots` (режим без пауз дозволений лише з причиною `research`, тест); перевірка «ботів demo немає» лишилась, щоб не відкладати `refresh_if_due` торгового процесу; (2) рішення 0023 переписано під код; (3) окремі канали логів `enqueue` і `research` (дві команди могли ротувати ті самі файли); (5) режим і біржа кешу — одне джерело (`RESEARCH_INSTRUMENTS_MODE`, `backfill.EXCHANGE`); (6) причина `research` у лозі замість `startup`; (7) `launch_agents.sh` відмовляє на шляху з символами `& | $ \` ' "`; (8) `skipif` з посиланням на T1.12; нові тести: боти лише іншого режиму, коди 11/15 команди, lock раннера.
+
+#### T1.12 · Безперервна робота колектора й воркера на macOS `[~]`
+- **Ризик:** R1 · **Модель:** Sonnet 5.5 (`sonnet`, `medium`) · **ТЗ:** §12.1.1 · **Рішення:** 0023 · **Аудит:** C2
+- **Зробити:** частина T5.10 для двох процесів, що мають працювати вже на етапі 2: launchd-агенти користувача з забороною сну.
+- **Готово, коли:** агенти встановлено; після перезавантаження колектор і воркер стартують самі; колектор запечатує години ліквідацій (`liquidations_sealed`) і добу без втрат за `data_gaps` (критерій T1.10).
+- **Примітки (2026-11-05):** `scripts/macos/launch_agents.sh install|uninstall|status|render`, шаблон `infra/macos/launch-agent.plist.template`: `/bin/sh -c 'caffeinate -i -s -w $$ & exec <venv python> -m <модуль>'` (заборона сну, поки живе процес; SIGTERM від `launchctl` отримує сам Python і виходить з кодом 0), `KeepAlive.SuccessfulExit=false` (перезапуск лише після ненульового коду), `ThrottleInterval` 30 с, `LOG_CONSOLE=false`, stdout/stderr — `logs/launchd/`. Прапорця перехоплення lock немає (T0.6); торговий процес — T5.10. Тести: `tests/test_launch_agents.py` (рендер plist, інваріанти). **Встановлення — команда власника** (постійна конфігурація поза репозиторієм): `scripts/macos/launch_agents.sh install`. Закрита кришка ноутбука без зовнішнього монітора однаково присипляє Mac.
 
 ### Етап 2. ML та бектест
 
@@ -426,6 +468,8 @@
   - **Відкрито після рев'ю:** умова `G1_ENTRY_RULE` не записана в ТЗ §5А.10 дослівно (випливає з §5А.3 п. 9–10, §5А.8) — дописати з підтвердженням людини; `rule_only` (§5А.11 п. 4) — власний експеримент `rule_only`, не експеримент каталогу (T2.13).
   - **Відкрито (лишається в T2.12):** (а) завантажувач історій, що будує розбивку з `PRIMARY_CANDIDATES` (зараз `load_optuna_inputs` рахує за стратегією задачі); (б) запуск на реальних даних ринку — команда і результат для людини; (в) рецепт з ранньою зупинкою: яке число дерев брати для моделі на всіх даних, рішення в `docs/decisions/`; (г) перерахунок трьох звітів G1 з сирих даних (T2.8, T2.9 у нотатках); (д) перевірка `ml-leakage-auditor` після змін у `app/ml/` не виконана.
   - **Передано в T2.13:** ітерація 2 (пряме 3-класове прогнозування); для неї немає навчання `label_type=direct`.
+- **Оновлення (2026-11-05, аудит `docs/audits/2026-11-05-audit-T0.1-T2.13.md`):** відкриті (а) завантажувач з розбивкою за `PRIMARY_CANDIDATES` і (б) запуск на ринкових даних — закрито в T2.14 (`python -m app.ml.research iteration-one`); перехресну оцінку правила входу (0020) замінено оцінкою лише минулими фолдами з прогрівом (T2.15, рішення 0024), тож відкриті (3) «виміряти завищення проти минулих фолдів» і (д) знято. Відкритим лишається (в) рецепт Optuna з ранньою зупинкою і (г) перерахунок трьох звітів G1 з сирих даних.
+
 #### T2.13 · Дослідницький цикл, ітерація 2 (пряме 3-класове прогнозування) `[x]`
 - **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5.1, §5А.3 п. 13, §5А.11 п. 2
 - **Зробити:** після ітерації 1 без проходження G1 (або якщо вона не пройшла) — пряме 3-класове прогнозування (LONG/SHORT/FLAT, `label_direct`) на тих самих фолдах; спроби — в тому ж журналі лінії; G1 для `direct` (без умови «фільтр краще правила», яка стосується лише `meta`). Вирішити рецепт з ранньою зупинкою (T2.12, відкрито).
@@ -441,9 +485,7 @@
 - **Зроблено після рев'ю (2026-11-05):** діагностика перемішаних міток (`direct_probability_gap`, ТЗ §5А.9), багатосимвольний тест і журнал з прогоном кожного символу, тест перестановки міток фолду k для `_fit_cross`.
 - **Відкрито / передано далі (окрема задача, R3):** ~~перенавчання `direct` у `retrain_registered_recipe` і допуск hold-out для `direct` (T2.11, ТЗ §5.4.1)~~ — закрито в T2.11-розширенні (0022); статус, реєстрація й live-інференс `direct` (T5.x); прогін на реальних даних ринку (команда і результат — для людини); діагностика перемішаних міток (параметр є, у журнал не пишеться). Модель задачі в TASKS — Opus 5.5 (`opus`, `high`), реалізовано на Haiku 5.5: рев'ю рекомендовано виконати на Opus 5.5.
 - **Документація:** `app/ml/README.md` (розділ T2.13, таблиця API, G1 для `direct`, `FoldRecord.direct`), `.claude/rules/ml-pipeline.md` → `.cursor/rules/ml-pipeline.mdc` (синхронізовано скриптом), `docs/decisions/0021-direct-three-class-entry-and-g1.md`, `docs/ai/TASKS.md`. Запуск і `.env` не змінювались — `docs/runbooks/getting-started.md` без змін; `AppInfo.md` не змінювався (відхилень від ТЗ немає).
-
-
-### Етап 3. Біржовий шар
+- **Оновлення (2026-11-05, рішення 0024):** G1 для `direct` більше не структурно недосяжний: фолди 0–1 — прогрів правила входу і в умови G1 не входять; правило минулих фолдів тепер і для meta.
 
 #### T2.11-розширення · Допуск, артефакт і перенавчання для `direct` `[x]`
 - **Ризик:** R3 · **Модель:** рекомендовано Fable 5.1 (`fable`, `xhigh`), реалізовано на Haiku 5.5 — рев'ю рекомендовано виконати на Fable/Opus · **ТЗ:** §5.3, §5.4, §5.4.1, §5А.10 · **Рішення:** 0022 (змінює 0021)
@@ -454,6 +496,40 @@
 - **Рішення користувача (2026-11-05):** варіант (a) з 0022 — `direct` не проходить G1 на порогах ТЗ, пороги G1 не змінюються, варіанти (b) і (c) не реалізовані. Причина: фолди 0 і 1 без угод (правило минулих фолдів), `_decide` вимагає угод на кожному фолді. Код допуску, артефакту і перенавчання лишається; `CANDIDATE` для direct не досягається, поки G1 не проходить. Hold-out для direct не відкривався. Коміт — за рішенням користувача.
 - **Відкрито (рішення людини):** G1 для direct на порогах ТЗ не проходить — див. 0022 (рішення (a) прийнято). Direct не стає APPROVED і не торгує до T5.x (`require_model_for_start` і `approve_model` відмовляють). Live-інференс `direct` — T5.x (`predict_probability` і `infer_entry` приймають лише `meta`); успішне відкриття hold-out через `open_holdout_after_gate` для direct на реальних даних не перевірено (потрібен прогін людини, T2.12); схема фіч допуску — наслідується від meta (T2.11, відкрито).
 - **Документація:** `app/ml/README.md` (артефакт direct, допуск, перенавчання, правило минулих фолдів), `.claude/rules/ml-pipeline.md` → `.cursor/rules/ml-pipeline.mdc` (синхронізовано скриптом), `docs/decisions/0022-direct-calibrator-past-folds-and-admission.md`, `docs/decisions/0021-direct-three-class-entry-and-g1.md` (позначка оновлення), `docs/ai/TASKS.md`. `AppInfo.md` не змінювався; `docs/runbooks/getting-started.md` не зачеплено (запуск і `.env` не змінювались).
+- **Оновлення (2026-11-05):** рішення користувача (a) з 0022 замінено рішенням 0024 (прогрів фолдів 0–1, ≥ 4 оцінених фолди) за дорученням власника за аудитом. Борг рев'ю R3 закрито в T2.15 (вердикти — там).
+- **Рев'ю `trading-safety-reviewer` (Opus 5.5 — Fable недоступна, 2026-11-06), частина A:** блокерів немає; інваріанти §5.3/§5.4 виконано (Live лише `APPROVED`, `direct` не торгує в жодному режимі, `git_dirty`, `audit_log`, версії бібліотек, підмінені файли, hold-out у моделі допуску). Виправлено: `_require_tradable` відмовляє `direct` (запас міцності), калібратор хешується й розбирається з одних байтів (TOCTOU), документація про перевірку scikit-learn і для `direct`. Важливе: звіт hold-out для допуску подає викликач — нова задача T2.18 (R3), блокує перше відкриття hold-out.
+
+#### T2.14 · Дослідницький раннер і перший прогін ітерації 1 на ринкових даних `[~]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5А.3 п. 2–10, §5А.11 п. 1 · **Аудит:** C1, C3
+- **Зробити:** закрити T2.12 (а) і (б): завантажувач, що будує розбивку за всіма `PRIMARY_CANDIDATES`, і команду, яка проганяє ітерацію 1 на даних з БД і пише звіт для людини.
+- **Готово, коли:** звіт у `docs/research/`; кожна спроба в журналі лінії; hold-out не відкривався.
+- **Примітки (2026-11-05):** `app/ml/research.py` — `python -m app.ml.research iteration-one [--seed --initial-equity --maintenance-margin-rate --min-equity-usd --max-notional-per-symbol-usd --report]` (advisory lock `RESEARCH_LOCK_ID` = 4: один прогін на БД, бо кожен пише спроби в N; коди 0/1/2/10/11/13/15); `optuna_search.load_research_inputs` (той самий завантажувач, що Optuna; фолди подовжуються за найрідшим кандидатом `PRIMARY_CANDIDATES`); `IterationOneReport.comparison` (порівняння каталогу для звіту). Рахунок бектесту — параметри дослідження (10 000 USDT, MMR 1%, `min_equity_usd` 1000, `max_notional_per_symbol_usd` 50 000), ліміти Risk Engine — за замовчуванням ТЗ §8.2. Тести: `tests/ml/test_research_runner.py`. Документація: `app/ml/README.md`, `docs/runbooks/getting-started.md`.
+- **Після рев'ю (2026-11-06):** коди виходу 12 (lock прогону втрачено до кінця — звіт з попередженням) і 14 (розбивку відхилено: hold-out лінії вже зафіксований попереднім прогоном, а нове вікно даних дає інший — повторний прогін лінії вирішує T2.17); числа порогів у звіті — з `GateThresholds`, прогрів — з `GateDecision.warmup_folds`, рядок про hold-out — з `report.hold_out_opened`.
+
+#### T2.15 · Правило входу для G1 лише з минулих фолдів, прогрів, ≥ 4 оцінених фолди `[x]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `xhigh`) · **ТЗ:** §5.2.4, §5А.8, §5А.10 · **Рішення:** `docs/decisions/0024-past-folds-entry-rule-and-g1-warmup.md` (змінює 0020, 0022) · **Аудит:** C3, C4
+- **Зробити:** один стандарт оцінки правила входу перед G1 для meta і direct — лише фолди `0…k−1` з purge; прогрівні фолди без правила не валять G1, але й не входять у жодну умову; прогрів визнається, лише коли журнал його доводить.
+- **Готово, коли:** правило фолду k не залежить від міток фолдів ≥ k (тест); підроблений прогрів — `G1_ENTRY_RULE` (тест); стара перехресна позначка не приймається (тест); пороги ТЗ не послаблено.
+- **Примітки (2026-11-05):** `decision.py` (`ENTRY_RULE_WARMUP_FOLDS` = 2, `past_fold_pool`; `ENTRY_EVALUATION` видалено), `artifacts.py` (`entry_rule_record` з `fit_on_folds`), `meta_model.py` (`past_fold_entry` замість `cross_fold_entry`, `MetaRun.entry_rules` з `None`), `direct_model.py` (спільні пул і запис), `statistics.py` (`warmup_folds`, `entry_rule_evaluated` — лише `past_folds`, `MIN_EVALUATED_FOLDS` = 4 / `G1_EVALUATED_FOLDS`, `GateDecision.warmup_folds`, запис відкриття `warmup_folds`, `trial_series_from_journal(warmup=)` — відрізок PBO від першого оціненого фолду, суми правил без фільтра лише по оцінених фолдах). Тести оновлено з поясненням: фікстури G1 — з прогрівом; юніт-тести меж G1 на 2–3 фолдах розширено до 4 фолдів (та сама межа медіани 1,15); тест direct тепер чекає `G1_EVALUATED_FOLDS`, а не `G1_MIN_TRADES_FOLD` (структурна неможливість G1 знята рішенням 0024). `tests/ml` — 357 passed. **ТЗ:** §5А.10 доповнено (правило минулих фолдів, прогрів, ≥ 4 оцінених фолди) — рішення 0024.
+- **Рев'ю (2026-11-06):** `ml-leakage-auditor` (Opus 5.5) — вердикт **«чисто»**: витоку з майбутнього і hold-out немає, пороги не послаблені, `tests/ml` 363 passed. Виправлено за зауваженнями: межа purge у `past_fold_pool` — строга (`label_end < test_start`, як `label_overlaps_test`); `fit_on_folds` і `label_end_ms` записуються з самого пулу (`DecisionFit.fit_folds`, `label_end_ms`), а G1 звіряє їх з межею тесту фолду (`_past_only_rule`); тест на 4 фолдах (мітки фолду 3 не змінюють правило фолду 2) для meta і direct; тест, що суми правила без фільтра в G1 не включають прогрів; числа звіту раннера — з констант G1; застарілі фрази README. Відкрито: G1 не перераховує угоди з `entry_rules[k]` (відоме (г) T2.12); спроби Optuna, обрізані у фолдах 0–1, випадають з PBO (консервативний бік).
+
+#### T2.16 · Продуктивність конвеєра `[ ]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5.6, §5А.7 · **Аудит:** I1
+- **Зробити:** заміряти T2.14 на реальних даних; кеш фіч між спробами Optuna (набір колонок залежить лише від розбивки; ключ — набір колонок і хеш даних); векторизувати EMA/ATR/RSI у `compute_features` і `strategy._ema_cross`, зберігши parity (буфер == офлайн, `1e-9`) і look-ahead-тести; результат не змінюється.
+- **Готово, коли:** спроба Optuna на 8 символах не перераховує фічі; parity- і look-ahead-тести зелені; заміри до/після в примітці.
+
+#### T2.17 · Таргет, таймфрейм і символи за результатами T2.14 `[ ]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5А.2, §5А.5, §5А.6, §5А.11 п. 3 · **Аудит:** C5, I6
+- **Зробити:** на звіті T2.14 вирішити: (1) таргет 1h 1/2 ATR (беззбитковість ~45% TP при медіанному ATR BTC 0,49%) чи ширші бар'єри / 4h (38–41%); кожен варіант — спроба в N, тож заздалегідь обмежити перелік 2–3 варіантами; (2) `SOL` у `RESEARCH_SYMBOLS` (лістинг 2021-10-15 відрізає ~1,5 року BTC; обрано заднім числом, §5А.6); (3) виправити ТЗ §5А.2 (36–40%) розрахунком з `CostModel`. Підтримка 4h у валідації — `_split_problem` зараз лише 1h.
+- **Готово, коли:** рішення в `docs/decisions/` з числами T2.14; ТЗ оновлено.
+
+#### T2.18 · Звіт hold-out для допуску рахує сам допуск `[ ]`
+- **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · **ТЗ:** §5.3, §5.4.1, §5А.10 · **Рев'ю:** `trading-safety-reviewer` 2026-11-06 (знахідка A.9)
+- **Зробити:** `record_holdout_admission(report=...)` зараз приймає звіти бектесту на запечатаному вікні від викликача: ніщо не доводить, що їх порахувала модель допуску правилом входу з `params.decision` (`direct_model._holdout_signals` ні до чого не підключена; для meta — аналогічно). Після рішення 0024 G1 для `direct` досяжний, тож шлях hold-out → допуск → `CANDIDATE` став реальним. Допуск має сам будувати сигнали hold-out моделлю допуску і правилом рецепта (`decide_entry`) і сам проганяти `run_backtest` (базові витрати, seed експерименту), а звіти викликача — прибрати або звіряти з власними. Те саме — для правил без фільтра (meta).
+- **Готово, коли:** тест: підмінений звіт викликача не дає допуску; допуск відтворюється з даних і моделі; для meta і direct.
+- **Передано:** блокує перше відкриття hold-out будь-якої лінії (людина не відкриває hold-out, поки T2.18 не `[x]`).
+
+### Етап 3. Біржовий шар
 
 #### T3.1 · Машина станів ордера `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `order-state-machine` · **ТЗ:** §7.1, §7.2
@@ -792,7 +868,7 @@
 
 | Звідки | Питання |
 |---|---|
-| T1.4, T1.7 | Свічки 1h, funding і кеш `instruments` не оновлює жоден процес: `MarketDataSync` і `InstrumentCache` чекають T5.1/T5.2 (funding — разом зі свічками, `docs/decisions/0011-funding-with-candles.md`), а етапу 2 потрібна історія свічок. Без кешу `instruments` сітка прогалин деривативів і ліквідацій іде від `BACKFILL_START_MS`, а не від лістингу. |
+| T1.4, T1.7 | **Для етапу 2 розв'язано (2026-11-05, T1.11, рішення 0023):** історію й кеш ставить `python -m app.jobs.enqueue market-data`, виконує воркер (кеш — лише без ботів режиму). Лишається для T5: Свічки 1h, funding і кеш `instruments` не оновлює жоден процес: `MarketDataSync` і `InstrumentCache` чекають T5.1/T5.2 (funding — разом зі свічками, `docs/decisions/0011-funding-with-candles.md`), а етапу 2 потрібна історія свічок. Без кешу `instruments` сітка прогалин деривативів і ліквідацій іде від `BACKFILL_START_MS`, а не від лістингу. |
 | T1.2 | ТЗ §6.5: частки 50/30/20 дають рівно 600 запитів / 5 с, без запасу; два комп'ютери за одним NAT ділять ліміт IP; retCode `10006` ставить на паузу всю чергу процесу, включно з SL в інших групах. |
 | T0.4 | Роль застосунку — не власник БД: зараз застосунок працює від superuser, тож append-only тригери не захищають від `DISABLE TRIGGER`. |
 | T0.6 | Lock діє в межах однієї БД: другий процес на тому самому комп'ютері з іншою `POSTGRES_DB` (напр. відновлена копія з ботами того самого акаунта) не блокується. |

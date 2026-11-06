@@ -55,6 +55,7 @@ __all__ = [
     "KEEPALIVE_INTERVAL_S",
     "KEEPALIVE_TIMEOUT_S",
     "LOCK_NAMESPACE",
+    "RESEARCH_LOCK_ID",
     "RETRY_INTERVAL_MS",
     "TERMINATE_WAIT_MS",
     "WORKER_APPLICATION_NAME_PREFIX",
@@ -82,6 +83,8 @@ LOCK_NAMESPACE: Final = 0x63746200  # "ctb\0"
 BACKEND_LOCK_ID: Final = 1  # торговий процес
 WORKER_LOCK_ID: Final = 2  # воркер задач: один процес на БД (частка rate limit ТЗ §6.5)
 COLLECTOR_LOCK_ID: Final = 3  # колектор ліквідацій: один процес на БД (частка rate limit ТЗ §6.5)
+# Дослідницький прогін (`python -m app.ml.research`, T2.14): один на БД — кожен пише спроби в журнал лінії (N DSR).
+RESEARCH_LOCK_ID: Final = 4
 # Інший advisory-простір — знімок інструментів (`app/exchange/instruments.py`).
 
 # Серверні keepalive сесії lock: PostgreSQL виявляє мертвого клієнта за idle + interval × count секунд.

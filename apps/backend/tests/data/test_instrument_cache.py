@@ -347,3 +347,35 @@ async def test_stale_snapshot_cannot_overwrite_a_newer_one(migrated_db: URL) -> 
                 await cleanup.execute(delete(ExchangeAccount).where(ExchangeAccount.id == account_id))
             await cleanup.execute(delete(StoredInstrument).where(StoredInstrument.symbol == _RACE_SYMBOL))
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_research_snapshot_writes_rules_but_never_touches_bot_pauses(conn: AsyncConnection) -> None:
+    """Воркер для досліджень (рішення 0023): правила пишуться, паузи ботів — ні, за будь-якого статусу інструмента.
+
+    Інакше знімок поза торговим процесом зняв би `INSTRUMENT_NOT_TRADING` і повернув бота в `RUNNING` до звірки
+    (ТЗ §11.1) — а поставити паузу без звірки й сповіщення теж не його справа.
+    """
+    account = await make_account(conn)
+    paused = await make_bot(conn, account, status="PAUSED", pause_reasons=[INSTRUMENT_NOT_TRADING])
+    running = await make_bot(conn, account, symbol="ETH/USDT:USDT", status="RUNNING")
+    before = (await _bot_state(conn, paused), await _bot_state(conn, running))
+    source = _Source([[_rules(), _rules(symbol="ETH/USDT:USDT", status="Closed")]])
+    cache = _cache(conn, source, symbols=(SYMBOL, "ETH/USDT:USDT"))
+
+    result = await cache.refresh(reason="research", apply_pauses=False)
+
+    assert result.pauses == ()
+    assert result.upserted == 2
+    assert await _stored(conn) == ("Trading", Decimal("0.1"), LAUNCH_MS)
+    assert await _stored(conn, "ETH/USDT:USDT") == ("Closed", Decimal("0.1"), LAUNCH_MS)
+    assert (await _bot_state(conn, paused), await _bot_state(conn, running)) == before
+
+
+@pytest.mark.asyncio
+async def test_only_a_research_snapshot_skips_pauses(conn: AsyncConnection) -> None:
+    cache = _cache(conn, _Source([]))
+    with pytest.raises(ValueError, match="research"):
+        await cache.refresh(reason="research")
+    with pytest.raises(ValueError, match="research"):
+        await cache.refresh(reason="startup", apply_pauses=False)

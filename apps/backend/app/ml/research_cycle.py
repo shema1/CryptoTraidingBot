@@ -30,6 +30,7 @@ from app.ml.models import Experiment
 from app.ml.statistics import G1Preview, GateThresholds, preview_gate_g1
 from app.ml.strategy import (
     PrimarySelection,
+    StrategyComparison,
     StrategySpec,
     SymbolHistory,
     compare_strategies,
@@ -95,6 +96,8 @@ class IterationOneReport:
     next_step: str
     # Цикл hold-out не відкриває. Поле фіксує це в звіті, а не лише в документації.
     hold_out_opened: bool = False
+    # Порівняння каталогу (бейзлайни й кандидати по фолдах) — для звіту людині. Числа ті самі, що в журналі.
+    comparison: StrategyComparison | None = None
 
 
 def iteration_one_verdict(passed: Sequence[bool]) -> str:
@@ -212,6 +215,7 @@ async def run_iteration_one(
         comparison_trials=comparison_trials,
         rules=tuple(rules),
         next_step=iteration_one_verdict(tuple(item.passed for item in rules)),
+        comparison=comparison,
     )
 
 

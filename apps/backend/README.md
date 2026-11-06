@@ -28,11 +28,13 @@ uv run pytest -q -m integration                   # схема БД, мігра�
 uv run python -m app                              # торговий процес: lock + локальний API на 127.0.0.1:API_PORT
 uv run python -m app.jobs.worker                  # воркер задач (backfill, далі Optuna); без торгових ключів і без API_TOKEN
 uv run python -m app.data.collector               # колектор ліквідацій і деривативів; без торгових ключів і без API_TOKEN
+uv run python -m app.jobs.enqueue market-data     # поставити воркеру кеш інструментів і історію ринку (лише БД, без мережі)
+uv run python -m app.ml.research iteration-one    # дослідницький прогін ітерації 1 на даних з БД; пише спроби в журнал, hold-out не відкриває
 uv run alembic upgrade head                       # міграції основної dev-БД (`-x db=test` — тестової)
 uv run alembic revision --autogenerate --rev-id 0002 -m "коротко"   # нова міграція (TimescaleDB/тригери — дописати вручну)
 uv run alembic check                              # моделі й міграції не розходяться
 uv run ruff check . && uv run ruff format --check .
-uv run mypy                                       # app/, tests/, migrations/env.py; strict для api/ exchange/ trading/ risk/ protection/ reconcile/ core/
+uv run mypy                                       # app/, tests/, migrations/env.py; strict для api/ exchange/ trading/ risk/ protection/ reconcile/ core/ і ml/artifacts, ml/decision
 ```
 
 ## Інструменти якості (`pyproject.toml`)
@@ -143,6 +145,21 @@ uv run python -m app.data.collector               # публічний WS лік
   запас 1 с на межах години, довіра до годинника і стрибок, відхилений символ, таймаут підписки, stale, реконект з
   backoff, БД недоступна чи зависла, зупинка за `stop` у тихому потоці й під час з'єднання, прогалини на тестовій БД).
 
+## Команди `python -m app.jobs.enqueue` і `python -m app.ml.research`
+
+Короткі команди без lock процесу; логи — `logs/enqueue/` і `logs/research/` (окремі `process`, бо ротація не для кількох процесів).
+
+- `python -m app.jobs.enqueue market-data` (T1.11, рішення 0023) — лише БД: ставить `refresh_instruments`,
+  `backfill_candles` і `backfill_derivatives` (повтор повертає активні задачі або докачує нове). Коди: 0 — у черзі;
+  1 — необроблений виняток; 2 — аргументи; 11 — БД недоступна; 15 — немає `POSTGRES_PASSWORD`.
+- `python -m app.ml.research iteration-one` (T2.14) — завантаження з БД, нова розбивка, `run_iteration_one`, звіт
+  у `docs/research/`. Advisory lock `RESEARCH_LOCK_ID` = 4 (один прогін на БД). Коди: 0 — прогін завершено
+  (незалежно від вердикту G1); 1; 2; 10 — інший прогін працює; 11 — БД недоступна; 12 — lock прогону втрачено до
+  кінця (звіт з попередженням); 13 — даних бракує; 14 — розбивку відхилено (hold-out лінії вже зафіксований
+  попереднім прогоном, а нове вікно даних дає інший — T2.17); 15 — конфіг.
+- launchd-агенти колектора й воркера на macOS — `scripts/macos/launch_agents.sh install|uninstall|status`
+  (T1.12, ТЗ §12.1.1): `caffeinate -i -s`, перезапуск лише після ненульового коду, без перехоплення lock.
+
 ## Конфігурація
 
 `app/core/config.py` читає `.env` з **кореня репозиторію**. Усі змінні описані в `/.env.example`
@@ -161,7 +178,9 @@ uv run python -m app.data.collector               # публічний WS лік
   `tests/db/test_instance_lock_process.py` (маркери `integration` + `slow`: реальні процеси `python -m app` — другий
   не стартує, `kill -9` звільняє lock, SIGTERM — код 0, зокрема під час очікування зайнятого lock).
 - Integration-тести (`tests/db/`, маркер `integration`) працюють лише з `<POSTGRES_DB>_test`: на старті сесії
-  `downgrade base` → `upgrade head`, кожен тест — у транзакції з rollback; фабрики рядків — `tests/db/factories.py`. Без БД — skip з причиною,
+  `downgrade base` → `upgrade head` під міжпроцесним блокуванням файла `ctb-test-db-<БД>.lock` у тимчасовій теці ОС
+  (другий одночасний прогін pytest чекає, а не зносить схему першому, T0.8), кожен тест — у транзакції з rollback;
+  фабрики рядків — `tests/db/factories.py`. Без БД — skip з причиною,
   `CTB_REQUIRE_DB=1` перетворює skip на помилку. Async-тести — `pytest-asyncio` (strict, `@pytest.mark.asyncio`).
 
 ## Логи і час

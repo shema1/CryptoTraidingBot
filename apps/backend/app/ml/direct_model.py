@@ -7,11 +7,11 @@
 Рішення про сторону — argmax класу з **унікальним** максимумом. `FLAT`, нічия або рядок без валідних
 фіч і ATR — без угоди. Сторона argmax дає один out-of-sample рядок: сира ймовірність — ймовірність
 цього класу, мітка — чи дійшла угода цієї сторони до TP (`trade.meta_label`). Далі той самий шлях, що
-в meta (рішення 0020): `fit_decision` на OOF-рядках інших фолдів і `decide_entry` (§5.5.1) на фолді.
+в meta (рішення 0024): `fit_decision` на OOF-рядках лише минулих фолдів і `decide_entry` (§5.5.1) на фолді.
 Правило входу однакове для обох ітерацій, і одна функція вирішує, чи брати угоду.
 
 Спроба пишеться так само, як meta: `params` з рецептом, таргетом, витратами, правилом входу, схемою
-фіч і перехресною оцінкою; `metrics.folds[].direct.stress` — стрес тих самих сигналів (G1 бере його
+фіч і оцінкою минулими фолдами; `metrics.folds[].direct.stress` — стрес тих самих сигналів (G1 бере його
 з журналу). Hold-out сюди не входить ні мітками, ні фічами, ні угодами. Цикл hold-out не відкриває.
 
 Рецепт — журнальний LightGBM без ранньої зупинки і без Optuna (рішення 0021): першу модель навчаємо
@@ -34,16 +34,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.exchange.types import PositionSide
-from app.ml.artifacts import decision_payload
+from app.ml.artifacts import decision_payload, entry_rule_record
 from app.ml.backtest import BacktestReport, EntrySignal
 from app.ml.decision import (
     ENTER,
     ENTRY_EVALUATION_PAST_FOLDS,
+    ENTRY_RULE_WARMUP_FOLDS,
     CalibrationError,
     DecisionFit,
     OosObservation,
     decide_entry,
     fit_decision,
+    past_fold_pool,
 )
 from app.ml.features import HOUR_MS, FeatureRows, SymbolData, compute_features
 from app.ml.meta_model import (
@@ -106,9 +108,8 @@ _LONG_INDEX: int = _CLASS_INDEX[DirectClass.LONG]
 _SHORT_INDEX: int = _CLASS_INDEX[DirectClass.SHORT]
 # Стрес — той самий, що в meta (`_STRESS_COST`), і G1 вимагає саме його (`stress_cost_factor`).
 _STRESS_COST: Decimal = Decimal(2)
-# Правило минулих фолдів (рішення 0022) калібрується лише на OOF-рядках щонайменше двох фолдів, як у
-# `fit_decision`. Фолди з меншим числом минулих не мають угод. Це свідомий наслідок вимоги 0021, не підбір.
-PAST_FOLDS_MIN: int = 2
+# Прогрів правила минулих фолдів (рішення 0022, 0024) — одна константа з meta і G1 (`decision.py`).
+PAST_FOLDS_MIN: int = ENTRY_RULE_WARMUP_FOLDS
 
 
 class DirectTrainError(RuntimeError):
@@ -325,7 +326,7 @@ def evaluate_direct(run: DirectRun, histories: Sequence[SymbolHistory]) -> Direc
 
 
 def direct_trial_params(run: DirectRun, evaluation: DirectEvaluation) -> dict[str, Any]:
-    """`params` COMPLETE-спроби прямого прогнозу: рецепт, схема фіч, правило входу і перехресна оцінка."""
+    """`params` COMPLETE-спроби прямого прогнозу: рецепт, схема фіч, правило входу і його оцінка минулими фолдами."""
     params = direct_recipe(shuffled_labels=run.shuffled_labels)
     params["feature_schema_hash"] = run.folds[-1].model.schema_hash
     params["feature_schema_hashes"] = [fold.model.schema_hash for fold in run.folds]
@@ -340,21 +341,9 @@ def direct_trial_params(run: DirectRun, evaluation: DirectEvaluation) -> dict[st
     if evaluation.usable:
         params["entry_evaluation"] = ENTRY_EVALUATION_PAST_FOLDS
         params["entry_rules"] = [
-            _entry_rule_record(fold.fold_index, fit) for fold, fit in zip(run.folds, evaluation.rules, strict=True)
+            entry_rule_record(fold.fold_index, fit) for fold, fit in zip(run.folds, evaluation.rules, strict=True)
         ]
     return params
-
-
-def _entry_rule_record(fold_index: int, fit: DecisionFit | None) -> dict[str, Any]:
-    """Правило фолду в журналі з переліком фолдів, на яких воно підігнане (аудит «лише минулі»).
-
-    Фолд без правила має `fit_on_folds = []`: нічого не підігнано, і журнал не має вдавати інакше.
-    """
-    if fit is None:
-        return {"fold_index": fold_index, "method": None, "fit_on_folds": []}
-    fitted_on = list(range(fold_index))
-    record: dict[str, Any] = {"fold_index": fold_index, "fit_on_folds": fitted_on}
-    return {"method": fit.method, **record, **decision_payload(fit.rule, fit.calibrator)}
 
 
 async def run_direct_experiment(
@@ -376,7 +365,7 @@ async def run_direct_experiment(
 
     Пише в сесію викликача і не комітить: викликач комітить і після винятку, інакше `FAILED` зникне
     разом з rollback (як `run_meta_experiment`). Збій навчання — `FAILED` без фолдів, збій після навчання
-    (правило входу, перехресна оцінка) — `FAILED` з `failed_at = "entry_rule"`. Обидва збільшують N лінії.
+    (правило входу, оцінка минулими фолдами) — `FAILED` з `failed_at = "entry_rule"`. Обидва збільшують N лінії.
     """
     target = params if params is not None else TargetParams(horizon_bars=split.horizon_bars)
     cost_model = costs if costs is not None else CostModel()
@@ -673,32 +662,14 @@ def _fit_full(rows: Sequence[OosObservation], run: DirectRun) -> tuple[DecisionF
         return None, str(exc)
 
 
-def _past_pool(
-    rows: Sequence[OosObservation],
-    split: ResearchSplit,
-    fold_index: int,
-) -> tuple[OosObservation, ...]:
-    """Рядки минулих фолдів, чия мітка закінчується до початку тесту фолду `fold_index`.
-
-    Мітка рядка живе до `time_ms + horizon_bars` свічок; рядок останнього минулого фолду, чия мітка
-    заходить у тест фолду k, — майбутнє щодо тестової частини, тож виключається (purge, як у walk-forward).
-    """
-    test_start = split.folds[fold_index].test_start_ms
-    horizon_ms = split.horizon_bars * HOUR_MS
-    return tuple(
-        observation
-        for observation in rows
-        if observation.fold_index < fold_index and observation.time_ms + horizon_ms <= test_start
-    )
-
-
 def _fit_past(
     run: DirectRun,
     rows: Sequence[OosObservation],
 ) -> tuple[tuple[DecisionFit | None, ...], str | None]:
     """Правило фолду k — з OOF-рядків фолдів `< k` (рішення 0022).
 
-    Фолди `< PAST_FOLDS_MIN` минулих для калібрування не мають — їх правило `None`, угод немає (фолд 0 — завжди).
+    Фолди `< PAST_FOLDS_MIN` (`ENTRY_RULE_WARMUP_FOLDS`) — прогрів: правило `None`, угод немає; G1 рахує умови
+    фолдів без них (рішення 0024).
     Пізніші фолди не входять ні в пул, ні в калібратор правила k. Помилка калібрування фолду k, для якого
     минулих достатньо, — `cross_error`: без угод, G1 відмовляє (`G1_ENTRY_RULE`).
     """
@@ -708,7 +679,7 @@ def _fit_past(
             if fold.fold_index < PAST_FOLDS_MIN:
                 rules.append(None)
                 continue
-            pool = _past_pool(rows, run.split, fold.fold_index)
+            pool = past_fold_pool(rows, run.split, fold.fold_index)
             rules.append(fit_decision(pool, run.split, costs=run.common.costs, params=run.common.params))
     except CalibrationError as exc:
         return (), f"правило минулих фолдів: {exc}"

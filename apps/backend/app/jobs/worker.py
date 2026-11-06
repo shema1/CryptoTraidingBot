@@ -35,8 +35,8 @@ from decimal import Decimal
 from typing import Any, Final, cast
 
 import asyncpg
-from sqlalchemy import text, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.clock import now_ms
@@ -53,6 +53,7 @@ from app.core.instance_lock import (
 )
 from app.core.logging import configure_logging, get_logger, shutdown_logging
 from app.data.backfill import (
+    EXCHANGE,
     JOB_KIND_BACKFILL,
     BackfillIncomplete,
     MarketDataSource,
@@ -66,8 +67,10 @@ from app.data.derivatives import (
     run_derivatives_job,
 )
 from app.exchange.bybit import BybitAdapter, ExchangeMode
+from app.exchange.instruments import RESEARCH_INSTRUMENTS_MODE, InstrumentCache, InstrumentSource
 from app.exchange.rate_limit import ProcessRole, RateLimiter
 from app.jobs.models import Job
+from app.trading.models import Bot
 
 _LOG = get_logger("app.jobs.worker")
 
@@ -206,6 +209,83 @@ def open_worker_market(settings: Settings) -> WorkerMarket:
     return WorkerMarket(limiter=limiter, adapter=adapter)
 
 
+# Кеш `instruments` для досліджень (T1.11, рішення 0023). Режим — той самий, що читає завантажувач ML
+# (`optuna_search._INSTRUMENT_MODE`): публічний mainnet. Пріоритет — раніше за свічки (200), тож сітка прогалин
+# свічок наступного проходу вже починається від лістингу.
+JOB_KIND_INSTRUMENTS: Final = "refresh_instruments"
+INSTRUMENTS_DEDUP_KEY: Final = "refresh_instruments"
+INSTRUMENTS_JOB_PRIORITY: Final = 190
+INSTRUMENTS_MODE: Final = RESEARCH_INSTRUMENTS_MODE
+
+
+def instruments_job_params(symbols: Sequence[str]) -> dict[str, Any]:
+    """Параметри `refresh_instruments`: символи, свіжість яких стежить кеш (знімок — уся категорія)."""
+    return {"symbols": list(symbols)}
+
+
+def parse_instruments_job_params(params: Mapping[str, Any]) -> tuple[str, ...]:
+    symbols = params.get("symbols")
+    if not isinstance(symbols, list) or not symbols or any(type(item) is not str for item in symbols):
+        raise ValueError("refresh_instruments: symbols має бути непорожнім списком рядків")
+    return tuple(symbols)
+
+
+async def enqueue_instruments_job(session: AsyncSession, *, symbols: Sequence[str]) -> uuid.UUID:
+    """Поставити `refresh_instruments`, якщо активної такої ще немає. Повертає id наявної або нової."""
+    parse_instruments_job_params(instruments_job_params(symbols))
+    active = await session.scalar(
+        select(Job.id).where(Job.dedup_key == INSTRUMENTS_DEDUP_KEY, Job.status.in_(("QUEUED", "RUNNING")))
+    )
+    if active is not None:
+        return uuid.UUID(int=active.int)
+    job = Job(
+        kind=JOB_KIND_INSTRUMENTS,
+        priority=INSTRUMENTS_JOB_PRIORITY,
+        params=instruments_job_params(symbols),
+        dedup_key=INSTRUMENTS_DEDUP_KEY,
+        progress_message=None,
+        result=None,
+        error=None,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(job)
+            await session.flush()
+    except IntegrityError:
+        found = await session.scalar(
+            select(Job.id).where(Job.dedup_key == INSTRUMENTS_DEDUP_KEY, Job.status.in_(("QUEUED", "RUNNING")))
+        )
+        if found is None:
+            raise
+        return uuid.UUID(int=found.int)
+    return uuid.UUID(int=job.id.int)
+
+
+async def handle_instruments(ctx: JobContext) -> dict[str, Any]:
+    """`refresh_instruments`: повний знімок правил інструментів режиму `demo` для досліджень (рішення 0023).
+
+    Паузи ботів воркер не зводить ніколи: `refresh(reason="research", apply_pauses=False)` пише лише правила, тож
+    зняти `INSTRUMENT_NOT_TRADING` і повернути бота в `RUNNING` до звірки (ТЗ §11.1) він не може за жодної гонки.
+    Окремо, поки боти режиму є, задача кеш не чіпає взагалі (`skipped`): тоді кеш і паузи разом оновлює торговий
+    процес (T5), і свіжий знімок воркера не відкладав би його власний `refresh_if_due`.
+    """
+    symbols = parse_instruments_job_params(ctx.params)
+    async with ctx.sessions() as session:
+        bots = await session.scalar(select(func.count()).select_from(Bot).where(Bot.mode == INSTRUMENTS_MODE))
+    if bots:
+        _LOG.warning("instruments_refresh_skipped", reason="bots_exist", mode=INSTRUMENTS_MODE, bots=bots)
+        return {"skipped": "bots_exist", "bots": int(bots)}
+    cache = InstrumentCache(
+        ctx.sessions,
+        _as_instruments(ctx.source),
+        exchange=EXCHANGE,
+        mode=INSTRUMENTS_MODE,
+        symbols=symbols,
+    )
+    result = await cache.refresh(reason="research", apply_pauses=False)
+    return {"upserted": result.upserted, "absent": sorted(result.absent)}
+
+
 async def handle_backfill(ctx: JobContext) -> dict[str, int]:
     """`backfill_candles`. `BackfillIncomplete` навмисно летить далі: цикл запише `FAILED`."""
     stats = await run_backfill_job(ctx.sessions, ctx.source, ctx.params)
@@ -272,6 +352,7 @@ def default_handlers() -> dict[str, JobHandler]:
     from app.ml.optuna_search import JOB_KIND_OPTUNA
 
     return {
+        JOB_KIND_INSTRUMENTS: handle_instruments,
         JOB_KIND_BACKFILL: handle_backfill,
         JOB_KIND_DERIVATIVES: handle_derivatives,
         JOB_KIND_OPTUNA: handle_optuna,
@@ -301,6 +382,13 @@ _DERIVATIVE_METHODS: Final = (
     "fetch_index_price_candles",
     "fetch_long_short_ratio",
 )
+
+
+def _as_instruments(source: object) -> InstrumentSource:
+    """Джерело воркера, що вміє `fetch_instruments` (`BybitAdapter`). Інше — помилка обробника, не тихий пропуск."""
+    if not callable(getattr(source, "fetch_instruments", None)):
+        raise TypeError("джерело воркера не вміє читати інструменти")
+    return cast(InstrumentSource, source)
 
 
 def _as_derivatives(source: object) -> DerivativesSource:

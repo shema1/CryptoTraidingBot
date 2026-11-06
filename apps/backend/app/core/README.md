@@ -37,7 +37,7 @@
 | `CLOCK_DRIFT_LIMIT_MS` | `clock.py` | 1000 мс — допуск розбіжності з часом біржі (ТЗ §4.3); одне джерело для контролю часу (`app/data/time_sync.py`), запасу детектора прогалин, допуску `signals` і нижньої межі `RECV_WINDOW_MS` |
 | `Clock`, `SystemClock`, `FakeClock` | `clock.py` | протокол годинника, реальний і фейковий; `FakeClock.advance(ms)` рухає обидва, `jump_wall(delta_ms)` / `set_now(ms)` — лише системний (імітація стрибка) |
 | `get_clock()`, `use_clock(clock)` | `clock.py` | поточний годинник і context manager підміни (відновлює попередній і при винятку) |
-| `configure_logging(settings, *, process, extra_secrets=())` | `logging.py` | налаштувати логування процесу (`backend` / `worker` / `collector`); ідемпотентно |
+| `configure_logging(settings, *, process, extra_secrets=())` | `logging.py` | налаштувати логування процесу (`backend` / `worker` / `collector` / `enqueue` / `research`); ідемпотентно |
 | `shutdown_logging()` | `logging.py` | зняти й закрити хендлери (завершення процесу, тести) |
 | `get_logger(name=APP, **initial)` | `logging.py` | structlog-логер; канали `APP`, `TRADING`, `ORDERS` або `app.<модуль>` |
 | `bind_context(**values)`, `clear_context()` | `logging.py` | контекст запису (`bot_id`, `symbol`, `client_order_id`, `signal_id`) через contextvars |
@@ -47,7 +47,7 @@
 | `InstanceLockHeld`, `InstanceLockUnavailable`, `InstanceLockLost`, `TakeoverRefused` | `instance_lock.py` | lock тримає інша сесія (з `holders`); БД недоступна (`last_error`); lock втрачено (`reason`); перехоплення не виконано (`not_confirmed` / `holder_changed` / `audit_failed`) |
 | `LockHolder` | `instance_lock.py` | власник lock з `pg_locks` + `pg_stat_activity`: pid сесії, pid процесу ОС з `application_name`, адреса, користувач, стан, час у мс |
 | `connect_lock_session(url, *, server_settings)`, `lock_server_settings(pid=None, *, prefix=)`, `application_name(pid, *, prefix=)` | `instance_lock.py` | окреме raw-з'єднання asyncpg (поза пулом) і параметри сесії lock (`application_name` `ctb-backend pid=N`, `ctb-worker pid=N` або `ctb-collector pid=N`; інший префікс — `ValueError`; серверні keepalive) |
-| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `WORKER_LOCK_ID`, `COLLECTOR_LOCK_ID`, `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
+| `LOCK_NAMESPACE`, `BACKEND_LOCK_ID`, `WORKER_LOCK_ID`, `COLLECTOR_LOCK_ID`, `RESEARCH_LOCK_ID` (4, дослідницький прогін — `pg_try_advisory_lock` у `app/ml/research.py`), `KEEPALIVE_*`, `RETRY_INTERVAL_MS`, `HEARTBEAT_*`, `TERMINATE_WAIT_MS`, `BODY_STOP_TIMEOUT_MS` | `instance_lock.py` | ключ lock і таймінги (розділ «Single-instance lock» нижче) |
 
 Поля `Settings` (межі й defaults визначені в `config.py`):
 

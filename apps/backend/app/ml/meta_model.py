@@ -35,12 +35,14 @@ from app.exchange.types import PositionSide
 from app.ml.backtest import BacktestReport, EntrySignal
 from app.ml.decision import (
     ENTER,
-    ENTRY_EVALUATION,
+    ENTRY_EVALUATION_PAST_FOLDS,
+    ENTRY_RULE_WARMUP_FOLDS,
     CalibrationError,
     DecisionFit,
     OosObservation,
     decide_entry,
     fit_decision,
+    past_fold_pool,
 )
 from app.ml.features import (
     HOUR_MS,
@@ -256,11 +258,12 @@ class MetaRun:
     folds: tuple[MetaFold, ...]
     # `None` — `lgbm_journal_params`. Інакше перевірена точка пошуку, не сирий словник викликача.
     lgbm: Mapping[str, Any] | None = None
-    # Налаштування бектесту навчання: перехресна оцінка правила входу перераховує фолди з тими самими.
+    # Налаштування бектесту навчання: оцінка правила входу минулими фолдами перераховує фолди з тими самими.
     backtest: _Backtest | None = None
-    # Правило входу кожного фолду, підігнане на інших фолдах (`cross_fold_entry`, рішення 0020).
-    # Порожньо — угоди фолдів відібрані `keep(min_probability)`, і G1 таку спробу meta не пропустить.
-    entry_rules: tuple[DecisionFit, ...] = ()
+    # Правило входу кожного фолду, підігнане лише на минулих фолдах (`past_fold_entry`, рішення 0024);
+    # `None` — прогрівний фолд без правила й без угод. Порожньо — угоди фолдів відібрані
+    # `keep(min_probability)`, і G1 таку спробу meta не пропустить.
+    entry_rules: tuple[DecisionFit | None, ...] = ()
 
     @property
     def filtered_total_net(self) -> Decimal:
@@ -315,13 +318,12 @@ class MetaRun:
         }
         if self.entry_rules:
             # Імпорт усередині: `artifacts` імпортує цей модуль. sha256 — той самий канонічний текст калібратора,
-            # що в `params.decision`: правило кожного фолду відтворюване з журналу (рішення 0020).
-            from app.ml.artifacts import decision_payload
+            # що в `params.decision`; `fit_on_folds` — фолди, на яких підігнано правило (рішення 0024).
+            from app.ml.artifacts import entry_rule_record
 
-            params["entry_evaluation"] = ENTRY_EVALUATION
+            params["entry_evaluation"] = ENTRY_EVALUATION_PAST_FOLDS
             params["entry_rules"] = [
-                {"fold_index": fold.fold_index, "method": fit.method, **decision_payload(fit.rule, fit.calibrator)}
-                for fold, fit in zip(self.folds, self.entry_rules, strict=True)
+                entry_rule_record(fold.fold_index, fit) for fold, fit in zip(self.folds, self.entry_rules, strict=True)
             ]
         return params
 
@@ -735,7 +737,7 @@ async def run_meta_experiment(
 class RecipeTrial:
     """Що пише COMPLETE-спроба meta: прогін, `params` і правило входу рецепта (рішення 0019, 0020).
 
-    `run` — фолди, оцінені перехресно правилом входу (`cross_fold_entry`), або прогін `keep`, якщо
+    `run` — фолди, оцінені правилом входу лише минулими фолдами (`past_fold_entry`), або прогін `keep`, якщо
     правило не підганяється: тоді `decision` — `None`, причина в `decision_error`, і G1 спробу не пропустить.
     """
 
@@ -757,8 +759,9 @@ def recipe_trial(
 
     1. `fit_entry_rule` — калібратор і поріг на OOF-рядках усіх фолдів: це правило йде в `params.decision`,
        модель допуску і live.
-    2. `cross_fold_entry` — те саме правило, але для фолду k підігнане на інших фолдах, перераховує угоди
-       кожного фолду. Їх і читає G1: поріг, обраний на угодах фолду, завищив би його результат.
+    2. `past_fold_entry` — те саме правило, але для фолду k підігнане лише на фолдах `< k`, перераховує угоди
+       кожного фолду (фолди 0 і 1 — прогрів без угод). Їх і читає G1: поріг, обраний на угодах цього або
+       пізнішого фолду, завищив би результат (рішення 0024).
     Не підганяється (немає розмічених рядків, менше трьох фолдів, немає ATR) — `decision_error` і прогін
     `keep` без позначки `entry_evaluation`: G1 відмовить (`G1_ENTRY_RULE`), допуск теж. Будь-який інший
     виняток — збій після навчання: викликач пише спробу `FAILED` (`entry_rule_failure`) і прокидає його.
@@ -775,9 +778,9 @@ def recipe_trial(
     if fit is None:
         return _without_rule(run, error)
     try:
-        evaluated = cross_fold_entry(run, histories)
+        evaluated = past_fold_entry(run, histories)
     except (CalibrationError, NoAtr) as exc:
-        return _without_rule(run, f"перехресна оцінка правила входу: {exc}")
+        return _without_rule(run, f"правило входу минулих фолдів: {exc}")
     trial_params = evaluated.trial_params()
     trial_params.update(g1_recipe_fields(evaluated, fit))
     return RecipeTrial(run=evaluated, params=trial_params, decision=fit, decision_error=None)
@@ -791,33 +794,42 @@ def _without_rule(run: MetaRun, error: str | None) -> RecipeTrial:
     return RecipeTrial(run=run, params=trial_params, decision=None, decision_error=error)
 
 
-def cross_fold_entry(run: MetaRun, histories: Sequence[SymbolHistory]) -> MetaRun:
-    """Угоди кожного фолду за правилом входу рецепта, підігнаним без цього фолду (рішення 0020).
+def past_fold_entry(run: MetaRun, histories: Sequence[SymbolHistory]) -> MetaRun:
+    """Угоди кожного фолду за правилом входу рецепта, підігнаним лише на минулих фолдах (рішення 0024).
 
-    Для фолду k калібратор і поріг — `fit_decision` на OOF-рядках інших фолдів; кандидат фолду k
-    береться, якщо `decide_entry` каже `ENTER` (та сама функція, що в live). Мітки фолду k у правило
-    не входять. Далі — ті самі звіти, що в `train_meta`: відфільтровані угоди кожного символу і стрес
-    на прийнятих сигналах; обидва правила без фільтра від рішення не залежать і лишаються як були.
-    Калібрування на решті потребує щонайменше двох фолдів, тож фолдів — щонайменше три
-    (інакше `CalibrationError`). Бектест — з налаштувань навчання (`MetaRun.backtest`).
+    Для фолду k калібратор і поріг — `fit_decision` на OOF-рядках фолдів `< k` (`past_fold_pool`, з purge
+    біля межі тесту); кандидат фолду k береться, якщо `decide_entry` каже `ENTER` (та сама функція, що в
+    live). Ні мітки фолду k, ні будь-що з пізніших фолдів у правило k не входять. Фолди
+    `< ENTRY_RULE_WARMUP_FOLDS` — прогрів калібрування: правила немає (`None`), угод теж; G1 рахує умови
+    фолдів без них. Далі — ті самі звіти, що в `train_meta`: відфільтровані угоди кожного символу і стрес на
+    прийнятих сигналах; обидва правила без фільтра від рішення не залежать і лишаються як були.
+    Фолдів — щонайменше `ENTRY_RULE_WARMUP_FOLDS + 1` (інакше `CalibrationError`). Бектест — з налаштувань
+    навчання (`MetaRun.backtest`).
     """
     common = run.backtest
     if common is None:
-        raise ValueError("прогін без налаштувань бектесту: перехресну оцінку рахує лише прогін train_meta")
+        raise ValueError("прогін без налаштувань бектесту: оцінку правила входу рахує лише прогін train_meta")
     if run.entry_rules:
         raise ValueError("прогін уже оцінено правилом входу")
     books = _books(histories, run.trading_symbol)
     trading = _history(books, run.trading_symbol)
     by_index = {fold.index: fold for fold in run.split.folds}
     rows = decision_observations(run, histories)
+    if len(run.folds) <= ENTRY_RULE_WARMUP_FOLDS:
+        raise CalibrationError(
+            f"оцінка минулих фолдів потребує щонайменше {ENTRY_RULE_WARMUP_FOLDS + 1} фолди walk-forward "
+            f"({ENTRY_RULE_WARMUP_FOLDS} перші — прогрів калібрування)"
+        )
     evaluated: list[MetaFold] = []
-    rules: list[DecisionFit] = []
+    rules: list[DecisionFit | None] = []
     for fold in run.folds:
-        pool = tuple(row for row in rows if row.fold_index != fold.fold_index)
-        fit = fit_decision(pool, run.split, costs=common.costs, params=common.params)
+        fit: DecisionFit | None = None
+        if fold.fold_index >= ENTRY_RULE_WARMUP_FOLDS:
+            pool = past_fold_pool(rows, run.split, fold.fold_index)
+            fit = fit_decision(pool, run.split, costs=common.costs, params=common.params)
         own = {(row.symbol, row.time_ms): row for row in rows if row.fold_index == fold.fold_index}
         scored = tuple(
-            row.model_copy(update={"taken": _enters(own[(row.symbol, row.time_ms)], fit, common)})
+            row.model_copy(update={"taken": fit is not None and _enters(own[(row.symbol, row.time_ms)], fit, common)})
             for row in fold.scored
         )
         window = by_index[fold.fold_index]

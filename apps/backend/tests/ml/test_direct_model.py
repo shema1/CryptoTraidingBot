@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -169,6 +169,13 @@ def _three_folds(
     chosen = patterns if patterns is not None else [_PATTERNS[step % len(_PATTERNS)] for step in range(_SETUPS)]
     books, split = _build(6400, chosen, noise=noise)
     assert len(split.folds) == 3
+    return books, split
+
+
+def _four_folds() -> tuple[tuple[SymbolHistory, ...], ResearchSplit]:
+    """Чотири фолди: два прогрівні й два оцінені — правило фолду 2 має пізніший фолд, який не сміє бачити."""
+    books, split = _build(6700, [_PATTERNS[step % len(_PATTERNS)] for step in range(_SETUPS)])
+    assert len(split.folds) == 4
     return books, split
 
 
@@ -439,6 +446,7 @@ def test_trial_params_carry_the_entry_rule_the_schema_and_no_meta_markers() -> N
 
 
 def test_g1_for_direct_has_no_filter_condition_and_meta_still_needs_one() -> None:
+    # Чотири фолди — мінімум оцінених фолдів G1 (рішення 0024).
     folds = tuple(
         FoldOutcome(
             n_trades=40,
@@ -448,7 +456,7 @@ def test_g1_for_direct_has_no_filter_condition_and_meta_still_needs_one() -> Non
             below_min_trades=False,
             cost_factor=Decimal(1),
         )
-        for _ in range(3)
+        for _ in range(4)
     )
     stress = tuple(item.model_copy(update={"cost_factor": Decimal(2), "total_net_usd": Decimal(10)}) for item in folds)
     direct = evaluate_gate(
@@ -760,9 +768,16 @@ def test_two_symbols_share_the_folds_and_the_journal_keeps_both_reports() -> Non
         assert record.direct.stress.symbol == BTC
 
 
-def test_flipping_the_labels_of_a_fold_never_changes_a_rule_fit_before_it() -> None:
-    """Рішення 0022: правило фолду k бачить лише фолди `< k`. Мітки фолду j ≥ k його не чіпають; j < k — можуть."""
-    books, split = _three_folds()
+@pytest.mark.parametrize("setup", [_three_folds, _four_folds], ids=["3-folds", "4-folds"])
+def test_flipping_the_labels_of_a_fold_never_changes_a_rule_fit_before_it(
+    setup: Callable[[], tuple[tuple[SymbolHistory, ...], ResearchSplit]],
+) -> None:
+    """Рішення 0022, 0024: правило фолду k бачить лише фолди `< k`. Мітки фолду j ≥ k його не чіпають; j < k — можуть.
+
+    На трьох фолдах оцінюється лише останній, тож відмінність від старої перехресної оцінки видно лише з чотирма:
+    мітки фолду 3 не сміють змінити правило фолду 2.
+    """
+    books, split = setup()
     base_run = _scripted_run(books, split)
     base = evaluate_direct(base_run, books)
     assert base.usable

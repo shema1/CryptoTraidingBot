@@ -31,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ml.backtest import BacktestReport, BacktestTrade
-from app.ml.decision import ENTRY_EVALUATION, ENTRY_EVALUATION_PAST_FOLDS
+from app.ml.decision import ENTRY_EVALUATION_PAST_FOLDS, ENTRY_RULE_WARMUP_FOLDS
 from app.ml.features import HOUR_MS
 from app.ml.models import LABEL_TYPES, Experiment, ExperimentTrial, ModelArtifact, TrialInvalidation
 from app.ml.strategy import is_reference_baseline
@@ -54,6 +54,9 @@ PBO_MAX: Decimal = Decimal("0.5")
 MEDIAN_PF_MIN: Decimal = Decimal("1.15")
 PROFITABLE_FOLD_SHARE: Decimal = Decimal("0.70")
 MIN_OOS_TRADES: int = 100
+# Скільки фолдів walk-forward G1 має оцінити після прогріву правила входу (рішення 0024): рік тестових
+# відрізків по 3 міс. Результат на 1–3 фолдах — везіння, а не закономірність (ТЗ §5А.9). Суворіша умова, не послаблення.
+MIN_EVALUATED_FOLDS: int = 4
 # Розкид Sharpe між спробами для DSR — з рядів, де угод не менше. Константа, а не `min_oos_trades` G1:
 # суворіший поріг G1 лишав би менше рядів, менший розкид і вищий DSR. Ряд із 2–3 угод дає Sharpe
 # у десятки і назавжди роздув би розкид лінії; короткі ряди лишаються в N.
@@ -82,8 +85,11 @@ G1_FOLD_SHARE = "G1_FOLD_SHARE"
 G1_COST_FACTOR = "G1_COST_FACTOR"
 G1_STRESS = "G1_STRESS"
 G1_FILTER = "G1_FILTER"
-# Угоди спроби meta відібрані не правилом входу рецепта, оціненим перехресно (рішення 0020).
+# Угоди спроби meta/direct відібрані не правилом входу рецепта, оціненим лише минулими фолдами, або журнал не
+# доводить прогрів (рішення 0020, 0024).
 G1_ENTRY_RULE = "G1_ENTRY_RULE"
+# Оцінених фолдів (без прогріву) менше за `min_evaluated_folds` (рішення 0024).
+G1_EVALUATED_FOLDS = "G1_EVALUATED_FOLDS"
 G1_DSR = "G1_DSR"
 G1_PBO = "G1_PBO"
 
@@ -238,6 +244,7 @@ class GateThresholds(FrozenModel):
     profitable_fold_share: Decimal = PROFITABLE_FOLD_SHARE
     min_trades_per_fold: int = MIN_TRADES_PER_FOLD
     min_oos_trades: int = MIN_OOS_TRADES
+    min_evaluated_folds: int = MIN_EVALUATED_FOLDS
     stress_median_pf_min: Decimal = STRESS_MEDIAN_PF_MIN
     stress_cost_factor: Decimal = STRESS_COST_FACTOR
     dsr_min: Decimal = DSR_MIN
@@ -251,6 +258,8 @@ class GateThresholds(FrozenModel):
             raise ValueError("частка прибуткових фолдів більша за 1")
         if self.min_trades_per_fold < 1 or self.min_oos_trades < 1:
             raise ValueError("мінімум угод має бути ціле ≥ 1")
+        if self.min_evaluated_folds < 1:
+            raise ValueError("мінімум оцінених фолдів має бути ціле ≥ 1")
         require_decimal("stress_median_pf_min", self.stress_median_pf_min, positive=True)
         require_decimal("stress_cost_factor", self.stress_cost_factor, positive=True)
         if self.stress_cost_factor < STRESS_COST_FACTOR:
@@ -274,12 +283,14 @@ class GateDecision(FrozenModel):
     median_pf: Decimal | None
     median_pf_unbounded: bool
     profitable_fold_share: Decimal | None
+    # Скільки перших фолдів G1 пропустив як прогрів правила входу (рішення 0024). Умови фолдів — без них.
+    warmup_folds: int = 0
 
     @model_validator(mode="after")
     def _match(self) -> GateDecision:
         if self.passed != (not self.reasons):
             raise ValueError("passed не збігається з reasons")
-        if self.n_trials < 1 or self.n_trades < 0:
+        if self.n_trials < 1 or self.n_trades < 0 or self.warmup_folds < 0:
             raise ValueError("лічильник Gate G1")
         for name, value in (("dsr", self.dsr), ("pbo", self.pbo)):
             if value is not None:
@@ -410,12 +421,36 @@ def parse_oos_results(raw: Sequence[object]) -> tuple[Decimal, ...]:
     return tuple(parsed)
 
 
+def _past_only_rule(rule: Mapping[str, Any], fold: Mapping[str, Any], index: int) -> bool:
+    """Правило фолду `index` підігнане лише на минулих фолдах і з мітками, що закінчились до його тесту."""
+    if not isinstance(rule.get("method"), str):
+        return False
+    fitted_on = rule.get("fit_on_folds")
+    if not isinstance(fitted_on, list) or not fitted_on:
+        return False
+    if any(type(item) is not int or not 0 <= item < index for item in fitted_on):
+        return False
+    if fitted_on != sorted(set(fitted_on)):
+        return False
+    label_end = rule.get("label_end_ms")
+    test_start = fold.get("test_start_ms")
+    return type(label_end) is int and type(test_start) is int and label_end < test_start
+
+
 def trial_series_from_journal(
     oos_results: Sequence[object],
     oos_entry_ms: Sequence[object],
     metrics: Mapping[str, Any],
+    *,
+    warmup: int = 0,
 ) -> TrialSeries:
-    """Ряд спроби з журналу. Рядок без часу кожної угоди (до міграції 0005) — відмова, а не пропуск."""
+    """Ряд спроби з журналу. Рядок без часу кожної угоди (до міграції 0005) — відмова, а не пропуск.
+
+    `warmup` — скільки перших фолдів прогріву правила входу (`warmup_folds`): відрізок спроби в PBO
+    починається з першого оціненого фолду, а доби прогріву — пропуски, а не нулі (рішення 0024).
+    """
+    if type(warmup) is not int or isinstance(warmup, bool) or warmup < 0:
+        raise ValueError("warmup має бути невід'ємний int")
     returns = parse_oos_results(oos_results)
     if not isinstance(oos_entry_ms, Sequence) or isinstance(oos_entry_ms, (str, bytes)):
         raise TypeError("oos_entry_ms має бути послідовністю")
@@ -436,7 +471,9 @@ def trial_series_from_journal(
             covered_from_ms=None,
             covered_to_ms=None,
         )
-    first, last = folds[0], folds[-1]
+    if warmup >= len(folds):
+        raise ValueError("прогрів поглинув усі фолди спроби")
+    first, last = folds[warmup], folds[-1]
     if not isinstance(first, Mapping) or not isinstance(last, Mapping):
         raise ValueError("фолд журналу не об'єкт")
     start = first.get("test_start_ms")
@@ -735,6 +772,7 @@ def loosened_thresholds(thresholds: GateThresholds) -> tuple[str, ...]:
             "profitable_fold_share",
             "min_trades_per_fold",
             "min_oos_trades",
+            "min_evaluated_folds",
             "stress_median_pf_min",
             "dsr_min",
         )
@@ -795,14 +833,53 @@ def evaluate_gate(
 
 
 def entry_rule_evaluated(params: Any) -> bool:
-    """Спроба оцінена правилом входу рецепта і несе саме правило: meta — перехресно (рішення 0020),
-    direct — лише минулими фолдами (рішення 0022)."""
+    """Спроба оцінена правилом входу рецепта лише минулими фолдами і несе саме правило (рішення 0024).
+
+    Однаково для `meta` і `direct`. Стара перехресна позначка `decision_cross_fold` (рішення 0020: калібрування
+    і на пізніших фолдах) не приймається: її оцінку завищували канали з майбутнього.
+    """
     if not isinstance(params, Mapping) or not isinstance(params.get("decision"), Mapping):
         return False
-    marker = params.get("entry_evaluation")
-    if params.get("stage") == DIRECT_STAGE:
-        return marker == ENTRY_EVALUATION_PAST_FOLDS
-    return marker == ENTRY_EVALUATION
+    return params.get("entry_evaluation") == ENTRY_EVALUATION_PAST_FOLDS
+
+
+def warmup_folds(params: Any, metrics: Any) -> int | None:
+    """Скільки перших фолдів спроби — прогрів правила входу, якщо журнал це доводить (рішення 0024). Інакше `None`.
+
+    Доведено, коли: позначка `past_folds`; `entry_rules` — по запису на кожен фолд журналу, по порядку;
+    фолди `< ENTRY_RULE_WARMUP_FOLDS` без правила (`method` = `None`, `fit_on_folds` = `[]`) і без жодного
+    сигналу й угоди торгового символу; правило кожного наступного фолду k підігнане лише на фолдах `< k`
+    (`fit_on_folds` — фолди самого пулу, непорожньо) і з кінцем міток пулу (`label_end_ms`) строго до початку тесту
+    фолду k у журналі; оцінених фолдів хоча б один. Так спроба не може оголосити прогрівом незручні фолди чи фолд з
+    угодами, а правило — бачити тест, який оцінює.
+    """
+    if not isinstance(params, Mapping) or params.get("entry_evaluation") != ENTRY_EVALUATION_PAST_FOLDS:
+        return None
+    rules = params.get("entry_rules")
+    folds = metrics.get("folds") if isinstance(metrics, Mapping) else None
+    if not isinstance(rules, list) or not isinstance(folds, list) or len(rules) != len(folds):
+        return None
+    if len(folds) <= ENTRY_RULE_WARMUP_FOLDS:
+        return None
+    for index, (rule, fold) in enumerate(zip(rules, folds, strict=True)):
+        if not isinstance(rule, Mapping) or not isinstance(fold, Mapping):
+            return None
+        position = rule.get("fold_index")
+        if type(position) is not int or position != index:
+            return None
+        fitted_on = rule.get("fit_on_folds")
+        if index < ENTRY_RULE_WARMUP_FOLDS:
+            if rule.get("method") is not None or fitted_on != []:
+                return None
+            trading = fold.get("trading")
+            numbers = trading.get("metrics") if isinstance(trading, Mapping) else None
+            if not isinstance(trading, Mapping) or not isinstance(numbers, Mapping):
+                return None
+            if trading.get("n_signals") != 0 or numbers.get("n_trades") != 0:
+                return None
+        elif not _past_only_rule(rule, fold, index):
+            return None
+    return ENTRY_RULE_WARMUP_FOLDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -862,7 +939,15 @@ async def _evaluate_g1(
     if type(split_min) is not int or isinstance(split_min, bool) or split_min < 1:
         raise SplitLeakError("у розбивці немає min_trades_per_fold")
     effective = limits.model_copy(update={"min_trades_per_fold": max(limits.min_trades_per_fold, split_min)})
-    series = [trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics) for row in rows]
+    # Прогрів правила входу (рішення 0024): доведений журналом — доби прогріву в PBO пропуски, а фолди не входять
+    # в умови G1. Не доведений — для meta/direct відмова `G1_ENTRY_RULE` нижче, а відрізок — від першого фолду.
+    warmups = {row.id: warmup_folds(row.params, row.metrics) for row in rows}
+    series = [
+        trial_series_from_journal(row.oos_results, row.oos_entry_ms, row.metrics, warmup=warmups[row.id] or 0)
+        for row in rows
+    ]
+    proven = warmups[trial.id] if experiment.label_type in ("meta", "direct") else 0
+    skip = proven or 0
     # Недійсна спроба лишається в N, але без Sharpe і без відрізка. Бейзлайн — у N і в розкиді,
     # якщо угод достатньо, але без відрізка PBO: інакше він завжди програє і занижує оцінку.
     baseline = {row.id for row in rows if is_reference_baseline(row.params)}
@@ -876,23 +961,24 @@ async def _evaluate_g1(
     pbo_detail = pbo_estimate(competing, candidate_index=candidate_index)
     dsr = dsr_detail.dsr
     pbo = pbo_detail.pbo
-    folds = fold_outcomes_from_metrics(trial.metrics)
+    folds = fold_outcomes_from_metrics(trial.metrics)[skip:]
     checked_stress: tuple[FoldOutcome, ...] = () if stress is None else tuple(stress)
     unfiltered_total_net: Decimal | None = None
     scored_unfiltered_total_net: Decimal | None = None
     if experiment.label_type == "meta":
         # Числа викликача не годяться: однакові «обидва правила» або стрес іншого прогону з тими самими
         # n_signals обійшли б G1. Звіти в журналі перевірені угодами при записі (рішення 0017).
-        unfiltered_total_net, scored_unfiltered_total_net, recorded = _journal_meta_runs(trial.metrics)
+        unfiltered_total_net, scored_unfiltered_total_net, recorded = _journal_meta_runs(trial.metrics, skip=skip)
+        # Стрес викликача звіряється з усім журналом (разом із прогрівом), у G1 іде лише оцінена частина.
         if stress is not None and checked_stress != recorded:
             recorded = None
-        checked_stress = () if recorded is None else recorded
+        checked_stress = () if recorded is None else recorded[skip:]
     elif experiment.label_type == "direct":
         # Стрес прямого прогнозу — з журналу (T2.13); переданий викликачем має збігатися з ним.
         recorded_direct = _journal_direct_stress(trial.metrics)
         if stress is not None and checked_stress != recorded_direct:
             recorded_direct = None
-        checked_stress = () if recorded_direct is None else recorded_direct
+        checked_stress = () if recorded_direct is None else recorded_direct[skip:]
     decision = evaluate_gate(
         label_type=experiment.label_type,
         folds=folds,
@@ -904,10 +990,11 @@ async def _evaluate_g1(
         scored_unfiltered_total_net=scored_unfiltered_total_net,
         thresholds=effective,
     )
-    if experiment.label_type in ("meta", "direct") and not entry_rule_evaluated(trial.params):
-        # Угоди відібрані `keep(0.5)` або правила входу немає: G1 оцінив би не те правило, що піде
-        # в модель допуску і live (рішення 0020). Відмова, а не тихий пропуск. Для direct — той самий
-        # перехресний перерахунок правила входу (T2.13).
+    decision = decision.model_copy(update={"warmup_folds": skip})
+    if experiment.label_type in ("meta", "direct") and (not entry_rule_evaluated(trial.params) or proven is None):
+        # Угоди відібрані `keep(0.5)`, правила входу немає, воно оцінене не лише минулими фолдами, або журнал не
+        # доводить прогрів: G1 оцінив би не те правило, що піде в модель допуску і live (рішення 0020, 0024).
+        # Відмова, а не тихий пропуск.
         decision = decision.model_copy(update={"passed": False, "reasons": (*decision.reasons, G1_ENTRY_RULE)})
     return _G1(
         experiment=experiment,
@@ -1057,6 +1144,7 @@ async def open_holdout_after_gate(
             "median_pf": decision.median_pf,
             "median_pf_unbounded": decision.median_pf_unbounded,
             "profitable_fold_share": decision.profitable_fold_share,
+            "warmup_folds": decision.warmup_folds,
             "unfiltered_total_net": unfiltered_total_net,
             "scored_unfiltered_total_net": scored_unfiltered_total_net,
             "stress": [item.model_dump() for item in checked_stress],
@@ -1097,6 +1185,8 @@ def _decide(
         reasons.append(G1_MIN_TRADES_FOLD)
     if n_trades < thresholds.min_oos_trades:
         reasons.append(G1_MIN_TRADES_TOTAL)
+    if len(folds) < thresholds.min_evaluated_folds:
+        reasons.append(G1_EVALUATED_FOLDS)
     if unbounded:
         median_ok = True
     elif median is None:
@@ -1197,8 +1287,14 @@ def _pf_rank(fold: FoldOutcome) -> Decimal | None:
 
 def _journal_meta_runs(
     metrics: Mapping[str, Any],
+    *,
+    skip: int = 0,
 ) -> tuple[Decimal | None, Decimal | None, tuple[FoldOutcome, ...] | None]:
-    """Обидва правила без фільтра і стрес зі звітів фолдів `meta`. Хоч одного фолду без них — `None`."""
+    """Обидва правила без фільтра і стрес зі звітів фолдів `meta`. Хоч одного фолду без них — `None`.
+
+    Суми правил без фільтра — лише по оцінених фолдах (`skip` перших — прогрів, рішення 0024): фільтр на прогріві
+    не торгує, тож порівняння з правилом, що там торгувало, міряло б прогрів, а не фільтр. Стрес — усі фолди.
+    """
     folds = metrics.get("folds")
     if not isinstance(folds, list) or not folds:
         return None, None, None
@@ -1218,7 +1314,7 @@ def _journal_meta_runs(
             stress.append(_fold_outcome({"trading": block, "below_min_trades": below, "cost_factor": cost}))
     except ValueError:
         return None, None, None
-    return total_net(unfiltered), total_net(scored), tuple(stress)
+    return total_net(unfiltered[skip:]), total_net(scored[skip:]), tuple(stress)
 
 
 def _journal_net(block: object) -> Decimal:

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Шаблон launchd-агента (T1.12, ТЗ §12.1.1). Заповнює scripts/macos/launch_agents.sh — вручну не редагувати.
+  caffeinate -i -s -w PID: заборона сну, поки живе процес (-s діє лише від мережі живлення; закрита кришка
+  без зовнішнього монітора все одно присипляє Mac). `exec` лишає PID оболонки за Python, тож SIGTERM від
+  launchctl отримує сам процес і завершується штатно (код 0), а caffeinate виходить слідом.
+  KeepAlive/SuccessfulExit=false: ненульовий код виходу (втрата lock, БД недоступна) → перезапуск; код 0 (SIGTERM
+  від launchctl) — ні. Прапорців перехоплення lock тут немає і не буде (T0.6).
+  LOG_CONSOLE=false: stderr launchd не ротується, логи — у logs/<процес>/ з ротацією.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>/usr/bin/caffeinate -i -s -w $$ &amp; exec "__PYTHON__" -m __MODULE__</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__BACKEND__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOG_CONSOLE</key>
+    <string>false</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>StandardOutPath</key>
+  <string>__LOGS__/__NAME__.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOGS__/__NAME__.launchd.log</string>
+</dict>
+</plist>
