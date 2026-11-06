@@ -366,7 +366,7 @@ def _rules_section(rules: Sequence[RuleResult], split: ResearchSplit) -> list[st
         verdict = "пройдено" if rule.passed else "не пройдено"
         lines.append(
             f"| `{rule.spec_name}` (`{rule.experiment_id}`, спроба {rule.trial_id}) | {decision.n_trades} "
-            f"| {_fmt(decision.median_pf) if decision.median_pf is not None else '—'} "
+            f"| {_fmt(decision.median_pf) if decision.median_pf is not None and decision.n_trades else '—'} "
             f"| {_pct(decision.profitable_fold_share) if decision.profitable_fold_share is not None else '—'} "
             f"| {_fmt(rule.preview.dsr)} | {_fmt(rule.preview.pbo)} | {verdict} |"
         )
