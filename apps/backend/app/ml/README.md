@@ -257,6 +257,19 @@ Hold-out цикл не відкриває: `IterationOneReport.hold_out_opened` 
 
 Запуск на ринкових даних (T2.14): `python -m app.ml.research iteration-one` — `load_research_inputs` (розбивка за `PRIMARY_CANDIDATES`) → `run_iteration_one` → звіт Markdown у `docs/research/` (числа каталогу, перегляд G1 кожного правила з причинами відмови, наступний крок). Advisory lock `RESEARCH_LOCK_ID` — один прогін на БД: кожен пише спроби в N. Коди виходу: 0, 1, 2, 10 (інший прогін), 11 (БД), 12 (lock прогону втрачено до кінця — звіт з попередженням), 13 (даних бракує — `python -m app.jobs.enqueue market-data`), 14 (розбивку відхилено: hold-out лінії вже зафіксований попереднім прогоном — T2.17), 15 (конфіг). Не готово: перерахунок звітів з сирих даних перед G1 (T2.8/T2.9 у нотатках задачі).
 
+## Таймфрейм 4h (T2.19, рішення 0025)
+
+Дослідження каталогу й meta на 4h — без зміни правила look-ahead: свічки 4h для правил, ATR(t−1), симуляції і бектесту —
+повні кошики з 1h (`optuna_search.aggregate_bars`: від 00:00 UTC, кошик з пропущеною годиною пропускається, без
+інтерполяції; mark — так само), а фічі рішення на відкритті 4h-свічки T — рядок `compute_features()` 1h-ряду з
+`entry_open_time_ms = T` (дані строго до T; у live — той самий рядок буфера). `SymbolHistory.bar_ms` і
+`ResearchSplit.bar_ms` мають збігатися; горизонт, embargo і запас шляху — у свічках ТФ; параметри правил (EMA 20/50,
+пробій 24) — теж. ATR(t−1) 4h — Wilder на 1300 свічках 4h. Допуск hold-out, артефакт і live для 4h — явна відмова
+(`fit_frozen_meta`, `open_holdout_after_gate` для експерименту 4h, `_require_validation_model`), `direct` — лише 1h.
+`experiments.timeframe` — з `bar_ms` розбивки (`validation.TIMEFRAME_NAMES`). Раннер: `python -m app.ml.research iteration-one --variant A|B|C` — лише варіанти, зафіксовані в рішенні 0025
+(`research.VARIANTS`; `baseline` — ітерація 1 на 1h); дані ріжуться по кінцю запечатаного hold-out лінії (`validation.sealed_holdout`), і нова
+розбивка мусить його відтворити (інакше код 14).
+
 ## Пряме прогнозування, ітерація 2 (T2.13, ТЗ §5.1 п. 2, §5А.3 п. 13, §5А.11 п. 2)
 
 `direct_model.py`. Одна LightGBM `multiclass` (FLAT = 0, LONG = 1, SHORT = 2) на всіх свічках символів до `holdout_from_ms`; мітка — `label_direct`, вага — `sample_weights` (унікальність × баланс класів), `device=cpu`. Рецепт — `lgbm_journal_params()` **без ранньої зупинки і без Optuna** (рішення 0021): першу модель навчаємо стандартними параметрами (§5А.3 п. 6). Фічі — `compute_features()` з покриттям train фолду, як у meta; `side` не є фічею, бо модель бачить усі свічки.

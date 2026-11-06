@@ -81,45 +81,46 @@
 | 38 | T2.16 | Продуктивність конвеєра: кеш фіч між спробами Optuna, векторизація | R2 | opus / high | T2.14 |
 | 39 | T2.17 | Рішення про таргет, таймфрейм і список символів за результатами T2.14 | R2 | opus / high | T2.14 |
 | 40 | T2.18 | Звіт hold-out для допуску рахує сам допуск (до першого відкриття hold-out) | R3 | fable / xhigh | T2.11, T2.15 |
-| 41 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
-| 42 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
-| 43 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
-| 44 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
-| 45 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
-| 46 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
-| 47 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
-| 48 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
-| 49 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
-| 50 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
-| 51 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
-| 52 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
-| 53 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
-| 54 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
-| 55 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
-| 56 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
-| 57 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
-| 58 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
-| 59 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
-| 60 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
-| 61 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
-| 62 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
-| 63 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
-| 64 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
-| 65 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
-| 66 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
-| 67 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
-| 68 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
-| 69 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
-| 70 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
-| 71 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
-| 72 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
-| 73 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
-| 74 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
-| 75 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
-| 76 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
-| 77 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
-| 78 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
-| 79 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
+| 41 | T2.19 | Таймфрейм 4h для каталогу і meta (дослідження, без допуску) | R2 | opus / xhigh | T2.14, T2.17 |
+| 42 | T3.1 | Машина станів ордера | R3 | fable / xhigh | T0.4, T1.1 |
+| 43 | T3.2 | Bybit: торгові методи та мапінг помилок | R3 | fable / xhigh | T1.2, T3.1 |
+| 44 | T3.3 | Розв'язання `SUBMISSION_UNKNOWN` | R3 | fable / xhigh | T3.2 |
+| 45 | T3.4 | Fills, `ledger`, `equity_snapshots` | R3 | fable / xhigh | T3.2 |
+| 46 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
+| 47 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
+| 48 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
+| 49 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
+| 50 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
+| 51 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
+| 52 | T4.4 | Звірка при старті та правила розбіжностей | R3 | fable / xhigh | T4.3 |
+| 53 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
+| 54 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
+| 55 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
+| 56 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
+| 57 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
+| 58 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
+| 59 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
+| 60 | T5.6 | Telegram-сповіщення | R1 | sonnet / high | T0.3 |
+| 61 | T5.7 | Dead-man's switch | R1 | sonnet / medium | T5.6 |
+| 62 | T5.8 | Drift-моніторинг і коридор результатів | R2 | opus / high | T5.2, T2.6 |
+| 63 | T5.9 | Резервні копії та перевірка відновлення | R1 | sonnet / medium | T0.2 |
+| 64 | T5.10 | Середовище запуску й автозапуск (Windows + WSL2 і macOS) | R1 | sonnet / medium | T5.2 |
+| 65 | T5.11 | Demo-прогін на реальних цінах | R2 | opus / high | T5.1–T5.7 |
+| 66 | T6.1 | REST API (ТЗ §16) | R2 | opus / high | T5.1 |
+| 67 | T6.2 | Небезпечні дії в API | R3 | fable / xhigh | T6.1, T4.6 |
+| 68 | T6.3 | WebSocket-канали для UI | R1 | sonnet / high | T6.1 |
+| 69 | T6.4 | Генерація TS-типів з OpenAPI | R0 | haiku / medium | T6.1 |
+| 70 | T6.5 | `<FieldHelp>`, файл довідки, CI-перевірка | R1 | sonnet / high | T6.4 |
+| 71 | T6.6 | Тексти підказок українською | R1 | sonnet / high | T6.5 |
+| 72 | T6.7 | Дашборд, боти, позиції, журнал рішень | R1 | sonnet / high | T6.3, T6.5 |
+| 73 | T6.8 | Графік (Lightweight Charts) | R0 | sonnet / medium | T6.7 |
+| 74 | T6.9 | ML Studio | R1 | sonnet / high | T6.7, T2.10 |
+| 75 | T6.10 | UI ризиків і Emergency Stop | R2 | opus / high | T6.2, T6.7 |
+| 76 | T7.1 | Chaos-сценарії на Testnet | R3 | fable / xhigh | T4.7, T5.11 |
+| 77 | T7.2 | 7-денний Testnet-прогін і аналіз | R2 | opus / high | T7.1 |
+| 78 | T7.3 | Незалежний аудит торгового шляху перед Live | R3 | fable / max | T7.2 |
+| 79 | T8.1 | Pre-live чекліст (ТЗ §18.3) | R3 | fable / high | T7.3 |
+| 80 | T8.2 | Live з мінімальним розміром | — | лише людина | T8.1 |
 
 ---
 
@@ -515,16 +516,23 @@
 - **Примітки (2026-11-05):** `decision.py` (`ENTRY_RULE_WARMUP_FOLDS` = 2, `past_fold_pool`; `ENTRY_EVALUATION` видалено), `artifacts.py` (`entry_rule_record` з `fit_on_folds`), `meta_model.py` (`past_fold_entry` замість `cross_fold_entry`, `MetaRun.entry_rules` з `None`), `direct_model.py` (спільні пул і запис), `statistics.py` (`warmup_folds`, `entry_rule_evaluated` — лише `past_folds`, `MIN_EVALUATED_FOLDS` = 4 / `G1_EVALUATED_FOLDS`, `GateDecision.warmup_folds`, запис відкриття `warmup_folds`, `trial_series_from_journal(warmup=)` — відрізок PBO від першого оціненого фолду, суми правил без фільтра лише по оцінених фолдах). Тести оновлено з поясненням: фікстури G1 — з прогрівом; юніт-тести меж G1 на 2–3 фолдах розширено до 4 фолдів (та сама межа медіани 1,15); тест direct тепер чекає `G1_EVALUATED_FOLDS`, а не `G1_MIN_TRADES_FOLD` (структурна неможливість G1 знята рішенням 0024). `tests/ml` — 357 passed. **ТЗ:** §5А.10 доповнено (правило минулих фолдів, прогрів, ≥ 4 оцінених фолди) — рішення 0024.
 - **Рев'ю (2026-11-06):** `ml-leakage-auditor` (Opus 5.5) — вердикт **«чисто»**: витоку з майбутнього і hold-out немає, пороги не послаблені, `tests/ml` 363 passed. Виправлено за зауваженнями: межа purge у `past_fold_pool` — строга (`label_end < test_start`, як `label_overlaps_test`); `fit_on_folds` і `label_end_ms` записуються з самого пулу (`DecisionFit.fit_folds`, `label_end_ms`), а G1 звіряє їх з межею тесту фолду (`_past_only_rule`); тест на 4 фолдах (мітки фолду 3 не змінюють правило фолду 2) для meta і direct; тест, що суми правила без фільтра в G1 не включають прогрів; числа звіту раннера — з констант G1; застарілі фрази README. Відкрито: G1 не перераховує угоди з `entry_rules[k]` (відоме (г) T2.12); спроби Optuna, обрізані у фолдах 0–1, випадають з PBO (консервативний бік).
 
-#### T2.16 · Продуктивність конвеєра `[ ]`
+#### T2.16 · Продуктивність конвеєра `[~]`
 - **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5.6, §5А.7 · **Аудит:** I1
 - **Зробити:** заміряти T2.14 на реальних даних; кеш фіч між спробами Optuna (набір колонок залежить лише від розбивки; ключ — набір колонок і хеш даних); векторизувати EMA/ATR/RSI у `compute_features` і `strategy._ema_cross`, зберігши parity (буфер == офлайн, `1e-9`) і look-ahead-тести; результат не змінюється.
 - **Готово, коли:** спроба Optuna на 8 символах не перераховує фічі; parity- і look-ahead-тести зелені; заміри до/після в примітці.
+- **Зроблено (2026-11-06):** профіль `train_meta` + `recipe_trial` на реальних BTC+ETH (14 фолдів): `_fold_signals` перераховував `primary_signals` по всій історії на кожен фолд і кожен звіт — для `ema_cross` (4 EMA по 1300 свічок на бар) це години; перший прогін T2.14 (8 символів) займав у meta ≈ 4 год. Сигнали правила тепер рахуються раз на прогін (`_Backtest.signals`, той самий `primary_signals`, паритет з live не зачеплено): `train_meta` 2 символи — 336 с (раніше > 28 хв без завершення), `recipe_trial` — 13 с. Лишилось: `_ema_cross` рахується двічі (кандидати й сигнали, ~200 с на 2 символи), `compute_features` ~95 с на виклик (Python-цикли по 1300 барів), кеш фіч між спробами Optuna, векторизація з паритетом `1e-9`.
 
 #### T2.17 · Таргет, таймфрейм і символи за результатами T2.14 `[ ]`
 - **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · **ТЗ:** §5А.2, §5А.5, §5А.6, §5А.11 п. 3 · **Аудит:** C5, I6
 - **Зробити:** на звіті T2.14 вирішити: (1) таргет 1h 1/2 ATR (беззбитковість ~45% TP при медіанному ATR BTC 0,49%) чи ширші бар'єри / 4h (38–41%); кожен варіант — спроба в N, тож заздалегідь обмежити перелік 2–3 варіантами; (2) `SOL` у `RESEARCH_SYMBOLS` (лістинг 2021-10-15 відрізає ~1,5 року BTC; обрано заднім числом, §5А.6); (3) виправити ТЗ §5А.2 (36–40%) розрахунком з `CostModel`. Підтримка 4h у валідації — `_split_problem` зараз лише 1h.
 - **Готово, коли:** рішення в `docs/decisions/` з числами T2.14; ТЗ оновлено.
 - **Дані для рішення (2026-11-06, T2.14):** на 1h з TP 2 / SL 1 ATR усі правила каталогу після витрат збиткові (−0,19…−0,38 R на угоду, 0–1 з 12 фолдів у плюсі), а правило входу meta не знаходить жодного сигналу з позитивним краєм. Ітерація 2 (`direct`) на тому самому таргеті платить ті самі ~0,3 R витрат на угоду. Рекомендація аудитора: спершу це рішення (4h і/або ширші бар'єри, 2–3 заздалегідь зафіксовані варіанти, кожен — спроба в N), потім ітерація 2 на обраному таргеті; зміна порядку ТЗ §5А.11 (ітерація 2 → таймфрейм) — лише рішенням у `docs/decisions/` з підтвердженням власника.
+
+#### T2.19 · Таймфрейм 4h для каталогу і meta `[x]`
+- **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `xhigh`) · **ТЗ:** §5А.5, §5А.11 п. 3 · **Рішення:** `docs/decisions/0025-target-and-timeframe-before-iteration-two.md`
+- **Зробити:** дослідження варіантів 4h (T2.17) без зміни правила look-ahead і без допуску/live.
+- **Готово, коли:** розбивка, правила, бектест і meta працюють на 4h-свічках; фічі рішення — 1h-ряд на відкритті 4h-свічки; допуск 4h — явна відмова; тести.
+- **Примітки (2026-11-06):** `validation.py` — `SUPPORTED_BAR_MS` (1h, 4h), `H4_MS`, `holdout_bounds(bar_ms=)`, `build_split(bar_ms=)` (горизонт, embargo і запас шляху — у свічках ТФ; тривалості кратні свічці), `sealed_holdout(session, line)`; `strategy.py` — `SymbolHistory.bar_ms` (свічки й mark на сітці ТФ), `primary_side/primary_candidates/primary_signals(bar_ms=)`, вікна й шлях бектесту — у свічках ТФ; `meta_model.py` — `train_meta` на 1h або 4h (таймфрейм історій = розбивки), фічі 4h — `_before_cut` 1h-рядів `feature_data`, ATR і мітки — 4h-свічки; `fit_frozen_meta` для 4h — відмова з посиланням на 0025; `optuna_search.py` — `aggregate_bars` (повні кошики від 00:00 UTC, кошик з дірою пропускається, без інтерполяції), `load_research_inputs(bar_ms=, data_to_ms=)`; `research.py` — `--variant baseline|A|B|C` (лише варіанти рішення 0025, `VARIANTS`), дані ріжуться по кінцю запечатаного hold-out лінії і розбивка має його відтворити, назва звіту з варіантом; `experiments.timeframe` — з `bar_ms`; `open_holdout_after_gate` і `_require_validation_model` для 4h — відмова до будь-якого запису. **Рев'ю `ml-leakage-auditor` (2026-11-06): «чисто»** (пертурбація: 1h-свічки з [T, T+4h) не змінюють імовірність на T, а T−1h — змінює); виправлено всі зауваження (структурна відмова 4h, мітки каталогу 4h, CLI лише з варіантами, тести пертурбації, каталогу 4h і журналу). Обмеження: funding з інтервалом < 4h усередині 4h-свічки виходу не нараховується. ATR(t−1) для 4h — той самий Wilder на 1300 свічках ТФ (~217 діб прогріву до першого розміченого кандидата). `direct` лишається на 1h. Тести: `tests/ml/test_four_hour.py`, `tests/ml/test_validation.py` (4h), `tests/ml/test_research_runner.py`.
 
 #### T2.18 · Звіт hold-out для допуску рахує сам допуск `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · **ТЗ:** §5.3, §5.4.1, §5А.10 · **Рев'ю:** `trading-safety-reviewer` 2026-11-06 (знахідка A.9)

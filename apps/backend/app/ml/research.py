@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import datetime as dt
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Final
@@ -76,7 +77,14 @@ from app.ml.statistics import (
 )
 from app.ml.strategy import RuleReport, StrategyComparison
 from app.ml.trade_sim import TargetParams
-from app.ml.validation import ResearchSplit, SplitLeakError, line_trial_count
+from app.ml.validation import (
+    H4_MS,
+    TIMEFRAME_NAMES,
+    ResearchSplit,
+    SplitLeakError,
+    line_trial_count,
+    sealed_holdout,
+)
 from app.risk.costs import CostModel
 from app.risk.limits import RiskLimits
 
@@ -153,10 +161,26 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
             limits = research_limits(
                 min_equity_usd=args.min_equity_usd, max_notional_per_symbol_usd=args.max_notional_per_symbol_usd
             )
-            target = TargetParams()
+            chosen = VARIANTS[args.variant]
+            target = chosen.target
             costs = CostModel()
+            bar_ms = chosen.bar_ms
             started = now_ms()
-            _LOG.info("research_loading", symbols=list(symbols), trading_symbol=settings.trading_symbol)
+            async with sessions() as session:
+                sealed = await sealed_holdout(session, settings.trading_symbol)
+            _LOG.info(
+                "research_loading",
+                symbols=list(symbols),
+                trading_symbol=settings.trading_symbol,
+                variant=args.variant,
+                timeframe=TIMEFRAME_NAMES[bar_ms],
+                target={
+                    "tp_atr": str(target.tp_atr_mult),
+                    "sl_atr": str(target.sl_atr_mult),
+                    "horizon_bars": target.horizon_bars,
+                },
+                sealed_holdout=None if sealed is None else list(sealed),
+            )
             inputs = await load_research_inputs(
                 sessions,
                 symbols=symbols,
@@ -167,7 +191,12 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
                 seed=args.seed,
                 target=target,
                 costs=costs,
+                bar_ms=bar_ms,
+                # Лінія з експериментами вже має запечатаний hold-out: нове вікно мусить його повторити (рішення 0025).
+                data_to_ms=None if sealed is None else sealed[1],
             )
+            if sealed is not None and (inputs.split.holdout_from_ms, inputs.split.holdout_to_ms) != sealed:
+                raise SplitLeakError("розбивка не відтворює запечатаний hold-out лінії")
             _LOG.info(
                 "research_split_ready",
                 folds=len(inputs.split.folds),
@@ -197,8 +226,8 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
         _LOG.error("research_data_insufficient", error=str(exc), hint="python -m app.jobs.enqueue market-data")
         return EXIT_DATA
     except SplitLeakError as exc:
-        # Найчастіше: hold-out лінії вже зафіксований попереднім прогоном, а нове вікно даних дає інший
-        # (validation.create_experiment). Повторний прогін на тій самій лінії — рішення людини (T2.17).
+        # Розбивка не відтворює запечатаний hold-out лінії або create_experiment його відхилив. Раннер ріже дані по
+        # кінцю запечатаного вікна (рішення 0025), тож це означає зміну даних на початку вікна чи витік — розібратись.
         _LOG.error("research_split_rejected", error=str(exc), hint="docs/runbooks/getting-started.md, крок 5А.3")
         return EXIT_SPLIT_REJECTED
     except (OSError, SQLAlchemyError) as exc:
@@ -207,7 +236,11 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
     finally:
         await engine.dispose()
     finished = now_ms()
-    path = args.report or REPORT_DIR / f"{_date(finished)}-iteration-one-{_slug(settings.trading_symbol)}.md"
+    variant = (
+        f"{args.variant}-{TIMEFRAME_NAMES[bar_ms]}-tp{_fmt_mult(target.tp_atr_mult)}"
+        f"-sl{_fmt_mult(target.sl_atr_mult)}-h{target.horizon_bars}"
+    )
+    path = args.report or REPORT_DIR / f"{_date(finished)}-iteration-one-{_slug(settings.trading_symbol)}-{variant}.md"
     markdown = render_iteration_one(
         report,
         inputs,
@@ -294,9 +327,13 @@ def render_iteration_one(
         f"- Hold-out (запечатаний): {_date(split.holdout_from_ms)} … {_date(split.holdout_to_ms)} "
         f"({_pct(split.holdout_fraction)} історії).",
         f"- Walk-forward: {len(split.folds)} фолдів, перший тест з {_date(split.folds[0].test_start_ms)}, "
-        f"подовжених до 6 міс.: {sum(1 for fold in split.folds if fold.extended)}; embargo {split.embargo_bars} год; "
+        f"подовжених до 6 міс.: {sum(1 for fold in split.folds if fold.extended)}; "
+        f"embargo {split.embargo_bars} свічок; "
         f"мінімум угод на фолд {split.min_trades_per_fold}. Два перші фолди — прогрів правила входу (рішення 0024).",
-        f"- Таргет: TP {target.tp_atr_mult}·ATR, SL {target.sl_atr_mult}·ATR, горизонт {target.horizon_bars} год.",
+        f"- Таймфрейм рішень і симуляції: {_timeframe_label(split.bar_ms)} "
+        "(фічі — 1h-ряд на відкритті свічки, рішення 0025).",
+        f"- Таргет: TP {target.tp_atr_mult}·ATR, SL {target.sl_atr_mult}·ATR (ATR цього таймфрейму), "
+        f"горизонт {target.horizon_bars} свічок.",
         f"- Витрати: taker {_pct(costs.taker_fee_rate)} за сторону, slippage входу {costs.slippage_entry_atr}·ATR, "
         f"SL {costs.stop_slippage_atr}·ATR, TP {costs.slippage_tp_atr}·ATR.",
         f"- Рахунок бектесту: {initial_equity} USDT, ліміти Risk Engine за замовчуванням (ризик 0,5% на угоду).",
@@ -390,6 +427,36 @@ def _rules_section(rules: Sequence[RuleResult], split: ResearchSplit) -> list[st
     return lines
 
 
+@dataclass(frozen=True, slots=True)
+class Variant:
+    """Заздалегідь зафіксований варіант таргета й таймфрейму лінії (рішення 0025). Інших CLI не приймає."""
+
+    bar_ms: int
+    target: TargetParams
+
+
+# `baseline` — ітерація 1 2026-11-06 (ТЗ §5А.5); A, B, C — рішення 0025. Новий варіант — лише новим рішенням:
+# кожен прогін назавжди додає спроби в N лінії, тож вибір не має залежати від результату попереднього.
+VARIANTS: Final[Mapping[str, Variant]] = {
+    "baseline": Variant(bar_ms=3_600_000, target=TargetParams()),
+    "A": Variant(bar_ms=H4_MS, target=TargetParams(tp_atr_mult=Decimal(2), sl_atr_mult=Decimal(1), horizon_bars=24)),
+    "B": Variant(
+        bar_ms=H4_MS, target=TargetParams(tp_atr_mult=Decimal(3), sl_atr_mult=Decimal("1.5"), horizon_bars=48)
+    ),
+    "C": Variant(
+        bar_ms=3_600_000, target=TargetParams(tp_atr_mult=Decimal(3), sl_atr_mult=Decimal("1.5"), horizon_bars=48)
+    ),
+}
+
+
+def _timeframe_label(bar_ms: int) -> str:
+    return TIMEFRAME_NAMES.get(bar_ms, f"{bar_ms} мс")
+
+
+def _fmt_mult(value: Decimal) -> str:
+    return format(value.normalize(), "f").replace(".", "_")
+
+
 def _date(ms: int) -> str:
     return dt.datetime.fromtimestamp(ms / 1000, tz=dt.UTC).strftime("%Y-%m-%d")
 
@@ -450,6 +517,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     one.add_argument("--maintenance-margin-rate", type=_decimal, default=DEFAULT_MAINTENANCE_MARGIN_RATE)
     one.add_argument("--min-equity-usd", type=_decimal, default=DEFAULT_MIN_EQUITY_USD)
     one.add_argument("--max-notional-per-symbol-usd", type=_decimal, default=DEFAULT_MAX_NOTIONAL_PER_SYMBOL_USD)
+    one.add_argument(
+        "--variant",
+        choices=sorted(VARIANTS),
+        default="baseline",
+        help="зафіксований варіант таргета й таймфрейму (рішення 0025): baseline, A, B або C",
+    )
     one.add_argument("--report", type=Path, default=None, help="куди записати звіт Markdown")
     return parser.parse_args(list(argv) if argv is not None else None)
 

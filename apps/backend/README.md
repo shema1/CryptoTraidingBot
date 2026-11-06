@@ -152,7 +152,8 @@ uv run python -m app.data.collector               # публічний WS лік
 - `python -m app.jobs.enqueue market-data` (T1.11, рішення 0023) — лише БД: ставить `refresh_instruments`,
   `backfill_candles` і `backfill_derivatives` (повтор повертає активні задачі або докачує нове). Коди: 0 — у черзі;
   1 — необроблений виняток; 2 — аргументи; 11 — БД недоступна; 15 — немає `POSTGRES_PASSWORD`.
-- `python -m app.ml.research iteration-one` (T2.14) — завантаження з БД, нова розбивка, `run_iteration_one`, звіт
+- `python -m app.ml.research iteration-one [--variant baseline|A|B|C]` (T2.14, T2.19, рішення 0025) — завантаження
+  з БД, нова розбивка (запечатаний hold-out лінії), `run_iteration_one`, звіт
   у `docs/research/`. Advisory lock `RESEARCH_LOCK_ID` = 4 (один прогін на БД). Коди: 0 — прогін завершено
   (незалежно від вердикту G1); 1; 2; 10 — інший прогін працює; 11 — БД недоступна; 12 — lock прогону втрачено до
   кінця (звіт з попередженням); 13 — даних бракує; 14 — розбивку відхилено (hold-out лінії вже зафіксований

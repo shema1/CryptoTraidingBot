@@ -470,14 +470,28 @@ async def load_optuna_inputs(sessions: SessionFactory, request: OptunaJobRequest
     return OptunaInputs(histories=histories, feature_data=features, split=split)
 
 
-def _common_window(rows: Sequence[_SymbolRows]) -> tuple[int, int, int]:
-    """Спільне вікно свічок усіх символів `[start, end)` і початок hold-out у ньому."""
+def _common_window(
+    rows: Sequence[_SymbolRows],
+    *,
+    bar_ms: int = HOUR_MS,
+    data_to_ms: int | None = None,
+) -> tuple[int, int, int]:
+    """Спільне вікно свічок усіх символів `[start, end)` і початок hold-out у ньому.
+
+    Межі вирівняні всередину до свічки ТФ. `data_to_ms` — обрізати кінець (запечатаний hold-out лінії, рішення 0025).
+    """
     start = max(item.candles[0][0].open_time_ms for item in rows)
+    start += (-start) % bar_ms
     end = min(item.candles[-1][0].open_time_ms for item in rows) + HOUR_MS
+    if data_to_ms is not None:
+        if data_to_ms > end:
+            raise OptunaDataError("даних менше, ніж до кінця запечатаного hold-out лінії")
+        end = data_to_ms
+    end -= end % bar_ms
     if end <= start:
         raise OptunaDataError("історії символів не перетинаються")
     try:
-        cut, _holdout_to = holdout_bounds(start, end)
+        cut, _holdout_to = holdout_bounds(start, end, bar_ms=bar_ms)
     except ValueError as exc:
         raise OptunaDataError("з наявної історії не виходить розбивка") from exc
     return start, end, cut
@@ -504,8 +518,13 @@ async def load_research_inputs(
     seed: int,
     target: TargetParams,
     costs: CostModel | None = None,
+    bar_ms: int = HOUR_MS,
+    data_to_ms: int | None = None,
 ) -> OptunaInputs:
     """Історії, фічі й нова розбивка для дослідницького циклу (T2.12 (а), T2.14). Hold-out не відкривається.
+
+    `bar_ms` — таймфрейм рішень (1h або 4h, рішення 0025): історії для правил і симуляції агрегуються з 1h
+    (`aggregate_bars`), фічі лишаються на 1h. `data_to_ms` — кінець вікна (запечатаний hold-out лінії).
 
     Той самий завантажувач, що в Optuna: свічки, mark, funding, деривативи і кеш інструментів режиму `demo`
     однією короткою транзакцією; ряди ріжуться по початку hold-out до вирівнювання mark (`_assemble`).
@@ -527,6 +546,8 @@ async def load_research_inputs(
         seed=seed,
         target=target,
         costs=costs,
+        bar_ms=bar_ms,
+        data_to_ms=data_to_ms,
     )
 
 
@@ -540,9 +561,11 @@ def _prepare_research(
     seed: int,
     target: TargetParams,
     costs: CostModel | None,
+    bar_ms: int = HOUR_MS,
+    data_to_ms: int | None = None,
 ) -> OptunaInputs:
-    start, end, cut = _common_window(rows)
-    histories, features = _assemble(rows, cut)
+    start, end, cut = _common_window(rows, bar_ms=bar_ms, data_to_ms=data_to_ms)
+    histories, features = _assemble(rows, cut, bar_ms=bar_ms)
     trading = next(item for item in histories if item.symbol == trading_symbol)
     try:
         split = build_split(
@@ -560,6 +583,7 @@ def _prepare_research(
                 params=target,
                 specs=PRIMARY_CANDIDATES,
             ),
+            bar_ms=bar_ms,
         )
     except (ValueError, SplitLeakError) as exc:
         raise OptunaDataError("з наявної історії не виходить розбивка") from exc
@@ -979,11 +1003,18 @@ async def _load_rows(session: AsyncSession, symbols: Sequence[str]) -> tuple[_Sy
     return tuple(loaded)
 
 
-def _assemble(rows: Sequence[_SymbolRows], cut_ms: int) -> tuple[tuple[SymbolHistory, ...], dict[str, SymbolData]]:
+def _assemble(
+    rows: Sequence[_SymbolRows],
+    cut_ms: int,
+    *,
+    bar_ms: int = HOUR_MS,
+) -> tuple[tuple[SymbolHistory, ...], dict[str, SymbolData]]:
     """Історії й фічі до `cut_ms` (початок hold-out). Спершу зріз, потім вирівнювання mark і ціни funding.
 
     Інакше відсутня mark-свічка в hold-out вимикала б mark для всього walk-forward (SL за last),
     і результат фолдів залежав би від даних, яких до відкриття hold-out не існує.
+    `bar_ms` = 4h: свічки й mark історії — повні 4h-кошики з 1h (`aggregate_bars`), ціна funding — з 1h-свічок
+    (точніша), фічі — 1h.
     """
     histories: list[SymbolHistory] = []
     features: dict[str, SymbolData] = {}
@@ -995,13 +1026,22 @@ def _assemble(rows: Sequence[_SymbolRows], cut_ms: int) -> tuple[tuple[SymbolHis
         marks = _aligned_marks(candles, [bar for bar in item.marks if bar.open_time_ms < cut_ms])
         price_bars = marks if marks is not None else candles
         funding = _funding_events([payment for payment in item.payments if payment[0] < cut_ms], price_bars)
+        decision_candles = aggregate_bars(candles, bar_ms)
+        decision_marks = None if marks is None else aggregate_bars(marks, bar_ms)
+        if decision_marks is not None and [bar.open_time_ms for bar in decision_marks] != [
+            bar.open_time_ms for bar in decision_candles
+        ]:
+            decision_marks = None
+        if not decision_candles:
+            raise OptunaDataError("до hold-out немає повних свічок таймфрейму")
         histories.append(
             SymbolHistory(
                 symbol=item.symbol,
-                candles=tuple(candles),
+                candles=decision_candles,
                 instrument=item.instrument,
-                mark_candles=marks,
+                mark_candles=decision_marks,
                 funding=funding,
+                bar_ms=bar_ms,
             )
         )
         features[item.symbol] = SymbolData(
@@ -1086,6 +1126,43 @@ async def _funding_payments(session: AsyncSession, symbol: str) -> tuple[tuple[i
         )
     ).all()
     return tuple((row.funding_time_ms, row.rate) for row in rows)
+
+
+def aggregate_bars(bars: Sequence[SimCandle], bar_ms: int) -> tuple[SimCandle, ...]:
+    """Свічки ТФ `bar_ms` з 1h: лише повні кошики від 00:00 UTC (усі години кошика поспіль), без інтерполяції.
+
+    Кошик з пропущеною годиною пропускається цілком — у ряді ТФ лишається дірка, як і в 1h (рішення 0025).
+    `open` — першої години, `close` — останньої, `high`/`low` — екстремуми кошика. 1h — без змін.
+    """
+    if bar_ms == HOUR_MS:
+        return tuple(bars)
+    if bar_ms <= 0 or bar_ms % HOUR_MS != 0:
+        raise ValueError("таймфрейм агрегації кратний 1h")
+    per = bar_ms // HOUR_MS
+    out: list[SimCandle] = []
+    index = 0
+    while index < len(bars):
+        start = bars[index].open_time_ms
+        group = bars[index : index + per]
+        complete = (
+            start % bar_ms == 0
+            and len(group) == per
+            and all(bar.open_time_ms == start + offset * HOUR_MS for offset, bar in enumerate(group))
+        )
+        if not complete:
+            index += 1
+            continue
+        out.append(
+            SimCandle(
+                open_time_ms=start,
+                open=group[0].open,
+                high=max(bar.high for bar in group),
+                low=min(bar.low for bar in group),
+                close=group[-1].close,
+            )
+        )
+        index += per
+    return tuple(out)
 
 
 def _funding_events(payments: Sequence[tuple[int, Decimal]], bars: Sequence[SimCandle]) -> tuple[FundingEvent, ...]:

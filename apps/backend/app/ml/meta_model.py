@@ -20,9 +20,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
@@ -66,6 +67,7 @@ from app.ml.strategy import (
 )
 from app.ml.trade_sim import MetaSample, NoAtr, TargetParams, atr_before_entry, label_meta, label_span, sample_weights
 from app.ml.validation import (
+    SUPPORTED_BAR_MS,
     Fold,
     FoldRecord,
     LabelStats,
@@ -390,8 +392,8 @@ def train_meta(
     checked = None if lgbm is None else lgbm_search_record(search_point(lgbm))
     if stop_after is not None and not callable(stop_after):
         raise ValueError("stop_after має бути викликаним")
-    if split.bar_ms != HOUR_MS:
-        raise ValueError("meta-модель рахується на свічках 1h")
+    if split.bar_ms not in SUPPORTED_BAR_MS:
+        raise ValueError("meta-модель рахується на свічках 1h або 4h")
     if not split.folds:
         raise ValueError("у розбивці немає фолдів")
     model_costs = costs if costs is not None else CostModel()
@@ -402,6 +404,8 @@ def train_meta(
         raise ValueError("params має бути TargetParams")
     if target.horizon_bars != split.horizon_bars:
         raise ValueError("горизонт таргета і розбивки різний")
+    if any(history.bar_ms != split.bar_ms for history in books):
+        raise ValueError("таймфрейм історії не той, що в розбивці")
     series = _feature_series(books, feature_data, split.holdout_from_ms)
     found = {history.symbol: _candidates(spec, history, split, target, model_costs, seed) for history in books}
     by_key = {(item.row.symbol, item.row.index): item for history in books for item in found[history.symbol]}
@@ -536,7 +540,8 @@ def fit_frozen_meta(
     _spec(spec)
     _seed(seed)
     if split.bar_ms != HOUR_MS:
-        raise ValueError("meta-модель рахується на свічках 1h")
+        # Допуск hold-out, артефакт і live для 4h — окрема задача після перегляду G1 (рішення 0025).
+        raise ValueError("модель допуску лише на свічках 1h: 4h — дослідження без допуску (рішення 0025)")
     model_costs = costs if costs is not None else CostModel()
     if type(model_costs) is not CostModel:
         raise ValueError("costs має бути CostModel")
@@ -838,7 +843,7 @@ def past_fold_entry(run: MetaRun, histories: Sequence[SymbolHistory]) -> MetaRun
                 history,
                 _scored_signals(
                     history,
-                    _fold_signals(history, run.spec, run.split, window, common.seed),
+                    _fold_signals(history, run.spec, run.split, window, common.seed, common.signals),
                     scored,
                     taken_only=True,
                 ),
@@ -850,7 +855,7 @@ def past_fold_entry(run: MetaRun, histories: Sequence[SymbolHistory]) -> MetaRun
         )
         taken = _scored_signals(
             trading,
-            _fold_signals(trading, run.spec, run.split, window, common.seed),
+            _fold_signals(trading, run.spec, run.split, window, common.seed, common.signals),
             scored,
             taken_only=True,
         )
@@ -925,7 +930,7 @@ def decision_observations(run: MetaRun, histories: Sequence[SymbolHistory]) -> t
                     raw_probability=scored.probability,
                     true_label=scored.true_label,
                     entry=entry.open,
-                    atr=atr_before_entry(history.candles, scored.entry_index),
+                    atr=atr_before_entry(history.candles, scored.entry_index, bar_ms=history.bar_ms),
                 )
             )
     return tuple(rows)
@@ -976,6 +981,10 @@ class _Backtest:
     seed: int
     costs: CostModel
     params: TargetParams
+    # Сигнали правила на всій історії символу — одні на прогін (T2.16): `_fold_signals` інакше перераховував
+    # `primary_signals` по всій історії на кожен фолд і кожен звіт (для `ema_cross` — години). Те саме обчислення,
+    # лише один раз; у порівнянні налаштувань не бере участі.
+    signals: dict[tuple[Any, ...], tuple[EntrySignal, ...]] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,7 +1033,7 @@ def _train_fold(
     fit_labels = _shuffle_labels(true_labels, seed, fold.index) if shuffled_labels else list(true_labels)
     if len(set(fit_labels)) < 2:
         raise MetaTrainError(f"фолд {fold.index}: у train один клас, бінарну модель не навчити")
-    spans = tuple(label_span(sample.symbol, sample.trade) for sample in train_samples)
+    spans = tuple(label_span(sample.symbol, sample.trade, bar_ms=split.bar_ms) for sample in train_samples)
     weights = sample_weights(spans, fit_labels)
     if not weights or any(weight <= 0 for weight in weights):
         raise MetaTrainError("без ваг унікальності навчати не можна")
@@ -1069,7 +1078,7 @@ def _train_fold(
     # Тест — усі кандидати з валідними фічами, з міткою чи без: інакше фільтр знав би майбутні дірки.
     scored = _score(model, _join(test_rows, by_key, features), min_probability=min_probability)
     trading = _history(books, trading_symbol)
-    rule = _fold_signals(trading, spec, split, fold, common.seed)
+    rule = _fold_signals(trading, spec, split, fold, common.seed, common.signals)
     seen = _scored_signals(trading, rule, scored, taken_only=False)
     taken = _scored_signals(trading, rule, scored, taken_only=True)
     # Звіти, а не числа: `record_trial` звірить їх з угодами і сигналами фільтра, G1 рахує з них (рішення 0017).
@@ -1125,7 +1134,12 @@ def _filtered_record(
     reports = tuple(
         _window(
             history,
-            _scored_signals(history, _fold_signals(history, spec, split, fold, common.seed), scored, taken_only=True),
+            _scored_signals(
+                history,
+                _fold_signals(history, spec, split, fold, common.seed, common.signals),
+                scored,
+                taken_only=True,
+            ),
             split,
             fold,
             common,
@@ -1168,8 +1182,25 @@ def _fold_signals(
     split: ResearchSplit,
     fold: Fold,
     seed: int,
+    cache: dict[tuple[Any, ...], tuple[EntrySignal, ...]] | None = None,
 ) -> tuple[EntrySignal, ...]:
-    signals = primary_signals(spec, history.candles, horizon_bars=split.horizon_bars, seed=seed)
+    key = (
+        history.symbol,
+        json.dumps(spec.metadata(), sort_keys=True),
+        split.horizon_bars,
+        seed,
+        history.bar_ms,
+        len(history.candles),
+        history.candles[0].open_time_ms,
+        history.candles[-1].open_time_ms,
+    )
+    signals = None if cache is None else cache.get(key)
+    if signals is None:
+        signals = primary_signals(
+            spec, history.candles, horizon_bars=split.horizon_bars, seed=seed, bar_ms=history.bar_ms
+        )
+        if cache is not None:
+            cache[key] = signals
     kept: list[EntrySignal] = []
     for signal in signals:
         stamp = history.candles[signal.entry_index].open_time_ms
@@ -1432,10 +1463,17 @@ def _feature_series(
     built: dict[str, SymbolData] = {}
     for history in books:
         candle_before = holdout_from_ms if cutoff_ms is None else cutoff_ms
+        extra = None if feature_data is None else feature_data[history.symbol]
+        if history.bar_ms != HOUR_MS:
+            # 4h (рішення 0025): фічі рішення на відкритті 4h-свічки T — рядок `compute_features()` 1h-ряду з
+            # `entry_open_time_ms = T` (дані строго до T). Тож ряд фіч — 1h-свічки з `feature_data`, а не 4h історії.
+            if extra is None:
+                raise ValueError("для 4h потрібні 1h-ряди фіч (feature_data)")
+            built[history.symbol] = _before_cut(extra, candle_before)
+            continue
         prefix = tuple(bar for bar in history.candles if bar.open_time_ms < candle_before)
         if len(prefix) < 2:
             raise ValueError("немає свічок до hold-out")
-        extra = None if feature_data is None else feature_data[history.symbol]
         volumes = _volumes(extra, prefix)
         candles = tuple(
             CandleBar(
@@ -1461,6 +1499,22 @@ def _feature_series(
             gaps=extra.gaps,
         )
     return built
+
+
+def _before_cut(data: SymbolData, cut_ms: int) -> SymbolData:
+    """1h-ряди фіч символу до `cut_ms` — для таймфрейму рішень 4h (рішення 0025)."""
+    candles = tuple(bar for bar in data.candles if bar.open_time_ms < cut_ms)
+    if len(candles) < 2:
+        raise ValueError("немає свічок до hold-out")
+    return SymbolData(
+        candles=candles,
+        open_interest=_before(data.open_interest, cut_ms),
+        premium=_before(data.premium, cut_ms),
+        long_short=tuple(point for point in data.long_short if point.ts_ms < cut_ms),
+        liquidations=tuple(bar for bar in data.liquidations if bar.ts_ms < cut_ms),
+        funding=_before(data.funding, cut_ms),
+        gaps=data.gaps,
+    )
 
 
 def _volumes(extra: SymbolData | None, prefix: Sequence[Any]) -> dict[int, float]:
@@ -1498,14 +1552,16 @@ def _candidates(
     prefix = tuple(bar for bar in history.candles if bar.open_time_ms < candle_cut)
     found = tuple(
         candidate
-        for candidate in primary_candidates(spec, prefix, symbol=history.symbol, seed=seed)
+        for candidate in primary_candidates(spec, prefix, symbol=history.symbol, seed=seed, bar_ms=history.bar_ms)
         if prefix[candidate.entry_index].open_time_ms < decision_cut
     )
     marks = None
     if history.mark_candles is not None:
         marks = tuple(bar for bar in history.mark_candles if bar.open_time_ms < candle_cut)
     funding = tuple(event for event in history.funding if event.time_ms < candle_cut)
-    labeled = label_meta(prefix, found, params=target, costs=costs, mark_candles=marks, funding=funding)
+    labeled = label_meta(
+        prefix, found, params=target, costs=costs, mark_candles=marks, funding=funding, bar_ms=history.bar_ms
+    )
     if len(labeled.samples) + len(labeled.skipped) != len(found):
         raise RuntimeError("label_meta загубив кандидата")
     by_index = {sample.trade.entry_index: sample for sample in labeled.samples}

@@ -1101,6 +1101,7 @@ async def open_holdout_after_gate(
     """
     if type(model_version) is not str or not model_version:
         raise ValueError("відкриття hold-out потребує model_version моделі допуску")
+    await _require_one_hour_line_experiment(session, experiment_id)
     ev = await _evaluate_g1(
         session,
         experiment_id=experiment_id,
@@ -1429,6 +1430,18 @@ async def _invalidations(session: AsyncSession, trial_ids: Sequence[int]) -> dic
         return {}
     stmt = select(TrialInvalidation).where(TrialInvalidation.trial_id.in_(trial_ids))
     return {mark.trial_id: mark for mark in (await session.execute(stmt)).scalars()}
+
+
+async def _require_one_hour_line_experiment(session: AsyncSession, experiment_id: str) -> None:
+    """Hold-out відкривають лише експерименти 1h: допуск, артефакт і live для 4h не підтримуються (рішення 0025).
+
+    Інакше спроба 4h (зокрема `rule_only`, якому `fit_frozen_meta` не потрібен) витратила б одне з двох відкриттів
+    запечатаного hold-out лінії, а модель з параметрами 4h пішла б у торгівлю на 1h. Відмова — до будь-якого запису.
+    """
+    experiment = await session.get(Experiment, experiment_id)
+    validation = None if experiment is None else experiment.params.get("validation")
+    if isinstance(validation, Mapping) and validation.get("bar_ms") != HOUR_MS:
+        raise ValueError("hold-out не відкривається експериментом 4h: допуск 4h не підтримується (рішення 0025)")
 
 
 async def _check_model(session: AsyncSession, model_version: str, experiment: Experiment) -> None:

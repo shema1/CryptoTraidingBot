@@ -127,6 +127,7 @@ def _args(tmp_path: Path) -> argparse.Namespace:
         maintenance_margin_rate=Decimal("0.01"),
         min_equity_usd=Decimal(1000),
         max_notional_per_symbol_usd=Decimal(50000),
+        variant="baseline",
         report=tmp_path / "report.md",
     )
 
@@ -235,3 +236,115 @@ async def test_lock_check_sees_its_own_lock_and_only_its_own(test_settings: Sett
             assert await _lock_still_held(stranger) is False
     finally:
         await engine.dispose()
+
+
+def test_four_hour_research_aggregates_histories_cuts_at_the_sealed_end_and_keeps_hourly_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Рішення 0025: історії правил — 4h з 1h, фічі — 1h, кінець вікна — запечатаний hold-out лінії."""
+    from app.ml.validation import H4_MS, holdout_bounds
+
+    seen: dict[str, Any] = {}
+
+    def fake_count(history: Any, **kwargs: Any) -> Callable[[int, int], int]:
+        seen["count_bar_ms"] = history.bar_ms
+        return lambda _start, _end: 99
+
+    def fake_split(**kwargs: Any) -> Any:
+        seen["split"] = kwargs
+        cut, _end = holdout_bounds(kwargs["data_from_ms"], kwargs["data_to_ms"], bar_ms=kwargs["bar_ms"])
+        return SimpleNamespace(holdout_from_ms=cut, folds=())
+
+    monkeypatch.setattr(optuna_search, "executed_trade_count", fake_count)
+    monkeypatch.setattr(optuna_search, "build_split", fake_split)
+    sealed_end = 320 * HOUR
+    inputs = _prepare_research(
+        [_rows(BTC, 400), _rows(ETH, 400)],
+        trading_symbol=BTC,
+        limits=research_limits(min_equity_usd=Decimal(1000), max_notional_per_symbol_usd=Decimal(50000)),
+        initial_equity=Decimal(10000),
+        maintenance_margin_rate=Decimal("0.01"),
+        seed=1,
+        target=TargetParams(),
+        costs=CostModel(),
+        bar_ms=H4_MS,
+        data_to_ms=sealed_end,
+    )
+    assert seen["split"]["bar_ms"] == H4_MS
+    assert seen["split"]["data_to_ms"] == sealed_end
+    assert seen["count_bar_ms"] == H4_MS
+    cut, _end = holdout_bounds(0, sealed_end, bar_ms=H4_MS)
+    for history in inputs.histories:
+        assert history.bar_ms == H4_MS
+        times = [bar.open_time_ms for bar in history.candles]
+        assert all(time % H4_MS == 0 and time < cut for time in times)
+        assert times == sorted(set(times))
+    for data in inputs.feature_data.values():
+        steps = {b.open_time_ms - a.open_time_ms for a, b in zip(data.candles, data.candles[1:], strict=False)}
+        assert steps == {HOUR}
+        assert data.candles[-1].open_time_ms < cut
+
+
+def test_research_refuses_a_window_longer_than_the_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(optuna_search.OptunaDataError, match="запечатаного"):
+        _prepare_research(
+            [_rows(BTC, 100)],
+            trading_symbol=BTC,
+            limits=research_limits(min_equity_usd=Decimal(1000), max_notional_per_symbol_usd=Decimal(50000)),
+            initial_equity=Decimal(10000),
+            maintenance_margin_rate=Decimal("0.01"),
+            seed=1,
+            target=TargetParams(),
+            costs=CostModel(),
+            data_to_ms=200 * HOUR,
+        )
+
+
+def test_cli_runs_only_the_variants_fixed_in_decision_0025() -> None:
+    from app.ml.research import VARIANTS, _parse_args
+    from app.ml.validation import H4_MS
+
+    assert _parse_args(["iteration-one"]).variant == "baseline"
+    assert _parse_args(["iteration-one", "--variant", "B"]).variant == "B"
+    # Довільний таргет з командного рядка — прихований підбір; лише зафіксовані варіанти.
+    for argv in (["iteration-one", "--variant", "D"], ["iteration-one", "--tp-atr", "5"]):
+        with pytest.raises(SystemExit):
+            _parse_args(argv)
+    assert VARIANTS["baseline"].target == TargetParams()
+    assert (VARIANTS["A"].bar_ms, VARIANTS["A"].target.horizon_bars) == (H4_MS, 24)
+    assert (VARIANTS["B"].target.tp_atr_mult, VARIANTS["B"].target.sl_atr_mult) == (Decimal(3), Decimal("1.5"))
+    assert (VARIANTS["C"].bar_ms, VARIANTS["C"].target.horizon_bars) == (HOUR, 48)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_sealed_holdout_of_a_line_is_the_window_of_its_experiments(conn: Any) -> None:
+    """Раннер ріже дані по кінцю цього вікна: нові варіанти лінії мають той самий hold-out (рішення 0025)."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.ml.validation import create_experiment, sealed_holdout
+
+    split = build_split(
+        data_from_ms=0,
+        data_to_ms=1500 * HOUR,
+        horizon_bars=4,
+        count_trades=lambda _start, _end: 1,
+        min_train_ms=48 * HOUR,
+        test_segment_ms=24 * HOUR,
+        test_segment_extended_ms=48 * HOUR,
+        min_trades_per_fold=1,
+    )
+    async with AsyncSession(bind=conn) as session:
+        assert await sealed_holdout(session, BTC) is None
+        await create_experiment(
+            session,
+            split=split,
+            research_line=BTC,
+            symbols=(BTC,),
+            label_type="meta",
+            primary_strategy={"name": "ema_cross"},
+            params={},
+            seed=1,
+        )
+        assert await sealed_holdout(session, BTC) == (split.holdout_from_ms, split.holdout_to_ms)
+        assert await sealed_holdout(session, ETH) is None

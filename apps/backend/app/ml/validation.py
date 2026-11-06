@@ -50,10 +50,14 @@ MIN_TRADES_PER_FOLD: int = 20
 HOLDOUT_FRACTION_MIN: Decimal = Decimal("0.15")
 HOLDOUT_FRACTION_MAX: Decimal = Decimal("0.20")
 DEFAULT_HOLDOUT_FRACTION: Decimal = Decimal("0.20")
+# Таймфрейми розбивки (рішення 0025): 1h — основний, 4h — дослідження (каталог і meta; T2.19).
+H4_MS: int = 4 * HOUR_MS
+SUPPORTED_BAR_MS: frozenset[int] = frozenset({HOUR_MS, H4_MS})
 # Ознака спроби прямого прогнозування (T2.13) в `params`. Для G1 відрізняє її від meta-спроби.
 DIRECT_STAGE: str = "direct_model"
 
-_TIMEFRAME = "1h"
+# Назва таймфрейму в журналі (`experiments.timeframe`) — з `bar_ms` розбивки, не константа (рішення 0025).
+TIMEFRAME_NAMES: dict[int, str] = {HOUR_MS: "1h", H4_MS: "4h"}
 _SYMBOL = re.compile(SYMBOL_RE)
 _EXPERIMENT_ID = re.compile(r"^exp-(\d+)$")
 _OPENING_LIMIT = ("opening_no_max_2", "uq_holdout_openings_window_opening_no")
@@ -237,22 +241,24 @@ def holdout_bounds(
     data_to_ms: int,
     *,
     fraction: Decimal = DEFAULT_HOLDOUT_FRACTION,
+    bar_ms: int = HOUR_MS,
 ) -> tuple[int, int]:
-    """Останні `fraction` історії, вирівняні вниз за годиною, тож відрізок не коротший за частку.
+    """Останні `fraction` історії, вирівняні вниз за свічкою ТФ, тож відрізок не коротший за частку.
 
-    Частка — лише `Decimal` з діапазону 15–20%. Межі — `[from, to)`.
+    Частка — лише `Decimal` з діапазону 15–20%. Межі — `[from, to)`, кратні `bar_ms` (1h або 4h).
     """
+    _bar_ms(bar_ms)
     start = _millis("data_from_ms", data_from_ms)
     end = _millis("data_to_ms", data_to_ms)
     if end <= start:
         raise ValueError("історія порожня")
-    if start % HOUR_MS != 0 or end % HOUR_MS != 0:
-        raise ValueError("межі історії не вирівняні за 1h")
+    if start % bar_ms != 0 or end % bar_ms != 0:
+        raise ValueError("межі історії не вирівняні за свічкою таймфрейму")
     _fraction(fraction)
     span = end - start
     length = int((Decimal(span) * fraction).to_integral_value(rounding=ROUND_CEILING))
     holdout_from = end - length
-    holdout_from -= (holdout_from - start) % HOUR_MS
+    holdout_from -= (holdout_from - start) % bar_ms
     if holdout_from <= start:
         raise ValueError("hold-out поглинув усю історію")
     return holdout_from, end
@@ -270,13 +276,16 @@ def build_split(
     test_segment_ms: int = TEST_SEGMENT_MS,
     test_segment_extended_ms: int = TEST_SEGMENT_EXTENDED_MS,
     min_trades_per_fold: int = MIN_TRADES_PER_FOLD,
+    bar_ms: int = HOUR_MS,
 ) -> ResearchSplit:
     """Розбивка з розширюваним вікном. `count_trades(start, end)` — угоди торгового символу на `[start, end)`.
 
     Рахунок має бути з бектесту, що стартує на `start` з порожнім рахунком: зріз довшого прогону
     бачить ліміти, нараховані до вікна. Сигнали — лише всередині вікна; свічки після `end` — шлях,
     і цей шлях не заходить у hold-out (запас `horizon_bars` вже відрізаний).
+    `bar_ms` — свічка таймфрейму рішень (1h або 4h, рішення 0025): горизонт і embargo — у свічках цього ТФ.
     """
+    _bar_ms(bar_ms)
     embargo = horizon_bars if embargo_bars is None else embargo_bars
     _bars("horizon_bars", horizon_bars)
     _bars("embargo_bars", embargo)
@@ -289,10 +298,12 @@ def build_split(
         raise ValueError("подовжений відрізок не довший за базовий")
     if type(min_trades_per_fold) is not int or min_trades_per_fold < 1:
         raise ValueError("min_trades_per_fold має бути ціле ≥ 1")
-    if min_train_ms <= embargo * HOUR_MS:
+    if min_train_ms % bar_ms or test_segment_ms % bar_ms or test_segment_extended_ms % bar_ms:
+        raise ValueError("тривалості розбивки мають бути кратні свічці таймфрейму")
+    if min_train_ms <= embargo * bar_ms:
         raise ValueError("мінімальне навчання має бути довше за embargo")
-    holdout_from, holdout_to = holdout_bounds(data_from_ms, data_to_ms, fraction=holdout_fraction)
-    decision_end = holdout_from - horizon_bars * HOUR_MS
+    holdout_from, holdout_to = holdout_bounds(data_from_ms, data_to_ms, fraction=holdout_fraction, bar_ms=bar_ms)
+    decision_end = holdout_from - horizon_bars * bar_ms
     first = data_from_ms + min_train_ms
     if first + test_segment_ms > decision_end:
         raise ValueError("історія не вміщує навчання, тестовий відрізок, запас шляху і hold-out")
@@ -305,6 +316,7 @@ def build_split(
         test_segment_extended_ms=test_segment_extended_ms,
         min_trades_per_fold=min_trades_per_fold,
         count_trades=count_trades,
+        bar_ms=bar_ms,
     )
     return ResearchSplit(
         data_from_ms=data_from_ms,
@@ -314,7 +326,7 @@ def build_split(
         holdout_fraction=holdout_fraction,
         horizon_bars=horizon_bars,
         embargo_bars=embargo,
-        bar_ms=HOUR_MS,
+        bar_ms=bar_ms,
         min_train_ms=min_train_ms,
         test_segment_ms=test_segment_ms,
         test_segment_extended_ms=test_segment_extended_ms,
@@ -680,6 +692,17 @@ async def invalidate_trial(
         return int(inserted.scalar_one())
 
 
+async def sealed_holdout(session: AsyncSession, research_line: str) -> tuple[int, int] | None:
+    """Запечатаний hold-out лінії `[from, to)` або `None`, якщо лінія ще не має експериментів.
+
+    Нові експерименти лінії (інший таргет чи таймфрейм, рішення 0025) мають той самий hold-out: інакше
+    `create_experiment` відмовить. Тож дослідницький раннер ріже дані по кінцю цього вікна.
+    """
+    if not _SYMBOL.fullmatch(research_line):
+        raise ValueError("символ лінії не канонічний")
+    return _sealed_holdout(await _line_windows(session, research_line), await _openings(session, research_line))
+
+
 async def line_trial_count(session: AsyncSession, research_line: str) -> int:
     """Скільки спроб уже є в лінії. Жоден зсув hold-out і жоден підхід цього числа не зменшують."""
     if not _SYMBOL.fullmatch(research_line):
@@ -862,6 +885,7 @@ def _folds(
     test_segment_extended_ms: int,
     min_trades_per_fold: int,
     count_trades: TradeCount,
+    bar_ms: int = HOUR_MS,
 ) -> list[Fold]:
     folds: list[Fold] = []
     cursor = first
@@ -879,7 +903,7 @@ def _folds(
             Fold(
                 index=len(folds),
                 train_start_ms=data_from,
-                embargo_start_ms=cursor - embargo_bars * HOUR_MS,
+                embargo_start_ms=cursor - embargo_bars * bar_ms,
                 test_start_ms=cursor,
                 test_end_ms=end,
                 extended=extended,
@@ -903,8 +927,8 @@ def _count(count_trades: TradeCount, start: int, end: int, decision_end: int) ->
 
 
 def _split_problem(split: ResearchSplit) -> str | None:
-    if split.bar_ms != HOUR_MS:
-        return "валідація v1 лише для 1h"
+    if split.bar_ms not in SUPPORTED_BAR_MS:
+        return "розбивка лише на свічках 1h або 4h"
     if split.horizon_bars < 1 or split.embargo_bars < split.horizon_bars:
         return "embargo коротший за horizon_bars"
     if split.min_trades_per_fold < 1:
@@ -964,7 +988,7 @@ def _fold(split: ResearchSplit, fold_index: int) -> Fold:
 
 def _aligned(row: SampleRow, split: ResearchSplit) -> None:
     if row.time_ms % split.bar_ms != 0:
-        raise ValueError("час рядка не вирівняний за 1h")
+        raise ValueError("час рядка не вирівняний за свічкою таймфрейму розбивки")
 
 
 def _in_any_test(row: SampleRow, split: ResearchSplit) -> bool:
@@ -1303,7 +1327,7 @@ def _experiment_insert(
         id=experiment_id,
         research_line=research_line,
         symbols=symbols,
-        timeframe=_TIMEFRAME,
+        timeframe=TIMEFRAME_NAMES[split.bar_ms],
         label_type=label_type,
         primary_strategy=primary_strategy,
         params=params,
@@ -1404,6 +1428,12 @@ def _millis(name: str, value: object) -> int:
 def _bars(name: str, value: object) -> int:
     if type(value) is not int or value < 1:
         raise ValueError(f"{name} має бути ціле ≥ 1")
+    return value
+
+
+def _bar_ms(value: object) -> int:
+    if type(value) is not int or value not in SUPPORTED_BAR_MS:
+        raise ValueError("таймфрейм розбивки — 1h або 4h (рішення 0025)")
     return value
 
 

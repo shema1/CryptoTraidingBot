@@ -65,7 +65,7 @@ from app.ml.decision import (
     calibrator_from_payload,
     decide_entry,
 )
-from app.ml.features import PREPROCESSING_VERSION, SymbolData, feature_schema_hash
+from app.ml.features import HOUR_MS, PREPROCESSING_VERSION, SymbolData, feature_schema_hash
 from app.ml.meta_model import (
     SIDE_COLUMN,
     HoldoutGrant,
@@ -1333,6 +1333,8 @@ def _require_validation_model(
     split: ResearchSplit,
 ) -> None:
     """Модель допуску — цього експерименту, цього hold-out, вчилась лише до hold-out збереженої розбивки."""
+    if split.bar_ms != HOUR_MS:
+        raise ArtifactError("допуск і перенавчання лише на свічках 1h: 4h — дослідження без допуску (рішення 0025)")
     meta = evidence.metadata_json
     if evidence.model_version != opening.model_version or evidence.experiment_id != opening.experiment_id:
         raise ArtifactError("відкриття не належить моделі допуску")

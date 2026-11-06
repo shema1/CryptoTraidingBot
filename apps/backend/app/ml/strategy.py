@@ -30,6 +30,7 @@ from app.ml.backtest import BacktestReport, EntrySignal, run_backtest
 from app.ml.features import EMA_FAST, EMA_SLOW, FEATURE_LOOKBACK_BARS, HOUR_MS
 from app.ml.trade_sim import EntryCandidate, MetaSample, SimCandle, TargetParams, label_meta
 from app.ml.validation import (
+    SUPPORTED_BAR_MS,
     Fold,
     FoldRecord,
     LabelStats,
@@ -136,13 +137,17 @@ def is_reference_baseline(params: Mapping[str, Any]) -> bool:
 
 
 class SymbolHistory(FrozenModel):
-    """Свічки одного символу для порівняння. Mark і funding — цього самого символу."""
+    """Свічки одного символу для порівняння. Mark і funding — цього самого символу.
+
+    `bar_ms` — таймфрейм свічок (1h або 4h, рішення 0025); кожна свічка й mark — на його сітці від 1970-01-01 UTC.
+    """
 
     symbol: str
     candles: tuple[SimCandle, ...]
     instrument: Instrument
     mark_candles: tuple[SimCandle, ...] | None = None
     funding: tuple[FundingEvent, ...] = ()
+    bar_ms: int = HOUR_MS
 
     @model_validator(mode="after")
     def _own(self) -> SymbolHistory:
@@ -150,18 +155,24 @@ class SymbolHistory(FrozenModel):
             raise ValueError("історія символу порожня")
         if self.instrument.symbol != self.symbol:
             raise ValueError("інструмент іншого символу")
+        if self.bar_ms not in SUPPORTED_BAR_MS:
+            raise ValueError("таймфрейм історії — 1h або 4h")
         previous = -1
         for bar in self.candles:
             if type(bar) is not SimCandle:
                 raise ValueError("свічка має бути SimCandle")
             if bar.open_time_ms <= previous:
                 raise ValueError("свічки мають йти за зростанням часу")
+            if bar.open_time_ms % self.bar_ms != 0:
+                raise ValueError("свічка не на сітці таймфрейму історії")
             previous = bar.open_time_ms
         if self.mark_candles is not None:
             previous = -1
             for bar in self.mark_candles:
                 if type(bar) is not SimCandle or bar.open_time_ms <= previous:
                     raise ValueError("mark-свічки мають йти за зростанням часу")
+                if bar.open_time_ms % self.bar_ms != 0:
+                    raise ValueError("mark-свічка не на сітці таймфрейму історії")
                 previous = bar.open_time_ms
         for event in self.funding:
             if type(event) is not FundingEvent:
@@ -306,6 +317,7 @@ class _Run:
             mark_candles=marks,
             funding=funding,
             cost_factor=cost_factor,
+            bar_ms=history.bar_ms,
         )
 
 
@@ -315,12 +327,16 @@ def primary_side(
     entry_index: int,
     *,
     seed: int = 0,
+    bar_ms: int = HOUR_MS,
 ) -> PositionSide | None:
     """Напрямок входу на `open` свічки `entry_index`, або None. Дані — лише до цієї свічки.
 
     Live (T5.2) передає закриті свічки буфера і індекс свічки, що відкривається.
     `seed` впливає лише на випадковий бейзлайн і є функцією часу входу, не порядкового номера.
+    `bar_ms` — таймфрейм свічок (1h або 4h): періоди правила — у свічках цього ТФ, дірка — крок, довший за свічку.
     """
+    if bar_ms not in SUPPORTED_BAR_MS:
+        raise ValueError("таймфрейм правила — 1h або 4h")
     _spec(spec)
     _seed(seed)
     if type(entry_index) is not int or isinstance(entry_index, bool) or entry_index < 0:
@@ -331,7 +347,7 @@ def primary_side(
         return None
     entry = _bar(candles, entry_index)
     previous = _bar(candles, entry_index - 1)
-    if entry.open_time_ms - previous.open_time_ms != HOUR_MS:
+    if entry.open_time_ms - previous.open_time_ms != bar_ms:
         return None
     if spec.name == "always_flat":
         return None
@@ -340,8 +356,8 @@ def primary_side(
     if spec.name == "random":
         return _random_side(seed, entry.open_time_ms)
     if spec.name == "ema_cross":
-        return _ema_cross(candles, entry_index, spec.fast, spec.slow)
-    return _breakout(candles, entry_index, spec.lookback)
+        return _ema_cross(candles, entry_index, spec.fast, spec.slow, bar_ms=bar_ms)
+    return _breakout(candles, entry_index, spec.lookback, bar_ms=bar_ms)
 
 
 def primary_candidates(
@@ -350,6 +366,7 @@ def primary_candidates(
     *,
     symbol: str,
     seed: int = 0,
+    bar_ms: int = HOUR_MS,
 ) -> tuple[EntryCandidate, ...]:
     """Кандидати для `label_meta`, включно з хвостом ряду. Пропуск шляху міткою не стає."""
     _spec(spec)
@@ -359,7 +376,7 @@ def primary_candidates(
     series = _series(candles)
     found: list[EntryCandidate] = []
     for index in range(1, len(series)):
-        side = primary_side(spec, series, index, seed=seed)
+        side = primary_side(spec, series, index, seed=seed, bar_ms=bar_ms)
         if side is not None:
             found.append(EntryCandidate(entry_index=index, side=side, symbol=symbol))
     return tuple(found)
@@ -371,6 +388,7 @@ def primary_signals(
     *,
     horizon_bars: int,
     seed: int = 0,
+    bar_ms: int = HOUR_MS,
 ) -> tuple[EntrySignal, ...]:
     """Сигнали для `run_backtest`. Хвіст без `horizon_bars` свічок після входу відкинуто за індексом.
 
@@ -381,7 +399,7 @@ def primary_signals(
     last = len(series) - horizon_bars
     found: list[EntrySignal] = []
     for index in range(1, last):
-        side = primary_side(spec, series, index, seed=seed)
+        side = primary_side(spec, series, index, seed=seed, bar_ms=bar_ms)
         if side is not None:
             found.append(EntrySignal(entry_index=index, side=side))
     return tuple(found)
@@ -423,7 +441,7 @@ def executed_trade_count(
     def count(start: int, end: int) -> int:
         if type(start) is not int or type(end) is not int or start >= end:
             raise ValueError("вікно угод порожнє")
-        path_to = end + horizon_bars * HOUR_MS
+        path_to = end + horizon_bars * history.bar_ms
         return min(
             _window_report(
                 history, series, spec, run, start_ms=start, end_ms=end, path_to=path_to, allowed=None
@@ -456,8 +474,8 @@ def backtest_fold_signals(
     """
     if fold.index >= len(split.folds) or split.folds[fold.index] != fold:
         raise ValueError("фолд не з цієї розбивки")
-    if split.bar_ms != HOUR_MS:
-        raise ValueError("правила рахуються на свічках 1h")
+    if split.bar_ms != history.bar_ms:
+        raise ValueError("таймфрейм історії не той, що в розбивці")
     require_decimal("cost_factor", cost_factor, positive=True)
     run = _run(
         horizon_bars=split.horizon_bars,
@@ -518,8 +536,8 @@ def compare_strategies(
     останнім сигналом) і не пізніше за hold-out. `atr_by_index` не передається.
     Стрес витрат сюди не входить: його рахує Gate G1 на вже обраних сигналах.
     """
-    if split.bar_ms != HOUR_MS:
-        raise ValueError("правила рахуються на свічках 1h")
+    if any(history.bar_ms != split.bar_ms for history in histories):
+        raise ValueError("таймфрейм історії не той, що в розбивці")
     run = _run(
         horizon_bars=split.horizon_bars,
         limits=limits,
@@ -535,7 +553,7 @@ def compare_strategies(
     hits: dict[tuple[str, str], tuple[_Hit, ...]] = {}
     for spec in chosen:
         for history in books:
-            found = _hits(spec, history.candles, seed=seed, end_ms=split.decision_end_ms)
+            found = _hits(spec, history.candles, seed=seed, end_ms=split.decision_end_ms, bar_ms=history.bar_ms)
             hits[(history.symbol, spec.name)] = found
             rows = tuple(SampleRow(symbol=history.symbol, time_ms=hit.time_ms, index=hit.index) for hit in found)
             reject_holdout(rows, split, purpose=SplitPurpose.PRIMARY_STRATEGY)
@@ -691,9 +709,9 @@ def _bounded(end: int, length: int) -> tuple[int, int]:
     return max(0, end - length), end
 
 
-def _contiguous(candles: Sequence[SimCandle], start: int, end: int) -> bool:
+def _contiguous(candles: Sequence[SimCandle], start: int, end: int, *, bar_ms: int = HOUR_MS) -> bool:
     for index in range(start + 1, end):
-        if candles[index].open_time_ms - candles[index - 1].open_time_ms != HOUR_MS:
+        if candles[index].open_time_ms - candles[index - 1].open_time_ms != bar_ms:
             return False
     return True
 
@@ -714,12 +732,14 @@ def _ema_cross(
     entry_index: int,
     fast: int | None,
     slow: int | None,
+    *,
+    bar_ms: int = HOUR_MS,
 ) -> PositionSide | None:
     if type(fast) is not int or type(slow) is not int:
         raise ValueError("у перетину EMA немає періодів")
     now_start, now_end = _bounded(entry_index, FEATURE_LOOKBACK_BARS)
     prev_start, prev_end = _bounded(entry_index - 1, FEATURE_LOOKBACK_BARS)
-    if not _contiguous(candles, prev_start, entry_index):
+    if not _contiguous(candles, prev_start, entry_index, bar_ms=bar_ms):
         return None
     now_fast = _ema_last(candles, now_start, now_end, fast)
     now_slow = _ema_last(candles, now_start, now_end, slow)
@@ -734,12 +754,14 @@ def _ema_cross(
     return None
 
 
-def _breakout(candles: Sequence[SimCandle], entry_index: int, lookback: int | None) -> PositionSide | None:
+def _breakout(
+    candles: Sequence[SimCandle], entry_index: int, lookback: int | None, *, bar_ms: int = HOUR_MS
+) -> PositionSide | None:
     if type(lookback) is not int:
         raise ValueError("у пробою немає вікна")
     decision = entry_index - 1
     channel_start = decision - lookback
-    if channel_start < 0 or not _contiguous(candles, channel_start, entry_index):
+    if channel_start < 0 or not _contiguous(candles, channel_start, entry_index, bar_ms=bar_ms):
         return None
     highest = candles[channel_start].high
     lowest = candles[channel_start].low
@@ -763,6 +785,7 @@ def _hits(
     seed: int,
     end_ms: int,
     start_ms: int = 0,
+    bar_ms: int = HOUR_MS,
 ) -> tuple[_Hit, ...]:
     """Сигнали на `[start_ms, end_ms)`. Кожен — з повного ряду; початок вікна лише економить прохід."""
     found: list[_Hit] = []
@@ -771,7 +794,7 @@ def _hits(
         time_ms = candles[index].open_time_ms
         if time_ms >= end_ms:
             break
-        side = primary_side(spec, candles, index, seed=seed)
+        side = primary_side(spec, candles, index, seed=seed, bar_ms=bar_ms)
         if side is not None:
             found.append(_Hit(time_ms=time_ms, index=index, side=side))
     return tuple(found)
@@ -861,10 +884,10 @@ def _fold_path_end(
     змінюють, але розводили б Sharpe барів фолду. Подовження за індексом не дає дірці після
     останнього сигналу викинути його з прогону. Далі за початок hold-out шлях не йде.
     """
-    end = fold.test_end_ms + split.horizon_bars * HOUR_MS
+    end = fold.test_end_ms + split.horizon_bars * split.bar_ms
     if window_hits:
         last = window_hits[-1].index + split.horizon_bars
-        end = max(end, candles[last].open_time_ms + HOUR_MS) if last < len(candles) else split.holdout_from_ms
+        end = max(end, candles[last].open_time_ms + split.bar_ms) if last < len(candles) else split.holdout_from_ms
     return min(end, split.holdout_from_ms)
 
 
@@ -880,7 +903,7 @@ def _window_report(
     allowed: tuple[_Hit, ...] | None,
     cost_factor: Decimal = Decimal(1),
 ) -> BacktestReport:
-    path_from = start_ms - FEATURE_LOOKBACK_BARS * HOUR_MS
+    path_from = start_ms - FEATURE_LOOKBACK_BARS * history.bar_ms
     path = _slice_time(candles, path_from, path_to)
     if not path:
         raise ValueError("немає свічок вікна")
@@ -888,7 +911,7 @@ def _window_report(
     if allowed is None:
         if spec is None:
             raise ValueError("без списку сигналів потрібне правило")
-        allowed = _hits(spec, candles, seed=run.seed, end_ms=end_ms, start_ms=start_ms)
+        allowed = _hits(spec, candles, seed=run.seed, end_ms=end_ms, start_ms=start_ms, bar_ms=history.bar_ms)
     signals: list[EntrySignal] = []
     for hit in allowed:
         index = index_of.get(hit.time_ms)
@@ -910,7 +933,7 @@ def _labeled(
     prefix = tuple(bar for bar in history.candles if bar.open_time_ms < split.holdout_from_ms)
     candidates = [
         candidate
-        for candidate in primary_candidates(spec, prefix, symbol=history.symbol, seed=run.seed)
+        for candidate in primary_candidates(spec, prefix, symbol=history.symbol, seed=run.seed, bar_ms=history.bar_ms)
         if prefix[candidate.entry_index].open_time_ms < split.decision_end_ms
     ]
     marks = None if history.mark_candles is None else _slice_time(history.mark_candles, 0, split.holdout_from_ms)
@@ -921,6 +944,7 @@ def _labeled(
         costs=run.costs,
         mark_candles=marks,
         funding=_slice_funding(history.funding, 0, split.holdout_from_ms),
+        bar_ms=history.bar_ms,
     )
     return {sample.trade.entry_index: sample for sample in labeled.samples}
 

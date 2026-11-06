@@ -403,3 +403,72 @@ def test_no_symbol_crosses_from_the_test_or_the_holdout_into_train(hour: int, sy
         overlaps = fold.test_start_ms <= row.time_ms < fold.test_end_ms or label_overlaps_test(row, split, fold.index)
         if overlaps or is_holdout_row(row, split):
             assert fitting == ()
+
+
+# --- 4h (рішення 0025, T2.19) -------------------------------------------------------------------------------------
+
+H4 = 4 * HOUR
+
+
+def _split_4h(**overrides: object) -> ResearchSplit:
+    values: dict[str, object] = {
+        "data_from_ms": 0,
+        "data_to_ms": 2000 * HOUR,
+        "horizon_bars": 4,
+        "count_trades": _count(),
+        "min_train_ms": 192 * HOUR,
+        "test_segment_ms": 96 * HOUR,
+        "test_segment_extended_ms": 192 * HOUR,
+        "bar_ms": H4,
+    }
+    values.update(overrides)
+    return build_split(**values)  # type: ignore[arg-type]
+
+
+def test_four_hour_split_counts_horizon_and_embargo_in_four_hour_bars() -> None:
+    split = _split_4h()
+    assert split.bar_ms == H4
+    assert split.holdout_from_ms % H4 == 0
+    # Запас шляху перед hold-out і embargo — у свічках ТФ: 4 свічки по 4h = 16 год, не 4 год.
+    assert split.decision_end_ms == split.holdout_from_ms - 4 * H4
+    for fold in split.folds:
+        assert fold.embargo_start_ms == fold.test_start_ms - 4 * H4
+        assert fold.test_start_ms % H4 == 0
+
+
+def test_four_hour_label_reaching_the_test_is_never_train() -> None:
+    split = _split_4h()
+    fold = split.folds[1]
+    # Рядок 4h за 3 свічки до тесту: мітка (4 свічки) дочитує тест — embargo його не пускає в train.
+    near = SampleRow(symbol=BTC, time_ms=fold.test_start_ms - 3 * H4, index=0)
+    far = SampleRow(symbol=BTC, time_ms=fold.embargo_start_ms - H4, index=1)
+    assert label_overlaps_test(near, split, fold.index)
+    assert rows_for([near, far], split, SplitPurpose.TRAIN, fold_index=fold.index) == (far,)
+
+
+def test_four_hour_split_rejects_rows_off_the_four_hour_grid() -> None:
+    split = _split_4h()
+    off_grid = SampleRow(symbol=BTC, time_ms=split.folds[0].test_start_ms + HOUR, index=0)
+    with pytest.raises(ValueError, match="вирівняний"):
+        is_holdout_row(off_grid, split)
+
+
+def test_only_one_and_four_hour_bars_are_supported() -> None:
+    with pytest.raises(ValueError, match="1h або 4h"):
+        _split_4h(bar_ms=2 * HOUR)
+
+
+def test_four_hour_holdout_bounds_align_to_the_bar() -> None:
+    start, end = 0, 1001 * H4
+    holdout_from, holdout_to = holdout_bounds(start, end, bar_ms=H4)
+    assert holdout_to == end
+    assert holdout_from % H4 == 0
+    assert holdout_to - holdout_from >= (end - start) * DEFAULT_HOLDOUT_FRACTION
+    with pytest.raises(ValueError, match="вирівняні"):
+        holdout_bounds(start, end + HOUR, bar_ms=H4)
+
+
+def test_same_window_gives_the_same_holdout_on_one_and_four_hours() -> None:
+    """Варіанти 4h ділять запечатаний hold-out лінії 1h (рішення 0025), якщо межі кратні 4h."""
+    start, end = 0, 9000 * H4
+    assert holdout_bounds(start, end) == holdout_bounds(start, end, bar_ms=H4)

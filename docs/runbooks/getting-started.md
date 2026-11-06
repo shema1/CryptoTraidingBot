@@ -201,6 +201,13 @@ scripts/macos/launch_agents.sh status
 cd apps/backend && uv run python -m app.ml.research iteration-one
 ```
 
+Варіанти таргета й таймфрейму — лише зафіксовані в `docs/decisions/0025-target-and-timeframe-before-iteration-two.md`
+(`--variant A` — 4h 2/1 ATR, `B` — 4h 3/1,5 ATR, `C` — 1h 3/1,5 ATR; без прапорця — `baseline`, 1h 2/1 ATR):
+
+```bash
+cd apps/backend && uv run python -m app.ml.research iteration-one --variant A
+```
+
 Важливо: **кожен прогін назавжди пише спроби в журнал лінії** (N для DSR росте), тож запускати свідомо, не «для
 перевірки». Перший прогін фіксує hold-out лінії (останні 20% вікна): повторний прогін зі свіжішими даними
 відмовить з кодом 14. Hold-out прогін не відкриває. Тривалість — десятки хвилин (CPU). Звіт — `docs/research/<дата>-iteration-one-btc.md`,
