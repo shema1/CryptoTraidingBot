@@ -278,3 +278,245 @@ async def test_four_hour_experiment_is_journaled_as_4h_and_never_opens_the_holdo
             await open_holdout_after_gate(session, experiment_id=experiment_id, trial_id=1, model_version="m")
         openings = (await session.execute(select(func.count()).select_from(HoldoutOpening))).scalar_one()
         assert openings == 0
+
+
+def test_direct_on_four_hours_decides_at_four_hour_opens_with_one_hour_features() -> None:
+    """Ітерація 2 на 4h (T2.20): рядок — відкриття 4h-свічки, фічі — 1h-рядок з тим самим часом, шлях — 4h."""
+    from app.ml.direct_model import evaluate_direct, train_direct
+
+    books, feature_data, split = _four_hour_setup()
+    run = train_direct(
+        books,
+        split=split,  # type: ignore[arg-type]
+        trading_symbol=BTC,
+        limits=_limits(),
+        initial_equity=Decimal(10_000),
+        maintenance_margin_rate=Decimal("0.01"),
+        seed=3,
+        costs=CostModel(),
+        params=TargetParams(horizon_bars=6),
+        feature_data=feature_data,
+    )
+    features = compute_features(feature_data)
+    by_time = {int(time) for time in features.entry_open_time_ms}
+    candles = books[0].candles
+    observations = [row for fold in run.folds for row in fold.observations]
+    assert observations, "argmax LONG/SHORT немає жодного — тест порожній"
+    for row in observations:
+        assert row.time_ms % H4_MS == 0
+        assert row.time_ms in by_time
+        # Індекс рядка — 4h-свічка історії з тим самим часом; ціна входу — її open.
+        assert candles[row.index].open_time_ms == row.time_ms
+        assert row.entry == candles[row.index].open
+    assert sum(fold.train_labels.n_labels for fold in run.folds) > 0
+    # Мітка рядка — симуляція на 4h-свічках (горизонт 6 свічок 4h), а не на 1h.
+    from app.exchange.types import PositionSide
+    from app.ml.trade_sim import label_direct
+
+    labeled = [row for row in observations if row.true_label is not None]
+    assert labeled, "розмічених рядків argmax немає — тест порожній"
+    prefix = tuple(bar for bar in candles if bar.open_time_ms < split.holdout_from_ms)  # type: ignore[attr-defined]
+    for row in labeled[:5]:
+        sample = label_direct(
+            prefix,
+            symbol=BTC,
+            entry_indexes=(row.index,),
+            params=TargetParams(horizon_bars=6),
+            costs=CostModel(),
+            funding=books[0].funding,
+            bar_ms=H4_MS,
+        ).samples[0]
+        simulated = sample.long_trade if row.side is PositionSide.LONG else sample.short_trade
+        assert simulated.meta_label == row.true_label
+    evaluation = evaluate_direct(run, books)
+    for record in evaluation.records:
+        for report in record.reports:
+            for trade in report.trades:
+                assert trade.entry_open_time_ms % H4_MS == 0
+                assert trade.exit_open_time_ms < split.holdout_from_ms  # type: ignore[attr-defined]
+
+
+def test_direct_refuses_history_on_another_timeframe_than_the_split() -> None:
+    from app.ml.direct_model import train_direct
+
+    books, feature_data, split = _four_hour_setup()
+    hourly = SymbolHistory(
+        symbol=BTC,
+        candles=tuple(
+            SimCandle(open_time_ms=bar.open_time_ms, open=bar.open, high=bar.high, low=bar.low, close=bar.close)
+            for bar in books[0].candles
+        ),
+        instrument=books[0].instrument,
+        funding=books[0].funding,
+        bar_ms=HOUR,
+    )
+    with pytest.raises(ValueError, match="таймфрейм історії"):
+        train_direct(
+            (hourly,),
+            split=split,  # type: ignore[arg-type]
+            trading_symbol=BTC,
+            limits=_limits(),
+            initial_equity=Decimal(10_000),
+            maintenance_margin_rate=Decimal("0.01"),
+            seed=3,
+            params=TargetParams(horizon_bars=6),
+            feature_data=feature_data,
+        )
+
+
+def test_direct_admission_model_is_one_hour_only_until_four_hours_passes_g1() -> None:
+    from app.ml.direct_model import fit_frozen_direct
+
+    books, feature_data, split = _four_hour_setup()
+    with pytest.raises(ValueError, match="рішення 0025"):
+        fit_frozen_direct(
+            books,
+            split=split,  # type: ignore[arg-type]
+            trading_symbol=BTC,
+            seed=3,
+            costs=CostModel(),
+            params=TargetParams(horizon_bars=6),
+            feature_data=feature_data,
+        )
+
+
+def _direct_4h(hourly: list[SimCandle]) -> tuple[object, tuple[SymbolHistory, ...], object]:
+    from app.ml.direct_model import train_direct
+
+    history = SymbolHistory(
+        symbol=BTC,
+        candles=aggregate_bars(hourly, H4_MS),
+        instrument=instrument(symbol=BTC),
+        funding=(FundingEvent(time_ms=0, rate=Decimal(0), mark_price=Decimal(100)),),
+        bar_ms=H4_MS,
+    )
+    _books, _feature, split = _four_hour_setup()
+    run = train_direct(
+        (history,),
+        split=split,  # type: ignore[arg-type]
+        trading_symbol=BTC,
+        limits=_limits(),
+        initial_equity=Decimal(10_000),
+        maintenance_margin_rate=Decimal("0.01"),
+        seed=3,
+        costs=CostModel(),
+        params=TargetParams(horizon_bars=6),
+        feature_data={BTC: _feature_data(hourly)},
+    )
+    return run, (history,), split
+
+
+def _scaled(hourly: list[SimCandle], hours: range | list[int]) -> list[SimCandle]:
+    """High, low і close цих годин змінено; open лишається (ціна входу на T відома в момент T)."""
+    changed = list(hourly)
+    for hour in hours:
+        bar = hourly[hour]
+        changed[hour] = SimCandle(
+            open_time_ms=bar.open_time_ms, open=bar.open, high=bar.high * 3, low=bar.low / 3, close=bar.close * 2
+        )
+    return changed
+
+
+def test_hours_inside_the_four_hour_candle_t_never_change_the_direct_decision_at_t() -> None:
+    """Рев'ю T2.20, наскрізно через `direct`: години [T, T+4h) не змінюють жодного рядка з часом ≤ T, а T−1h — змінює.
+
+    Мітка рядка, чий шлях заходить за T, — законно майбутнє; її з порівняння прибираємо.
+    """
+    from app.ml.direct_model import evaluate_direct
+
+    hourly = _random_walk(12000, seed=11)
+    base, books, _split = _direct_4h(hourly)
+    last = base.folds[-1]  # type: ignore[attr-defined]
+    assert last.observations, "у останньому фолді немає рядків argmax — тест порожній"
+    entry = last.observations[len(last.observations) // 2].time_ms
+    changed, changed_books, _ = _direct_4h(_scaled(hourly, range(entry // HOUR, entry // HOUR + 4)))
+
+    def rows(run: object) -> list[tuple[object, ...]]:
+        return [
+            (
+                row.symbol,
+                row.time_ms,
+                row.side,
+                row.raw_probability,
+                row.true_label if row.time_ms + 6 * H4_MS < entry else None,
+                row.entry,
+                row.atr,
+            )
+            for fold in run.folds  # type: ignore[attr-defined]
+            for row in fold.observations
+            if row.time_ms <= entry
+        ]
+
+    assert rows(base) == rows(changed)
+    before = evaluate_direct(base, books)  # type: ignore[arg-type]
+    after = evaluate_direct(changed, changed_books)  # type: ignore[arg-type]
+    assert [None if rule is None else rule.rule.metadata() for rule in before.rules] == [
+        None if rule is None else rule.rule.metadata() for rule in after.rules
+    ]
+    # Тест не порожній: година T−1h — уже дані рішення на T.
+    earlier, _, _ = _direct_4h(_scaled(hourly, [entry // HOUR - 1]))
+    at_t = [row for row in earlier.folds[-1].observations if row.time_ms == entry]  # type: ignore[attr-defined]
+    original = next(row for row in last.observations if row.time_ms == entry)
+    assert not at_t or at_t[0].raw_probability != original.raw_probability
+
+
+def test_holdout_prices_never_reach_the_direct_model_on_four_hours() -> None:
+    """Рев'ю T2.20: ціни hold-out (усі 1h від `holdout_from_ms`) не змінюють ні рядків, ні правил, ні угод фолдів."""
+    from app.ml.direct_model import evaluate_direct
+
+    hourly = _random_walk(12000, seed=11)
+    base, books, split = _direct_4h(hourly)
+    first = split.holdout_from_ms // HOUR  # type: ignore[attr-defined]
+    changed, changed_books, _ = _direct_4h(_scaled(hourly, range(first, len(hourly))))
+    assert [fold.observations for fold in base.folds] == [  # type: ignore[attr-defined]
+        fold.observations
+        for fold in changed.folds  # type: ignore[attr-defined]
+    ]
+    before = evaluate_direct(base, books)  # type: ignore[arg-type]
+    after = evaluate_direct(changed, changed_books)  # type: ignore[arg-type]
+    assert before.decision is not None
+    assert after.decision is not None
+    assert before.decision.rule.metadata() == after.decision.rule.metadata()
+    assert before.records == after.records
+
+
+def test_direct_uniqueness_weights_use_four_hour_label_spans(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Рев'ю T2.20: кінці міток для ваг унікальності — у свічках 4h (на 1h-сітці ваги тихо інші)."""
+    from app.ml import direct_model
+
+    seen: list[int] = []
+    original = direct_model.label_span_direct
+
+    def spy(symbol: str, sample: object, *, bar_ms: int = HOUR) -> object:
+        seen.append(bar_ms)
+        return original(symbol, sample, bar_ms=bar_ms)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(direct_model, "label_span_direct", spy)
+    _direct_4h(_random_walk(12000, seed=11))
+    assert seen
+    assert set(seen) == {H4_MS}
+
+
+def test_direct_holdout_signals_refuse_four_hours() -> None:
+    from app.ml.direct_model import FrozenDirectFit, _holdout_signals
+
+    books, feature_data, split = _four_hour_setup()
+    fit = FrozenDirectFit(
+        model=None,  # type: ignore[arg-type]
+        n_rows=0,
+        row_times_ms=(),
+        lgbm={},
+        include_holdout=False,
+        coverage_ms=(0, 1),
+    )
+    with pytest.raises(ValueError, match="рішення 0025"):
+        _holdout_signals(
+            fit,
+            None,  # type: ignore[arg-type]
+            books,
+            split=split,  # type: ignore[arg-type]
+            trading_symbol=BTC,
+            costs=CostModel(),
+            params=TargetParams(horizon_bars=6),
+            feature_data=feature_data,
+        )

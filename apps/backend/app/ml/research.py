@@ -1,6 +1,6 @@
-"""Дослідницький прогін на ринкових даних з БД (T2.14; ТЗ §5А.3 п. 2–10, §5А.11 п. 1; T2.12 (а), (б)).
+"""Дослідницький прогін на ринкових даних з БД (T2.14, T2.20; ТЗ §5А.3 п. 2–10, 13, §5А.11; T2.12 (а), (б)).
 
-`python -m app.ml.research iteration-one`:
+`python -m app.ml.research iteration-one [--variant …]`:
 
 1. Читає з БД свічки 1h, mark, funding, деривативи і кеш інструментів (`demo`) для `TRADING_SYMBOL` і
    `RESEARCH_SYMBOLS` (`load_research_inputs`). Дані заздалегідь качає воркер: `python -m app.jobs.enqueue market-data`.
@@ -9,6 +9,13 @@
 3. `run_iteration_one`: каталог бейзлайнів і кандидатів → вибір 1–2 правил → meta-експеримент на кожне → перегляд
    Gate G1 без запису. Кожна спроба — у журналі лінії, тож N для DSR росте з кожним запуском: запускати свідомо.
 4. Звіт для людини — Markdown у `docs/research/` (шлях — у лозі `research_report_written`, `logs/research/`).
+
+`python -m app.ml.research iteration-two --variant …` (T2.20): ті самі дані й та сама розбивка, що в ітерації 1 цього
+варіанта; звіт ітерації 1 відновлюється з журналу (`iteration_one_from_journal`: рівно один каталог на тих самих фолдах,
+таргеті, витратах, символах і seed і його meta-спроби, перегляди G1 — на поточному журналі). Ітерація 2
+(`run_iteration_two`, пряме 3-класове прогнозування) — лише варіант, обраний після ітерації 1 (`ITERATION_TWO_VARIANTS`,
+рішення 0025), лише якщо ітерація 1 не пройшла G1, hold-out лінії ще не відкривали й ітерацію 2 на цих фолдах ще не
+проганяли; інакше код 16 без запису (`REFUSAL_HINTS`). Одна спроба `direct` у журналі лінії.
 
 Hold-out не відкривається ніколи: рішення відкрити його приймає людина окремим викликом `open_holdout_after_gate`
 (ТЗ §5А.10). На одній БД одночасно працює лише один прогін (advisory lock `RESEARCH_LOCK_ID`).
@@ -20,7 +27,9 @@ Hold-out не відкривається ніколи: рішення відкр
 Коди виходу: 0 — прогін завершено (незалежно від вердикту G1); 1 — необроблений виняток; 2 — аргументи;
 10 — інший прогін уже працює; 11 — БД недоступна; 12 — lock прогону втрачено до кінця (звіт з попередженням);
 13 — даних бракує для розбивки; 14 — розбивку відхилено (зазвичай hold-out лінії вже зафіксований попереднім
-прогоном, а нове вікно даних дає інший: повторний прогін лінії — рішення людини, T2.17); 15 — конфіг невалідний.
+прогоном, а нове вікно даних дає інший: повторний прогін лінії — рішення людини, T2.17); 15 — конфіг невалідний;
+16 — ітерацію 2 не запущено: ітерації 1 цього варіанта в журналі немає, вона неоднозначна чи не збігається з даними,
+пройшла G1, hold-out лінії вже відкривали або ітерацію 2 на цих фолдах уже прогнано.
 """
 
 from __future__ import annotations
@@ -46,14 +55,22 @@ from app.core.instance_lock import LOCK_NAMESPACE, RESEARCH_LOCK_ID
 from app.core.logging import configure_logging, get_logger, shutdown_logging
 from app.data.backfill import backfill_symbols
 from app.ml.decision import ENTRY_RULE_WARMUP_FOLDS
+from app.ml.features import HOUR_MS
+from app.ml.models import ExperimentTrial
 from app.ml.optuna_search import OptunaDataError, OptunaInputs, load_research_inputs
 from app.ml.research_cycle import (
     CHANGE_LINE_OR_TIMEFRAME,
     ITERATION_TWO,
     WAIT_FOR_HUMAN_HOLDOUT,
     IterationOneReport,
+    IterationTwoReport,
+    JournalMismatch,
     RuleResult,
+    SessionFactory,
+    direct_runs_on_same_folds,
+    iteration_one_from_journal,
     run_iteration_one,
+    run_iteration_two,
 )
 from app.ml.statistics import (
     DSR_MIN,
@@ -73,9 +90,11 @@ from app.ml.statistics import (
     MIN_OOS_TRADES,
     PBO_MAX,
     PROFITABLE_FOLD_SHARE,
+    FoldOutcome,
     GateThresholds,
+    fold_outcomes_from_metrics,
 )
-from app.ml.strategy import RuleReport, StrategyComparison
+from app.ml.strategy import RuleReport, StrategyComparison, SymbolHistory
 from app.ml.trade_sim import TargetParams
 from app.ml.validation import (
     H4_MS,
@@ -96,8 +115,10 @@ EXIT_LOCK_LOST: Final = 12
 EXIT_DATA: Final = 13
 EXIT_SPLIT_REJECTED: Final = 14
 EXIT_CONFIG_INVALID: Final = 15
+EXIT_ITERATION_TWO_REFUSED: Final = 16
 
 COMMAND_ITERATION_ONE: Final = "iteration-one"
+COMMAND_ITERATION_TWO: Final = "iteration-two"
 REPORT_DIR: Final = REPO_ROOT / "docs" / "research"
 # Параметри рахунку бектесту за замовчуванням (не live). Розмір угоди задає ризик 0,5% (ТЗ §8.2), тож межа номіналу
 # символу з запасом не обмежує угоди на 10 000 USDT; підтримуюча маржа 1% — консервативніша за 0,5% першого тиру BTC.
@@ -129,7 +150,10 @@ NEXT_STEP_TEXT: Final[Mapping[str, str]] = {
         "Хоча б одне правило пройшло перегляд G1 на порогах ТЗ. Рішення відкрити hold-out (≤ 2 відкриттів на лінію) "
         "приймає людина окремим викликом `open_holdout_after_gate`; спершу — модель допуску (`fit_frozen_meta`)."
     ),
-    CHANGE_LINE_OR_TIMEFRAME: "Ітерація 2 теж не пройшла: змінити символ або таймфрейм (ТЗ §5А.11 п. 3).",
+    CHANGE_LINE_OR_TIMEFRAME: (
+        "Ітерація 2 теж не пройшла перегляд G1. За ТЗ §5А.11 далі — інший торговий символ або таймфрейм, а після 2–3 "
+        "розумних ітерацій без переваги — висновок «моделі для торгівлі немає». Hold-out не відкривати."
+    ),
 }
 
 _LOG = get_logger("app.ml.research")
@@ -137,6 +161,39 @@ _LOG = get_logger("app.ml.research")
 
 class ResearchLockHeld(Exception):
     """Інший дослідницький прогін на цій БД ще працює."""
+
+
+class IterationTwoRefused(Exception):
+    """Ітерацію 2 не запущено (код 16) — до будь-якого запису. `kind` вибирає підказку людині.
+
+    `missing` / `ambiguous` / `inconsistent` / `repeated` — з `JournalMismatch`; `passed` — ітерація 1 пройшла
+    перегляд G1; `holdout_opened` — hold-out лінії вже відкривали.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+REFUSAL_HINTS: Final[Mapping[str, str]] = {
+    "missing": "спершу python -m app.ml.research iteration-one з тим самим --variant і --seed (ТЗ §5А.3 п. 13)",
+    "ambiguous": "ітерацію 1 прогнали кілька разів на тих самих фолдах: який прогін брати — рішення людини",
+    "inconsistent": "журнал не збігається з даними прогону: розібратись; iteration-one повторно не запускати (+N)",
+    "repeated": "ітерацію 2 цього варіанта вже прогнано: повтор з іншим seed — прихований вибір, лише новим рішенням",
+    "passed": "ітерація 1 пройшла перегляд G1: далі — рішення людини про hold-out (T2.18), не ітерація 2",
+    "holdout_opened": "hold-out лінії вже відкривали: нова ітерація після відкриття — підгонка під нього",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class IterationTwoRun:
+    """Ітерація 2 і що з журналу треба людині: відновлена ітерація 1, фолди спроби `direct` (торговий символ)."""
+
+    after: IterationOneReport
+    report: IterationTwoReport
+    folds: tuple[FoldOutcome, ...]
+    n_observations: tuple[int, ...]
+    flat_rows: tuple[int, ...]
 
 
 def research_limits(*, min_equity_usd: Decimal, max_notional_per_symbol_usd: Decimal) -> RiskLimits:
@@ -203,25 +260,47 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
                 data_from_ms=inputs.split.data_from_ms,
                 holdout_from_ms=inputs.split.holdout_from_ms,
             )
-            report = await run_iteration_one(
-                sessions,
-                inputs.histories,
-                split=inputs.split,
-                trading_symbol=settings.trading_symbol,
-                limits=limits,
-                initial_equity=args.initial_equity,
-                maintenance_margin_rate=args.maintenance_margin_rate,
-                seed=args.seed,
-                costs=costs,
-                params=target,
-                feature_data=inputs.feature_data,
-            )
+            outcome: IterationOneReport | IterationTwoRun
+            if args.command == COMMAND_ITERATION_TWO:
+                outcome = await iteration_two(
+                    sessions,
+                    inputs,
+                    trading_symbol=settings.trading_symbol,
+                    limits=limits,
+                    initial_equity=args.initial_equity,
+                    maintenance_margin_rate=args.maintenance_margin_rate,
+                    seed=args.seed,
+                    target=target,
+                    costs=costs,
+                )
+            else:
+                outcome = await run_iteration_one(
+                    sessions,
+                    inputs.histories,
+                    split=inputs.split,
+                    trading_symbol=settings.trading_symbol,
+                    limits=limits,
+                    initial_equity=args.initial_equity,
+                    maintenance_margin_rate=args.maintenance_margin_rate,
+                    seed=args.seed,
+                    costs=costs,
+                    params=target,
+                    feature_data=inputs.feature_data,
+                )
             async with sessions() as session:
                 n_line = await line_trial_count(session, settings.trading_symbol)
             lock_held = await _lock_still_held(lock_connection)
     except ResearchLockHeld:
         _LOG.error("research_lock_held", hint="інший прогін python -m app.ml.research ще працює")
         return EXIT_LOCK_HELD
+    except IterationTwoRefused as exc:
+        _LOG.error(
+            "research_iteration_two_refused",
+            kind=exc.kind,
+            error=str(exc),
+            hint=REFUSAL_HINTS.get(exc.kind, ""),
+        )
+        return EXIT_ITERATION_TWO_REFUSED
     except OptunaDataError as exc:
         _LOG.error("research_data_insufficient", error=str(exc), hint="python -m app.jobs.enqueue market-data")
         return EXIT_DATA
@@ -240,18 +319,39 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
         f"{args.variant}-{TIMEFRAME_NAMES[bar_ms]}-tp{_fmt_mult(target.tp_atr_mult)}"
         f"-sl{_fmt_mult(target.sl_atr_mult)}-h{target.horizon_bars}"
     )
-    path = args.report or REPORT_DIR / f"{_date(finished)}-iteration-one-{_slug(settings.trading_symbol)}-{variant}.md"
-    markdown = render_iteration_one(
-        report,
-        inputs,
-        trading_symbol=settings.trading_symbol,
-        n_line_trials=n_line,
-        initial_equity=args.initial_equity,
-        target=target,
-        costs=costs,
-        started_ms=started,
-        finished_ms=finished,
-    )
+    path = args.report or REPORT_DIR / f"{_date(finished)}-{args.command}-{_slug(settings.trading_symbol)}-{variant}.md"
+    if isinstance(outcome, IterationTwoRun):
+        markdown = render_iteration_two(
+            outcome,
+            inputs,
+            trading_symbol=settings.trading_symbol,
+            n_line_trials=n_line,
+            initial_equity=args.initial_equity,
+            target=target,
+            costs=costs,
+            started_ms=started,
+            finished_ms=finished,
+        )
+        next_step = outcome.report.next_step
+        passed = [outcome.report.experiment.spec_name] if outcome.report.experiment.passed else []
+        hold_out_opened = outcome.report.hold_out_opened
+        chosen_rules: list[str] = []
+    else:
+        markdown = render_iteration_one(
+            outcome,
+            inputs,
+            trading_symbol=settings.trading_symbol,
+            n_line_trials=n_line,
+            initial_equity=args.initial_equity,
+            target=target,
+            costs=costs,
+            started_ms=started,
+            finished_ms=finished,
+        )
+        next_step = outcome.next_step
+        passed = [rule.spec_name for rule in outcome.rules if rule.passed]
+        hold_out_opened = outcome.hold_out_opened
+        chosen_rules = [spec.name for spec in outcome.selection.chosen]
     if not lock_held:
         # Спроби вже в журналі (N їх рахує), але звіт міг не побачити спроб паралельного прогону.
         markdown = (
@@ -263,17 +363,85 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
     _LOG.info(
         "research_report_written",
         path=str(path),
-        next_step=report.next_step,
-        chosen=[spec.name for spec in report.selection.chosen],
-        passed=[rule.spec_name for rule in report.rules if rule.passed],
+        command=args.command,
+        next_step=next_step,
+        chosen=chosen_rules,
+        passed=passed,
         n_line_trials=n_line,
         duration_ms=finished - started,
-        hold_out_opened=report.hold_out_opened,
+        hold_out_opened=hold_out_opened,
     )
     if not lock_held:
         _LOG.error("research_lock_lost", path=str(path))
         return EXIT_LOCK_LOST
     return EXIT_OK
+
+
+async def iteration_two(
+    sessions: SessionFactory,
+    inputs: OptunaInputs,
+    *,
+    trading_symbol: str,
+    limits: RiskLimits,
+    initial_equity: Decimal,
+    maintenance_margin_rate: Decimal,
+    seed: int,
+    target: TargetParams,
+    costs: CostModel,
+) -> IterationTwoRun:
+    """Ітерація 2 на розбивці ітерації 1 цього варіанта. Відмова (`IterationTwoRefused`) — до будь-якого запису.
+
+    Звіт ітерації 1 — з журналу (`iteration_one_from_journal`: ті самі фолди, таргет, витрати, символи й seed), не з
+    пам'яті й не з аргументів. Hold-out лінії вже відкривали, ітерація 1 пройшла перегляд G1 або ітерацію 2 на цих
+    фолдах уже прогнано — ітерація 2 не запускається (ТЗ §5А.3 п. 13, §5А.10; T2.20).
+    """
+    async with sessions() as session:
+        try:
+            after = await iteration_one_from_journal(
+                session,
+                split=inputs.split,
+                trading_symbol=trading_symbol,
+                symbols=tuple(history.symbol for history in inputs.histories),
+                seed=seed,
+                target=target,
+                costs=costs,
+            )
+            earlier = await direct_runs_on_same_folds(
+                session, split=inputs.split, trading_symbol=trading_symbol, target=target, costs=costs
+            )
+        except JournalMismatch as exc:
+            raise IterationTwoRefused(exc.kind, str(exc)) from exc
+    if after.hold_out_opened:
+        raise IterationTwoRefused("holdout_opened", "hold-out лінії вже відкривали")
+    if after.next_step != ITERATION_TWO:
+        raise IterationTwoRefused("passed", "ітерація 1 пройшла перегляд G1")
+    if earlier:
+        raise IterationTwoRefused("repeated", f"ітерацію 2 на цих фолдах уже прогнано: {', '.join(earlier)}")
+    report = await run_iteration_two(
+        sessions,
+        inputs.histories,
+        after=after,
+        split=inputs.split,
+        trading_symbol=trading_symbol,
+        limits=limits,
+        initial_equity=initial_equity,
+        maintenance_margin_rate=maintenance_margin_rate,
+        seed=seed,
+        costs=costs,
+        params=target,
+        feature_data=inputs.feature_data,
+    )
+    async with sessions() as session:
+        trial = await session.get(ExperimentTrial, report.experiment.trial_id)
+    if trial is None:
+        raise RuntimeError("спроби ітерації 2 немає в журналі після запису")
+    return IterationTwoRun(
+        after=after,
+        report=report,
+        folds=fold_outcomes_from_metrics(trial.metrics),
+        n_observations=tuple(int(item) for item in trial.params.get("n_observations", ())),
+        flat_rows=tuple(int(item) for item in trial.params.get("flat_rows", ())),
+    )
 
 
 async def _lock_still_held(connection: AsyncConnection) -> bool:
@@ -320,26 +488,16 @@ def render_iteration_one(
         + ("Hold-out **відкривався**." if report.hold_out_opened else "Hold-out **не відкривався**.")
         + " Кожна спроба нижче вже записана в журнал лінії й рахується в N для DSR.",
         "",
-        "## Дані й розбивка",
-        "",
-        f"- Символи: {', '.join(item.symbol for item in inputs.histories)}; рішення — за {trading_symbol}.",
-        f"- Спільне вікно свічок: {_date(split.data_from_ms)} … {_date(split.data_to_ms)} (UTC).",
-        f"- Hold-out (запечатаний): {_date(split.holdout_from_ms)} … {_date(split.holdout_to_ms)} "
-        f"({_pct(split.holdout_fraction)} історії).",
-        f"- Walk-forward: {len(split.folds)} фолдів, перший тест з {_date(split.folds[0].test_start_ms)}, "
-        f"подовжених до 6 міс.: {sum(1 for fold in split.folds if fold.extended)}; "
-        f"embargo {split.embargo_bars} свічок; "
-        f"мінімум угод на фолд {split.min_trades_per_fold}. Два перші фолди — прогрів правила входу (рішення 0024).",
-        f"- Таймфрейм рішень і симуляції: {_timeframe_label(split.bar_ms)} "
-        "(фічі — 1h-ряд на відкритті свічки, рішення 0025).",
-        f"- Таргет: TP {target.tp_atr_mult}·ATR, SL {target.sl_atr_mult}·ATR (ATR цього таймфрейму), "
-        f"горизонт {target.horizon_bars} свічок.",
-        f"- Витрати: taker {_pct(costs.taker_fee_rate)} за сторону, slippage входу {costs.slippage_entry_atr}·ATR, "
-        f"SL {costs.stop_slippage_atr}·ATR, TP {costs.slippage_tp_atr}·ATR.",
-        f"- Рахунок бектесту: {initial_equity} USDT, ліміти Risk Engine за замовчуванням (ризик 0,5% на угоду).",
-        f"- Спроб у лінії {trading_symbol} після прогону: **{n_line_trials}**. "
-        f"Тривалість: {round((finished_ms - started_ms) / 60_000)} хв.",
-        "",
+        *_data_section(
+            inputs,
+            trading_symbol=trading_symbol,
+            n_line_trials=n_line_trials,
+            initial_equity=initial_equity,
+            target=target,
+            costs=costs,
+            started_ms=started_ms,
+            finished_ms=finished_ms,
+        ),
     ]
     if report.comparison is not None:
         lines.extend(_comparison_section(report.comparison))
@@ -358,6 +516,130 @@ def render_iteration_one(
         ]
     )
     return "\n".join(lines)
+
+
+def render_iteration_two(
+    outcome: IterationTwoRun,
+    inputs: OptunaInputs,
+    *,
+    trading_symbol: str,
+    n_line_trials: int,
+    initial_equity: Decimal,
+    target: TargetParams,
+    costs: CostModel,
+    started_ms: int,
+    finished_ms: int,
+) -> str:
+    """Звіт ітерації 2 людині. Числа — з журналу спроби `direct` і переглядів G1, без оцінок поза порогами ТЗ."""
+    split = inputs.split
+    report = outcome.report
+    after = outcome.after
+    rule = report.experiment
+    warmup = rule.preview.decision.warmup_folds
+    lines: list[str] = [
+        f"# Ітерація 2 (пряме прогнозування) на ринкових даних — {trading_symbol}, {_date(finished_ms)}",
+        "",
+        "> Згенеровано `python -m app.ml.research iteration-two` (T2.20). "
+        + ("Hold-out **відкривався**." if report.hold_out_opened else "Hold-out **не відкривався**.")
+        + " Спроба нижче вже записана в журнал лінії й рахується в N для DSR.",
+        "",
+        *_data_section(
+            inputs,
+            trading_symbol=trading_symbol,
+            n_line_trials=n_line_trials,
+            initial_equity=initial_equity,
+            target=target,
+            costs=costs,
+            started_ms=started_ms,
+            finished_ms=finished_ms,
+        ),
+        "## Ітерація 1 цього варіанта (з журналу)",
+        "",
+        "Каталог: "
+        + ", ".join(f"`{item}`" for item in sorted({trial.experiment_id for trial in after.comparison_trials}))
+        + "; обрано для meta: "
+        + ", ".join(f"`{spec.name}`" for spec in after.selection.chosen)
+        + ". Перегляд G1 — на журналі перед ітерацією 2 (з новими спробами лінії може відрізнятися від звіту "
+        "ітерації 1 в обидва боки):",
+        "",
+        *_rules_section(after.rules, split),
+        "## Пряме 3-класове прогнозування (`direct`) — фолди торгового символу",
+        "",
+        "Одна LightGBM `multiclass` (FLAT / LONG / SHORT) на всіх свічках символів; сторона — argmax з унікальним "
+        "максимумом, вхід — те саме правило входу, що в meta, підігнане лише на минулих фолдах (рішення 0024).",
+        "",
+        "| Фолд | Тест (UTC) | Рядків LONG/SHORT | FLAT | Угод | Чистий, USDT | PF |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for index, fold in enumerate(split.folds):
+        result = outcome.folds[index] if index < len(outcome.folds) else None
+        observed = outcome.n_observations[index] if index < len(outcome.n_observations) else None
+        flat = outcome.flat_rows[index] if index < len(outcome.flat_rows) else None
+        label = f"{index}" + (" (прогрів)" if index < warmup else "")
+        lines.append(
+            f"| {label} | {_date(fold.test_start_ms)} … {_date(fold.test_end_ms)} "
+            f"| {'—' if observed is None else observed} | {'—' if flat is None else flat} "
+            f"| {'—' if result is None else result.n_trades} "
+            f"| {'—' if result is None else _fmt(result.total_net_usd)} "
+            f"| {'—' if result is None else _fmt(result.profit_factor)} |"
+        )
+    lines.extend(["", "## Перегляд Gate G1 ітерації 2", ""])
+    lines.extend(_rules_section((rule,), split))
+    lines.extend(
+        [
+            "## Висновок",
+            "",
+            f"Наступний крок (`{report.next_step}`): {NEXT_STEP_TEXT.get(report.next_step, report.next_step)}",
+            "",
+        ]
+    )
+    if rule.passed and split.bar_ms != HOUR_MS:
+        lines.extend(
+            [
+                "Допуск hold-out, артефакт і live для 4h ще не підтримуються (рішення 0025): спершу окрема задача.",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _data_section(
+    inputs: OptunaInputs,
+    *,
+    trading_symbol: str,
+    n_line_trials: int,
+    initial_equity: Decimal,
+    target: TargetParams,
+    costs: CostModel,
+    started_ms: int,
+    finished_ms: int,
+) -> list[str]:
+    split = inputs.split
+    return [
+        "## Дані й розбивка",
+        "",
+        f"- Символи: {', '.join(item.symbol for item in inputs.histories)}; рішення — за {trading_symbol}.",
+        f"- Спільне вікно свічок: {_date(split.data_from_ms)} … {_date(split.data_to_ms)} (UTC).",
+        f"- Hold-out (запечатаний): {_date(split.holdout_from_ms)} … {_date(split.holdout_to_ms)} "
+        f"({_pct(split.holdout_fraction)} історії).",
+        f"- Walk-forward: {len(split.folds)} фолдів, перший тест з {_date(split.folds[0].test_start_ms)}, "
+        f"подовжених до 6 міс.: {sum(1 for fold in split.folds if fold.extended)}; "
+        f"embargo {split.embargo_bars} свічок; "
+        f"мінімум угод на фолд {split.min_trades_per_fold}. Два перші фолди — прогрів правила входу (рішення 0024).",
+        f"- Таймфрейм рішень і симуляції: {_timeframe_label(split.bar_ms)} "
+        "(фічі — 1h-ряд на відкритті свічки, рішення 0025).",
+        "- Пропущених свічок ТФ у вікні (дірки даних або неповні 4h-кошики, без інтерполяції): "
+        + "; ".join(f"{_slug(item.symbol).upper()} {_missing_bars(item, split)}" for item in inputs.histories)
+        + ".",
+        f"- Таргет: TP {target.tp_atr_mult}·ATR, SL {target.sl_atr_mult}·ATR (ATR цього таймфрейму), "
+        f"горизонт {target.horizon_bars} свічок.",
+        f"- Витрати: taker {_pct(costs.taker_fee_rate)} за сторону, slippage входу {costs.slippage_entry_atr}·ATR, "
+        f"SL {costs.stop_slippage_atr}·ATR, TP {costs.slippage_tp_atr}·ATR.",
+        f"- Рахунок бектесту: {initial_equity} USDT, ліміти Risk Engine за замовчуванням (ризик 0,5% на угоду).",
+        f"- Спроб у лінії {trading_symbol} після прогону: **{n_line_trials}**. "
+        f"Тривалість: {round((finished_ms - started_ms) / 60_000)} хв.",
+        "",
+    ]
 
 
 def _comparison_section(comparison: StrategyComparison) -> list[str]:
@@ -449,8 +731,22 @@ VARIANTS: Final[Mapping[str, Variant]] = {
 }
 
 
+# Ітерація 2 — лише на таргеті, обраному після ітерації 1 (рішення 0025, «Результат»: B). Інший варіант — нове
+# рішення: ітерація 2 на кожному варіанті по черзі — прихований вибір кращого.
+ITERATION_TWO_VARIANTS: Final[tuple[str, ...]] = ("B",)
+
+
 def _timeframe_label(bar_ms: int) -> str:
     return TIMEFRAME_NAMES.get(bar_ms, f"{bar_ms} мс")
+
+
+def _missing_bars(history: SymbolHistory, split: ResearchSplit) -> int:
+    """Скільки свічок ТФ бракує у вікні даних розбивки від першої свічки символу (кошик з діркою — пропуск)."""
+    inside = [bar.open_time_ms for bar in history.candles if split.data_from_ms <= bar.open_time_ms < split.data_to_ms]
+    if not inside:
+        return 0
+    expected = (split.data_to_ms - inside[0]) // split.bar_ms
+    return max(expected - len(inside), 0)
 
 
 def _fmt_mult(value: Decimal) -> str:
@@ -512,18 +808,28 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     one = commands.add_parser(COMMAND_ITERATION_ONE, help="бейзлайни, вибір правила, meta-модель, перегляд G1")
-    one.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    one.add_argument("--initial-equity", type=_decimal, default=DEFAULT_INITIAL_EQUITY)
-    one.add_argument("--maintenance-margin-rate", type=_decimal, default=DEFAULT_MAINTENANCE_MARGIN_RATE)
-    one.add_argument("--min-equity-usd", type=_decimal, default=DEFAULT_MIN_EQUITY_USD)
-    one.add_argument("--max-notional-per-symbol-usd", type=_decimal, default=DEFAULT_MAX_NOTIONAL_PER_SYMBOL_USD)
-    one.add_argument(
-        "--variant",
-        choices=sorted(VARIANTS),
-        default="baseline",
-        help="зафіксований варіант таргета й таймфрейму (рішення 0025): baseline, A, B або C",
+    two = commands.add_parser(
+        COMMAND_ITERATION_TWO,
+        help="пряме 3-класове прогнозування на фолдах ітерації 1 того самого варіанта (з журналу), перегляд G1",
     )
-    one.add_argument("--report", type=Path, default=None, help="куди записати звіт Markdown")
+    for command, variants, default in (
+        (one, sorted(VARIANTS), "baseline"),
+        (two, list(ITERATION_TWO_VARIANTS), ITERATION_TWO_VARIANTS[0]),
+    ):
+        command.add_argument("--seed", type=int, default=DEFAULT_SEED)
+        command.add_argument("--initial-equity", type=_decimal, default=DEFAULT_INITIAL_EQUITY)
+        command.add_argument("--maintenance-margin-rate", type=_decimal, default=DEFAULT_MAINTENANCE_MARGIN_RATE)
+        command.add_argument("--min-equity-usd", type=_decimal, default=DEFAULT_MIN_EQUITY_USD)
+        command.add_argument(
+            "--max-notional-per-symbol-usd", type=_decimal, default=DEFAULT_MAX_NOTIONAL_PER_SYMBOL_USD
+        )
+        command.add_argument(
+            "--variant",
+            choices=variants,
+            default=default,
+            help="зафіксований варіант таргета й таймфрейму (рішення 0025): " + ", ".join(variants),
+        )
+        command.add_argument("--report", type=Path, default=None, help="куди записати звіт Markdown")
     return parser.parse_args(list(argv) if argv is not None else None)
 
 

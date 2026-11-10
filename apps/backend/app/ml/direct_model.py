@@ -17,6 +17,11 @@
 Рецепт — журнальний LightGBM без ранньої зупинки і без Optuna (рішення 0021): першу модель навчаємо
 стандартними параметрами (§5А.3 п. 6). `device=cpu`.
 
+Таймфрейм рішень — 1h або 4h (рішення 0025, T2.20): на 4h рядок — відкриття 4h-свічки T, мітка, ATR(t−1),
+шлях угоди й бектест — на 4h-свічках історії (`SymbolHistory.bar_ms` = `ResearchSplit.bar_ms`), фічі — рядок
+1h `compute_features()` з `entry_open_time_ms = T`, як у meta. Допуск (`fit_frozen_direct`), артефакт і live для
+4h — відмова, доки варіант 4h не пройде G1.
+
 Спільні з meta фічі, вікна, бектест і `_estimator` імпортуються з `meta_model`, а не копіюються, щоб обидві
 ітерації бачили ті самі фічі та ті самі угоди.
 """
@@ -77,6 +82,7 @@ from app.ml.trade_sim import (
 )
 from app.ml.validation import (
     DIRECT_STAGE,
+    SUPPORTED_BAR_MS,
     DirectFoldRuns,
     FoldRecord,
     LabelStats,
@@ -235,8 +241,10 @@ def train_direct(
     """
     books = _books(histories, trading_symbol)
     _seed(seed)
-    if split.bar_ms != HOUR_MS:
-        raise ValueError("пряме прогнозування рахується на свічках 1h")
+    if split.bar_ms not in SUPPORTED_BAR_MS:
+        raise ValueError("пряме прогнозування рахується на свічках 1h або 4h")
+    if any(history.bar_ms != split.bar_ms for history in books):
+        raise ValueError("таймфрейм історії не той, що в розбивці")
     if not split.folds:
         raise ValueError("у розбивці немає фолдів")
     if type(shuffled_labels) is not bool:
@@ -482,6 +490,7 @@ def _bars(
         costs=costs,
         mark_candles=marks,
         funding=funding,
+        bar_ms=history.bar_ms,
     )
     if len(labeled.samples) + len(labeled.skipped) != len(indexes):
         raise RuntimeError("label_direct загубив свічку")
@@ -491,7 +500,7 @@ def _bars(
         bar = prefix[index]
         atr: Decimal | None
         try:
-            atr = atr_before_entry(prefix, index)
+            atr = atr_before_entry(prefix, index, bar_ms=history.bar_ms)
         except NoAtr:
             atr = None
         bars.append(
@@ -539,7 +548,7 @@ def _train_fold(
     absent = [label.value for label in CLASS_LABELS if _CLASS_INDEX[label] not in fit_labels]
     if absent:
         raise DirectTrainError(f"фолд {fold_index}: у train немає класу {absent[0]}")
-    spans = tuple(label_span_direct(sample.symbol, sample) for sample in samples)
+    spans = tuple(label_span_direct(sample.symbol, sample, bar_ms=split.bar_ms) for sample in samples)
     weights = sample_weights(spans, fit_labels)
     if not weights or any(weight <= 0 for weight in weights):
         raise DirectTrainError(f"фолд {fold_index}: без ваг унікальності навчати не можна")
@@ -783,7 +792,8 @@ def fit_frozen_direct(
     books = _books(histories, trading_symbol)
     _seed(seed)
     if split.bar_ms != HOUR_MS:
-        raise ValueError("пряме прогнозування рахується на свічках 1h")
+        # Допуск hold-out, артефакт і live для 4h — окрема задача після перегляду G1 (рішення 0025).
+        raise ValueError("модель допуску лише на свічках 1h: 4h — дослідження без допуску (рішення 0025)")
     model_costs = costs if costs is not None else CostModel()
     if type(model_costs) is not CostModel:
         raise ValueError("costs має бути CostModel")
@@ -836,7 +846,7 @@ def fit_frozen_direct(
     absent = [label.value for label in CLASS_LABELS if _CLASS_INDEX[label] not in labels]
     if absent:
         raise DirectTrainError(f"у навчанні немає класу {absent[0]}")
-    spans = tuple(label_span_direct(sample.symbol, sample) for sample in samples)
+    spans = tuple(label_span_direct(sample.symbol, sample, bar_ms=split.bar_ms) for sample in samples)
     weights = sample_weights(spans, labels)
     if not weights or any(weight <= 0 for weight in weights):
         raise DirectTrainError("без ваг унікальності навчати не можна")
@@ -881,6 +891,9 @@ def _holdout_signals(
     """
     if fit.include_holdout:
         raise ValueError("сигнали hold-out рахує модель допуску, не перенавчена")
+    if split.bar_ms != HOUR_MS:
+        # Модель допуску 4h не буває (`fit_frozen_direct`), але й сюди 4h не пропускаємо (рішення 0025, рев'ю T2.20).
+        raise ValueError("сигнали hold-out лише на свічках 1h: 4h — дослідження без допуску (рішення 0025)")
     books = _books(histories, trading_symbol)
     series = _feature_series(books, feature_data, split.holdout_from_ms, cutoff_ms=split.data_to_ms)
     features = compute_features(series, coverage_start_ms=fit.coverage_ms[0], coverage_end_ms=fit.coverage_ms[1])

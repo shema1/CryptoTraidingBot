@@ -38,6 +38,7 @@ uv run python -m app.jobs.worker                  # воркер задач (bac
 uv run python -m app.data.collector               # колектор ліквідацій і хвоста деривативів; коди виходу — apps/backend/README.md
 uv run python -m app.jobs.enqueue market-data     # поставити воркеру історію ринку і кеш інструментів (лише БД)
 uv run python -m app.ml.research iteration-one    # ітерація 1 на даних з БД → звіт у docs/research/ (пише спроби в журнал)
+uv run python -m app.ml.research iteration-two --variant B   # ітерація 2 (пряме прогнозування) на фолдах ітерації 1 варіанта
 
 # веб (з apps/web)
 npm run typecheck

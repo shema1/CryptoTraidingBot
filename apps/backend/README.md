@@ -30,6 +30,7 @@ uv run python -m app.jobs.worker                  # воркер задач (bac
 uv run python -m app.data.collector               # колектор ліквідацій і деривативів; без торгових ключів і без API_TOKEN
 uv run python -m app.jobs.enqueue market-data     # поставити воркеру кеш інструментів і історію ринку (лише БД, без мережі)
 uv run python -m app.ml.research iteration-one    # дослідницький прогін ітерації 1 на даних з БД; пише спроби в журнал, hold-out не відкриває
+uv run python -m app.ml.research iteration-two --variant B   # ітерація 2 (пряме прогнозування) на фолдах ітерації 1 варіанта
 uv run alembic upgrade head                       # міграції основної dev-БД (`-x db=test` — тестової)
 uv run alembic revision --autogenerate --rev-id 0002 -m "коротко"   # нова міграція (TimescaleDB/тригери — дописати вручну)
 uv run alembic check                              # моделі й міграції не розходяться
@@ -158,6 +159,12 @@ uv run python -m app.data.collector               # публічний WS лік
   (незалежно від вердикту G1); 1; 2; 10 — інший прогін працює; 11 — БД недоступна; 12 — lock прогону втрачено до
   кінця (звіт з попередженням); 13 — даних бракує; 14 — розбивку відхилено (hold-out лінії вже зафіксований
   попереднім прогоном, а нове вікно даних дає інший — T2.17); 15 — конфіг.
+- `python -m app.ml.research iteration-two [--variant B]` (T2.20) — лише варіант, обраний після ітерації 1
+  (рішення 0025); ті самі дані й розбивка, що в ітерації 1 варіанта; звіт ітерації 1 відновлюється з журналу
+  (`iteration_one_from_journal`: ті самі фолди, таргет, витрати, символи й seed), далі `run_iteration_two` (одна
+  спроба `direct`; повтор на тих самих фолдах — відмова), звіт `docs/research/<дата>-iteration-two-…md`. Коди — як
+  вище, і 16 — ітерацію 2 не запущено (причина `kind` і підказка — у лозі `research_iteration_two_refused`); відмова —
+  до будь-якого запису.
 - launchd-агенти колектора й воркера на macOS — `scripts/macos/launch_agents.sh install|uninstall|status`
   (T1.12, ТЗ §12.1.1): `caffeinate -i -s`, перезапуск лише після ненульового коду, без перехоплення lock.
 

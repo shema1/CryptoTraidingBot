@@ -825,3 +825,62 @@ async def test_journal_keeps_a_report_for_every_symbol_of_the_experiment(conn: A
     for fold in trial.metrics["folds"]:
         symbols = {entry["symbol"] for entry in fold["all_symbols"]["per_symbol"]}
         assert symbols == {BTC, ETH}
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_iteration_two_runs_once_per_folds_target_and_costs(conn: AsyncConnection) -> None:
+    """Рев'ю T2.20: повтор ітерації 2 на тих самих фолдах (інший seed) — прихований вибір; відмова без запису."""
+    from app.ml.research_cycle import JournalMismatch, direct_runs_on_same_folds
+    from app.ml.validation import costs_payload, target_payload
+
+    books, split = _three_folds()
+    async with AsyncSession(bind=conn) as session:
+        earlier = await create_experiment(
+            session,
+            split=split,
+            research_line=BTC,
+            symbols=(BTC,),
+            label_type="direct",
+            primary_strategy={},
+            params={
+                **direct_recipe(shuffled_labels=False),
+                "target": target_payload(_TARGET),
+                "costs": costs_payload(_zero_costs()),
+            },
+            seed=_SEED + 1,
+        )
+        await session.flush()
+        assert await direct_runs_on_same_folds(
+            session, split=split, trading_symbol=BTC, target=_TARGET, costs=_zero_costs()
+        ) == (earlier,)
+        # Інший таргет — не той самий прогін.
+        assert (
+            await direct_runs_on_same_folds(
+                session,
+                split=split,
+                trading_symbol=BTC,
+                target=TargetParams(horizon_bars=_TARGET.horizon_bars, tp_atr_mult=Decimal(3)),
+                costs=_zero_costs(),
+            )
+            == ()
+        )
+    sessions = _sessions(conn)
+    with pytest.raises(JournalMismatch, match="уже прогнано") as refused:
+        await run_iteration_two(
+            sessions,
+            books,
+            after=_iteration_one(ITERATION_TWO),
+            split=split,
+            trading_symbol=BTC,
+            limits=_wide_limits(),
+            initial_equity=_EQUITY,
+            maintenance_margin_rate=_MARGIN,
+            seed=_SEED,
+            costs=_zero_costs(),
+            params=_TARGET,
+        )
+    assert refused.value.kind == "repeated"
+    async with sessions() as session:
+        trials = (await session.execute(select(func.count()).select_from(ExperimentTrial))).scalar_one()
+    assert trials == 0

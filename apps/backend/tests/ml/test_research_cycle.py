@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from app.ml import meta_model, research_cycle
@@ -758,3 +758,257 @@ def test_recipe_trial_refuses_costs_or_target_other_than_training() -> None:
         recipe_trial(
             run, books, split=split, costs=_zero_costs(), params=TargetParams(horizon_bars=4, tp_atr_mult=Decimal(3))
         )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_iteration_one_is_restored_from_the_journal_for_a_separate_iteration_two(conn: AsyncConnection) -> None:
+    """T2.20: ітерація 2 окремим прогоном бере звіт ітерації 1 з журналу — той самий вибір, ті самі спроби."""
+    from app.ml.research_cycle import iteration_one_from_journal
+
+    books, split = _two_fold_setup()
+    sessions = _sessions(conn)
+    report = await _cycle(sessions, books, split)
+    async with sessions() as session:
+        n_before = await line_trial_count(session, BTC)
+        restored = await iteration_one_from_journal(
+            session,
+            split=split,
+            trading_symbol=BTC,
+            symbols=_symbols(books),
+            seed=_SEED,
+            target=_TARGET,
+            costs=_zero_costs(),
+        )
+        n_after = await line_trial_count(session, BTC)
+    assert n_after == n_before  # відновлення нічого не пише
+    assert restored.selection == report.selection
+    assert restored.comparison_trials == report.comparison_trials
+    assert [(rule.spec_name, rule.experiment_id, rule.trial_id, rule.decision_error) for rule in restored.rules] == [
+        (rule.spec_name, rule.experiment_id, rule.trial_id, rule.decision_error) for rule in report.rules
+    ]
+    # Журнал між прогонами не змінився: перегляди G1 ті самі.
+    assert [rule.preview for rule in restored.rules] == [rule.preview for rule in report.rules]
+    assert restored.next_step == report.next_step
+    assert restored.hold_out_opened is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_restoring_iteration_one_refuses_another_target_or_costs_or_split(conn: AsyncConnection) -> None:
+    from app.ml.research_cycle import iteration_one_from_journal
+
+    books, split = _two_fold_setup()
+    _other_books, other_split = _three_fold_setup()
+    sessions = _sessions(conn)
+    await _cycle(sessions, books, split)
+    async with sessions() as session:
+        with pytest.raises(ValueError, match="немає"):
+            await iteration_one_from_journal(
+                session,
+                split=split,
+                trading_symbol=BTC,
+                symbols=_symbols(books),
+                seed=_SEED,
+                target=TargetParams(horizon_bars=4, tp_atr_mult=Decimal(3)),
+                costs=_zero_costs(),
+            )
+        with pytest.raises(ValueError, match="немає"):
+            await iteration_one_from_journal(
+                session,
+                split=split,
+                trading_symbol=BTC,
+                symbols=_symbols(books),
+                seed=_SEED,
+                target=_TARGET,
+                costs=CostModel(),
+            )
+        with pytest.raises(ValueError, match="немає"):
+            await iteration_one_from_journal(
+                session,
+                split=other_split,
+                trading_symbol=BTC,
+                symbols=_symbols(books),
+                seed=_SEED,
+                target=_TARGET,
+                costs=_zero_costs(),
+            )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_restoring_iteration_one_refuses_two_runs_of_the_same_variant(conn: AsyncConnection) -> None:
+    """Двічі прогнана ітерація 1 на тих самих фолдах — неоднозначно: який прогін брати, вирішує людина."""
+    from app.ml.research_cycle import iteration_one_from_journal
+
+    books, split = _two_fold_setup()
+    sessions = _sessions(conn)
+    await _cycle(sessions, books, split)
+    await _cycle(sessions, books, split)
+    async with sessions() as session:
+        with pytest.raises(ValueError, match="кілька"):  # JournalMismatch("ambiguous")
+            await iteration_one_from_journal(
+                session,
+                split=split,
+                trading_symbol=BTC,
+                symbols=_symbols(books),
+                seed=_SEED,
+                target=_TARGET,
+                costs=_zero_costs(),
+            )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_restored_iteration_one_reports_an_opened_holdout_and_iteration_two_refuses(
+    conn: AsyncConnection,
+) -> None:
+    """Hold-out лінії вже відкривали — відновлений звіт це каже, і ітерація 2 відмовляє до будь-якого запису."""
+    from app.ml.research_cycle import iteration_one_from_journal, run_iteration_two
+
+    books, split = _two_fold_setup()
+    sessions = _sessions(conn)
+    report = await _cycle(sessions, books, split)
+    version = await make_model(conn)
+    await conn.execute(
+        insert(HoldoutOpening).values(
+            research_line=BTC,
+            holdout_from_ms=split.holdout_from_ms,
+            holdout_to_ms=split.holdout_to_ms,
+            opening_no=1,
+            experiment_id=report.rules[0].experiment_id,
+            model_version=version,
+        )
+    )
+    async with sessions() as session:
+        restored = await iteration_one_from_journal(
+            session,
+            split=split,
+            trading_symbol=BTC,
+            symbols=_symbols(books),
+            seed=_SEED,
+            target=_TARGET,
+            costs=_zero_costs(),
+        )
+        n_before = await line_trial_count(session, BTC)
+    assert restored.hold_out_opened is True
+    with pytest.raises(ValueError, match="ітерація 2 лише після"):
+        await run_iteration_two(
+            sessions,
+            books,
+            after=restored,
+            split=split,
+            trading_symbol=BTC,
+            limits=_wide_limits(),
+            initial_equity=_EQUITY,
+            maintenance_margin_rate=_MARGIN,
+            seed=_SEED,
+            costs=_zero_costs(),
+            params=_TARGET,
+        )
+    async with sessions() as session:
+        assert await line_trial_count(session, BTC) == n_before
+
+
+def _symbols(books: tuple[SymbolHistory, ...]) -> tuple[str, ...]:
+    return tuple(history.symbol for history in books)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_restoring_iteration_one_refuses_other_symbols_or_seed(conn: AsyncConnection) -> None:
+    """Рев'ю T2.20: ітерація 2 — на тих самих символах і seed, що ітерація 1; інакше журнал не про ці дані."""
+    from app.ml.research_cycle import JournalMismatch, iteration_one_from_journal
+
+    books, split = _two_fold_setup()
+    sessions = _sessions(conn)
+    await _cycle(sessions, books, split)
+    async with sessions() as session:
+        for symbols, seed in (((*_symbols(books), "ETH/USDT:USDT"), _SEED), (_symbols(books), _SEED + 1)):
+            with pytest.raises(JournalMismatch) as refused:
+                await iteration_one_from_journal(
+                    session,
+                    split=split,
+                    trading_symbol=BTC,
+                    symbols=symbols,
+                    seed=seed,
+                    target=_TARGET,
+                    costs=_zero_costs(),
+                )
+            assert refused.value.kind == "inconsistent"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_optuna_on_the_same_folds_does_not_break_the_restored_iteration_one(conn: AsyncConnection) -> None:
+    """Пошук Optuna (`stage = meta_model` + `optuna_search`) на тих самих фолдах — не спроба ітерації 1."""
+    from app.ml.meta_model import META_MIN_PROBABILITY, meta_recipe
+    from app.ml.research_cycle import iteration_one_from_journal
+    from app.ml.validation import create_experiment
+
+    books, split = _two_fold_setup()
+    sessions = _sessions(conn)
+    report = await _cycle(sessions, books, split)
+    recipe = meta_recipe(shuffled_labels=False, min_probability=META_MIN_PROBABILITY)
+    recipe["optuna_search"] = {"space": "test"}
+    recipe["target"] = target_payload(_TARGET)
+    recipe["costs"] = costs_payload(_zero_costs())
+    async with sessions() as session:
+        await create_experiment(
+            session,
+            split=split,
+            research_line=BTC,
+            symbols=_symbols(books),
+            label_type="meta",
+            primary_strategy=BREAKOUT.metadata(),
+            params=recipe,
+            seed=_SEED,
+        )
+        await session.commit()
+    async with sessions() as session:
+        restored = await iteration_one_from_journal(
+            session,
+            split=split,
+            trading_symbol=BTC,
+            symbols=_symbols(books),
+            seed=_SEED,
+            target=_TARGET,
+            costs=_zero_costs(),
+        )
+    assert [rule.experiment_id for rule in restored.rules] == [rule.experiment_id for rule in report.rules]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unfinished_iteration_one_is_not_restored(conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ітерація 1 впала на другому правилі (спроба `FAILED`): звіту не було — і з журналу його немає."""
+    from app.ml.research_cycle import JournalMismatch, iteration_one_from_journal
+
+    books, split = _two_fold_setup()
+    monkeypatch.setattr(research_cycle, "select_primary", _two_rules)
+    calls = 0
+    original = meta_model.fit_entry_rule
+
+    def second_fails(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise SplitLeakError("рядок hold-out у вибірці порогу")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(meta_model, "fit_entry_rule", second_fails)
+    sessions = _sessions(conn)
+    with pytest.raises(SplitLeakError):
+        await _cycle(sessions, books, split)
+    async with sessions() as session:
+        with pytest.raises(JournalMismatch, match="COMPLETE") as refused:
+            await iteration_one_from_journal(
+                session,
+                split=split,
+                trading_symbol=BTC,
+                symbols=_symbols(books),
+                seed=_SEED,
+                target=_TARGET,
+                costs=_zero_costs(),
+            )
+    assert refused.value.kind == "inconsistent"
