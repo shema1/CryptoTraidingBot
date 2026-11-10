@@ -577,3 +577,108 @@ async def test_a_missing_model_is_not_reported_as_the_opening_limit(conn: AsyncC
                 experiment_id=experiment_id,
                 model_version="missing-model",
             )
+
+
+async def test_a_new_line_takes_the_sealed_window_of_the_program(conn: AsyncConnection) -> None:
+    """Рішення 0026: нова лінія не бачить запечатаного року іншої — бере той самий відрізок або новіший (зсув)."""
+    from app.ml.validation import program_sealed_holdout
+
+    wide = _split()
+    overlapping = build_split(
+        data_from_ms=0,
+        data_to_ms=520 * HOUR,
+        horizon_bars=4,
+        count_trades=lambda _start, _end: 20,
+        min_train_ms=48 * HOUR,
+        test_segment_ms=24 * HOUR,
+        test_segment_extended_ms=48 * HOUR,
+    )
+    assert wide.holdout_from_ms < overlapping.holdout_from_ms < wide.holdout_to_ms
+    async with AsyncSession(bind=conn) as session:
+        assert await program_sealed_holdout(session) is None
+        await _experiment(session, wide)
+        assert await program_sealed_holdout(session) == (wide.holdout_from_ms, wide.holdout_to_ms)
+
+        async def eth(split: ResearchSplit) -> str:
+            return await create_experiment(
+                session,
+                split=split,
+                research_line=ETH,
+                symbols=(ETH, BTC),
+                label_type="meta",
+                primary_strategy={"name": "ema_cross"},
+                params={},
+                seed=7,
+            )
+
+        # Свіже вікно ETH зачепило б запечатаний рік BTC — відмова до запису.
+        with pytest.raises(SplitLeakError, match="рішення 0026"):
+            await eth(overlapping)
+        assert await line_trial_count(session, ETH) == 0
+        # Той самий відрізок — можна.
+        await eth(wide)
+        assert await program_sealed_holdout(session) == (wide.holdout_from_ms, wide.holdout_to_ms)
+
+
+async def test_journal_n_counts_every_line(conn: AsyncConnection) -> None:
+    from app.ml.validation import journal_trial_count
+
+    split = _split()
+    async with AsyncSession(bind=conn) as session:
+        btc = await _experiment(session, split)
+        eth = await create_experiment(
+            session,
+            split=split,
+            research_line=ETH,
+            symbols=(ETH, BTC),
+            label_type="meta",
+            primary_strategy={"name": "ema_cross"},
+            params={},
+            seed=7,
+        )
+        for experiment_id in (btc, btc, eth):
+            await record_trial(session, experiment_id=experiment_id, split=split, state="FAILED", params={})
+        assert await line_trial_count(session, BTC) == 2
+        assert await line_trial_count(session, ETH) == 1
+        assert await journal_trial_count(session) == 3
+
+
+async def test_with_two_lines_no_line_shifts_the_shared_window_alone(conn: AsyncConnection) -> None:
+    """Рішення 0026, рев'ю T2.21: зсув однієї лінії при кількох лініях відкрив би запечатаний рік іншої — відмова."""
+    old = _split()
+    shifted = _split(data_to_ms=625 * HOUR)
+    async with AsyncSession(bind=conn) as session:
+        await _experiment(session, old)
+        await create_experiment(
+            session,
+            split=old,
+            research_line=ETH,
+            symbols=(ETH, BTC),
+            label_type="meta",
+            primary_strategy={"name": "ema_cross"},
+            params={},
+            seed=7,
+        )
+        with pytest.raises(SplitLeakError, match="рішення 0026"):
+            await _experiment(session, shifted, seed=9)
+
+
+async def test_an_opening_of_the_window_by_another_line_marks_later_trials(conn: AsyncConnection) -> None:
+    """Рішення 0026: відкриття спільного відрізка лінією BTC — уже перегляд і для спроб лінії ETH."""
+    model = await make_model(conn)
+    split = _split()
+    async with AsyncSession(bind=conn) as session:
+        btc = await _experiment(session, split)
+        eth = await create_experiment(
+            session,
+            split=split,
+            research_line=ETH,
+            symbols=(ETH, BTC),
+            label_type="meta",
+            primary_strategy={"name": "ema_cross"},
+            params={},
+            seed=7,
+        )
+        assert await holdout_was_opened(session, eth) is False
+        assert await _open(session, split, btc, model) == 1
+        assert await holdout_was_opened(session, eth) is True

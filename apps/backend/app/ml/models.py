@@ -93,8 +93,9 @@ class ModelArtifact(Base):
 class Experiment(Base):
     """Експеримент дослідницької лінії (ТЗ §5.2.5). Лінія = торговий символ; лічильник спроб лінії не скидається.
 
-    Загальна кількість спроб лінії рахується з `experiment_trials`. `n_trials_line`, `dsr`, `pbo` — знімок
-    останнього відкриття hold-out (`statistics.open_holdout_after_gate`).
+    Кількість спроб рахується з `experiment_trials`. `n_trials_line`, `dsr`, `pbo` — знімок останнього відкриття
+    hold-out (`statistics.open_holdout_after_gate`); `n_trials_line` — N для DSR, тобто усі спроби журналу, усіх ліній
+    (рішення 0026; назву колонки збережено без міграції).
     """
 
     __tablename__ = "experiments"

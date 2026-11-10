@@ -129,6 +129,7 @@ def _args(tmp_path: Path) -> argparse.Namespace:
         max_notional_per_symbol_usd=Decimal(50000),
         variant="baseline",
         report=tmp_path / "report.md",
+        trading_symbol=None,
     )
 
 
@@ -216,6 +217,7 @@ def test_report_shows_the_gate_numbers_reasons_and_that_the_holdout_stayed_seale
         inputs,  # type: ignore[arg-type]
         trading_symbol=BTC,
         n_line_trials=9,
+        n_journal_trials=31,
         initial_equity=Decimal(10000),
         target=TargetParams(),
         costs=CostModel(),
@@ -227,6 +229,7 @@ def test_report_shows_the_gate_numbers_reasons_and_that_the_holdout_stayed_seale
     assert REASON_TEXT[G1_EVALUATED_FOLDS] in markdown
     assert "`ema_cross` (не краще за «завжди FLAT»)" in markdown
     assert "Спроб у лінії BTC/USDT:USDT після прогону: **9**" in markdown
+    assert "N для DSR — усі спроби журналу (усі лінії, рішення 0026): **31**" in markdown
     assert (
         "Пропущених свічок ТФ до hold-out (дірки даних або неповні 4h-кошики, без інтерполяції): BTC 1; ETH 0."
         in markdown
@@ -514,6 +517,7 @@ def test_iteration_two_report_shows_folds_warmup_gate_and_the_restored_iteration
         inputs,  # type: ignore[arg-type]
         trading_symbol=BTC,
         n_line_trials=25,
+        n_journal_trials=25,
         initial_equity=Decimal(10000),
         target=TargetParams(),
         costs=CostModel(),
@@ -543,3 +547,35 @@ def _flat_bars(hours: int, *, missing: int | None = None) -> tuple[SimCandle, ..
         for hour in range(hours)
         if hour != missing
     )
+
+
+def test_cli_research_lines_are_the_decided_ones() -> None:
+    """Рішення 0026: лінія — лише зафіксована рішенням (BTC, ETH); без прапорця — TRADING_SYMBOL з конфігу."""
+    from app.ml.research import LINE_VARIANTS, _parse_args
+
+    assert set(LINE_VARIANTS) == {BTC, ETH}
+    assert LINE_VARIANTS[ETH] == ("B",)
+    assert _parse_args(["iteration-one", "--variant", "B", "--trading-symbol", ETH]).trading_symbol == ETH
+    assert _parse_args(["iteration-two", "--trading-symbol", ETH]).trading_symbol == ETH
+    assert _parse_args(["iteration-one"]).trading_symbol is None
+    with pytest.raises(SystemExit):
+        _parse_args(["iteration-one", "--trading-symbol", "SOL/USDT:USDT"])
+
+
+@pytest.mark.asyncio
+async def test_a_variant_not_fixed_for_the_line_is_refused_before_the_database(tmp_path: Path) -> None:
+    """ETH — лише обраний варіант B (рішення 0026): baseline/A/C на ETH — прихований вибір, код 2 без БД і звіту."""
+    from app.ml.research import EXIT_USAGE
+
+    settings = SimpleNamespace(trading_symbol=BTC)  # БД не потрібна: відмова до підключення
+
+    def boom() -> str:
+        raise AssertionError("до БД не мало дійти")
+
+    settings.database_url = boom  # type: ignore[attr-defined]
+    for variant in ("baseline", "A", "C"):
+        args = _args(tmp_path)
+        args.variant = variant
+        args.trading_symbol = ETH
+        assert await run(settings, args) == EXIT_USAGE  # type: ignore[arg-type]
+    assert not (tmp_path / "report.md").exists()

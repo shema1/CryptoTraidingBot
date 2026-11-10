@@ -24,7 +24,12 @@ Hold-out не відкривається ніколи: рішення відкр
 за замовчуванням (ТЗ §8.2); `min_equity_usd` і `max_notional_per_symbol_usd`, які в ТЗ «задаються», — аргументи
 команди з консервативними значеннями за замовчуванням.
 
-Коди виходу: 0 — прогін завершено (незалежно від вердикту G1); 1 — необроблений виняток; 2 — аргументи;
+Лінія — `--trading-symbol` (без прапорця — `TRADING_SYMBOL`), лише з `LINE_VARIANTS` і лише з дозволеними їй варіантами
+(рішення 0025, 0026: BTC — baseline/A/B/C, ETH — B). Нова лінія бере запечатаний відрізок програми
+(`program_sealed_holdout`), тож не бачить запечатаного року іншої. Звіт показує спроби лінії і N журналу (усі лінії).
+
+Коди виходу: 0 — прогін завершено (незалежно від вердикту G1); 1 — необроблений виняток; 2 — аргументи (і варіант, не
+дозволений лінії — до підключення до БД);
 10 — інший прогін уже працює; 11 — БД недоступна; 12 — lock прогону втрачено до кінця (звіт з попередженням);
 13 — даних бракує для розбивки; 14 — розбивку відхилено (зазвичай hold-out лінії вже зафіксований попереднім
 прогоном, а нове вікно даних дає інший: повторний прогін лінії — рішення людини, T2.17); 15 — конфіг невалідний;
@@ -101,7 +106,9 @@ from app.ml.validation import (
     TIMEFRAME_NAMES,
     ResearchSplit,
     SplitLeakError,
+    journal_trial_count,
     line_trial_count,
+    program_sealed_holdout,
     sealed_holdout,
 )
 from app.risk.costs import CostModel
@@ -109,6 +116,7 @@ from app.risk.limits import RiskLimits
 
 EXIT_OK: Final = 0
 EXIT_UNCAUGHT: Final = 1
+EXIT_USAGE: Final = 2
 EXIT_LOCK_HELD: Final = 10
 EXIT_DB_UNAVAILABLE: Final = 11
 EXIT_LOCK_LOST: Final = 12
@@ -202,6 +210,12 @@ def research_limits(*, min_equity_usd: Decimal, max_notional_per_symbol_usd: Dec
 
 
 async def run(settings: Settings, args: argparse.Namespace) -> int:
+    line = args.trading_symbol or settings.trading_symbol
+    allowed = LINE_VARIANTS.get(line, ())
+    if args.variant not in allowed:
+        # Лінія і варіанти — лише зафіксовані рішеннями 0025, 0026: інший символ чи таргет — прихований вибір.
+        _LOG.error("research_variant_refused", trading_symbol=line, variant=args.variant, allowed=list(allowed))
+        return EXIT_USAGE
     try:
         url = settings.database_url()
     except ValueError:
@@ -212,9 +226,7 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
         async with engine.connect() as lock_connection:
             await _take_lock(lock_connection)
             sessions = session_factory(engine)
-            symbols = backfill_symbols(
-                trading_symbol=settings.trading_symbol, research_symbols=settings.research_symbols
-            )
+            symbols = backfill_symbols(trading_symbol=line, research_symbols=settings.research_symbols)
             limits = research_limits(
                 min_equity_usd=args.min_equity_usd, max_notional_per_symbol_usd=args.max_notional_per_symbol_usd
             )
@@ -224,11 +236,16 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
             bar_ms = chosen.bar_ms
             started = now_ms()
             async with sessions() as session:
-                sealed = await sealed_holdout(session, settings.trading_symbol)
+                # Свій відрізок лінії, а для нової лінії — спільний відрізок програми (рішення 0026).
+                sealed = await sealed_holdout(session, line)
+                program = await program_sealed_holdout(session)
+            if sealed is not None and program is not None and sealed != program:
+                raise SplitLeakError("запечатаний відрізок лінії не збігається з відрізком програми (рішення 0026)")
+            sealed = sealed or program
             _LOG.info(
                 "research_loading",
                 symbols=list(symbols),
-                trading_symbol=settings.trading_symbol,
+                trading_symbol=line,
                 variant=args.variant,
                 timeframe=TIMEFRAME_NAMES[bar_ms],
                 target={
@@ -241,7 +258,7 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
             inputs = await load_research_inputs(
                 sessions,
                 symbols=symbols,
-                trading_symbol=settings.trading_symbol,
+                trading_symbol=line,
                 limits=limits,
                 initial_equity=args.initial_equity,
                 maintenance_margin_rate=args.maintenance_margin_rate,
@@ -265,7 +282,7 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
                 outcome = await iteration_two(
                     sessions,
                     inputs,
-                    trading_symbol=settings.trading_symbol,
+                    trading_symbol=line,
                     limits=limits,
                     initial_equity=args.initial_equity,
                     maintenance_margin_rate=args.maintenance_margin_rate,
@@ -278,7 +295,7 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
                     sessions,
                     inputs.histories,
                     split=inputs.split,
-                    trading_symbol=settings.trading_symbol,
+                    trading_symbol=line,
                     limits=limits,
                     initial_equity=args.initial_equity,
                     maintenance_margin_rate=args.maintenance_margin_rate,
@@ -288,7 +305,8 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
                     feature_data=inputs.feature_data,
                 )
             async with sessions() as session:
-                n_line = await line_trial_count(session, settings.trading_symbol)
+                n_line = await line_trial_count(session, line)
+                n_journal = await journal_trial_count(session)
             lock_held = await _lock_still_held(lock_connection)
     except ResearchLockHeld:
         _LOG.error("research_lock_held", hint="інший прогін python -m app.ml.research ще працює")
@@ -319,13 +337,14 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
         f"{args.variant}-{TIMEFRAME_NAMES[bar_ms]}-tp{_fmt_mult(target.tp_atr_mult)}"
         f"-sl{_fmt_mult(target.sl_atr_mult)}-h{target.horizon_bars}"
     )
-    path = args.report or REPORT_DIR / f"{_date(finished)}-{args.command}-{_slug(settings.trading_symbol)}-{variant}.md"
+    path = args.report or REPORT_DIR / f"{_date(finished)}-{args.command}-{_slug(line)}-{variant}.md"
     if isinstance(outcome, IterationTwoRun):
         markdown = render_iteration_two(
             outcome,
             inputs,
-            trading_symbol=settings.trading_symbol,
+            trading_symbol=line,
             n_line_trials=n_line,
+            n_journal_trials=n_journal,
             initial_equity=args.initial_equity,
             target=target,
             costs=costs,
@@ -340,8 +359,9 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
         markdown = render_iteration_one(
             outcome,
             inputs,
-            trading_symbol=settings.trading_symbol,
+            trading_symbol=line,
             n_line_trials=n_line,
+            n_journal_trials=n_journal,
             initial_equity=args.initial_equity,
             target=target,
             costs=costs,
@@ -368,6 +388,7 @@ async def run(settings: Settings, args: argparse.Namespace) -> int:
         chosen=chosen_rules,
         passed=passed,
         n_line_trials=n_line,
+        n_journal_trials=n_journal,
         duration_ms=finished - started,
         hold_out_opened=hold_out_opened,
     )
@@ -473,6 +494,7 @@ def render_iteration_one(
     *,
     trading_symbol: str,
     n_line_trials: int,
+    n_journal_trials: int,
     initial_equity: Decimal,
     target: TargetParams,
     costs: CostModel,
@@ -492,6 +514,7 @@ def render_iteration_one(
             inputs,
             trading_symbol=trading_symbol,
             n_line_trials=n_line_trials,
+            n_journal_trials=n_journal_trials,
             initial_equity=initial_equity,
             target=target,
             costs=costs,
@@ -524,6 +547,7 @@ def render_iteration_two(
     *,
     trading_symbol: str,
     n_line_trials: int,
+    n_journal_trials: int,
     initial_equity: Decimal,
     target: TargetParams,
     costs: CostModel,
@@ -547,6 +571,7 @@ def render_iteration_two(
             inputs,
             trading_symbol=trading_symbol,
             n_line_trials=n_line_trials,
+            n_journal_trials=n_journal_trials,
             initial_equity=initial_equity,
             target=target,
             costs=costs,
@@ -608,6 +633,7 @@ def _data_section(
     *,
     trading_symbol: str,
     n_line_trials: int,
+    n_journal_trials: int,
     initial_equity: Decimal,
     target: TargetParams,
     costs: CostModel,
@@ -636,7 +662,8 @@ def _data_section(
         f"- Витрати: taker {_pct(costs.taker_fee_rate)} за сторону, slippage входу {costs.slippage_entry_atr}·ATR, "
         f"SL {costs.stop_slippage_atr}·ATR, TP {costs.slippage_tp_atr}·ATR.",
         f"- Рахунок бектесту: {initial_equity} USDT, ліміти Risk Engine за замовчуванням (ризик 0,5% на угоду).",
-        f"- Спроб у лінії {trading_symbol} після прогону: **{n_line_trials}**. "
+        f"- Спроб у лінії {trading_symbol} після прогону: **{n_line_trials}**; N для DSR — усі спроби журналу "
+        f"(усі лінії, рішення 0026): **{n_journal_trials}**. "
         f"Тривалість: {round((finished_ms - started_ms) / 60_000)} хв.",
         "",
     ]
@@ -734,6 +761,12 @@ VARIANTS: Final[Mapping[str, Variant]] = {
 # Ітерація 2 — лише на таргеті, обраному після ітерації 1 (рішення 0025, «Результат»: B). Інший варіант — нове
 # рішення: ітерація 2 на кожному варіанті по черзі — прихований вибір кращого.
 ITERATION_TWO_VARIANTS: Final[tuple[str, ...]] = ("B",)
+# Дослідницькі лінії і дозволені їм варіанти (рішення 0025 — BTC, 0026 — ETH лише з обраним B). Новий символ чи
+# варіант — лише новим рішенням: перебір символів і таргетів по черзі — прихований вибір.
+LINE_VARIANTS: Final[Mapping[str, tuple[str, ...]]] = {
+    "BTC/USDT:USDT": ("baseline", "A", "B", "C"),
+    "ETH/USDT:USDT": ("B",),
+}
 
 
 def _timeframe_label(bar_ms: int) -> str:
@@ -836,6 +869,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             help="зафіксований варіант таргета й таймфрейму (рішення 0025): " + ", ".join(variants),
         )
         command.add_argument("--report", type=Path, default=None, help="куди записати звіт Markdown")
+        command.add_argument(
+            "--trading-symbol",
+            choices=sorted(LINE_VARIANTS),
+            default=None,
+            help="дослідницька лінія (рішення 0026); без прапорця — TRADING_SYMBOL з конфігу",
+        )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 

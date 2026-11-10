@@ -26,7 +26,7 @@ from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from pydantic import model_validator
-from sqlalchemy import func, insert, select
+from sqlalchemy import and_, func, insert, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -605,7 +605,9 @@ async def create_experiment(
     """Новий експеримент лінії. `seed` лише зберігається: розбивка від нього не залежить.
 
     Hold-out — запечатаний на лінії або новіший: початок не раніше за кінець запечатаного.
-    Новіший відпускає старий у walk-forward (зсув, ТЗ §5А.10) і нічого не відкриває.
+    Новіший відпускає старий у walk-forward (зсув, ТЗ §5А.10) і нічого не відкриває. Відрізок спільний для всіх ліній
+    (`program_sealed_holdout`, рішення 0026): нова лінія бере той самий, а зсув можливий, лише поки в журналі одна
+    лінія — інакше walk-forward однієї лінії покрив би запечатаний рік іншої.
     `n_trials_line`, DSR і PBO лишаються порожніми, доки `statistics.open_holdout_after_gate` не відкриє hold-out.
     """
     line = _symbols(research_line, symbols)
@@ -615,11 +617,22 @@ async def create_experiment(
         raise ValueError("seed має бути невід'ємний int")
     if "validation" in params:
         raise ValueError("params.validation займає розбивка")
+    await _lock_journal(session)
     await _lock_line(session, line)
     sealed = _sealed_holdout(await _line_windows(session, line), await _openings(session, line))
     window = (split.holdout_from_ms, split.holdout_to_ms)
     if sealed is not None and window != sealed and split.holdout_from_ms < sealed[1]:
         raise SplitLeakError("hold-out лінії вже зафіксований: новий має починатися не раніше за його кінець")
+    # Рішення 0026: запечатаний відрізок спільний для всіх ліній — нова лінія не бачить запечатаного року іншої.
+    # Інше вікно (і зсув) — лише коли в журналі немає інших ліній; зсув усієї програми — рішення людини.
+    program = await program_sealed_holdout(session)
+    if program is not None and window != program:
+        others = await _other_lines(session, line)
+        if others or split.holdout_from_ms < program[1]:
+            raise SplitLeakError(
+                "запечатаний відрізок спільний для всіх ліній: нова лінія бере той самий hold-out, а зсув при кількох "
+                "лініях — лише рішенням людини (рішення 0026)"
+            )
     stored = _jsonable(
         {**dict(params), "validation": validation_payload(split)},
         path="params",
@@ -703,8 +716,38 @@ async def sealed_holdout(session: AsyncSession, research_line: str) -> tuple[int
     return _sealed_holdout(await _line_windows(session, research_line), await _openings(session, research_line))
 
 
+async def program_sealed_holdout(session: AsyncSession) -> tuple[int, int] | None:
+    """Запечатаний відрізок програми досліджень — спільний для всіх ліній журналу (рішення 0026), або `None`.
+
+    Лінії з різними запечатаними відрізками — `SplitLeakError`: дані однієї лінії зачепили б запечатаний рік іншої
+    (фічі рахуються з усіх символів дослідження). Розбирає людина.
+    """
+    lines = (await session.execute(select(Experiment.research_line).distinct())).scalars().all()
+    sealed: set[tuple[int, int]] = set()
+    for line in lines:
+        window = _sealed_holdout(await _line_windows(session, line), await _openings(session, line))
+        if window is not None:
+            sealed.add(window)
+    if len(sealed) > 1:
+        raise SplitLeakError("лінії журналу мають різні запечатані відрізки: розбирає людина (рішення 0026)")
+    return next(iter(sealed), None)
+
+
+async def _other_lines(session: AsyncSession, research_line: str) -> list[str]:
+    stmt = select(Experiment.research_line).where(Experiment.research_line != research_line).distinct()
+    return list((await session.execute(stmt)).scalars())
+
+
+async def journal_trial_count(session: AsyncSession) -> int:
+    """N для DSR: усі спроби журналу, усіх ліній (рішення 0026). Нічим не зменшується."""
+    return int((await session.execute(select(func.count()).select_from(ExperimentTrial))).scalar_one())
+
+
 async def line_trial_count(session: AsyncSession, research_line: str) -> int:
-    """Скільки спроб уже є в лінії. Жоден зсув hold-out і жоден підхід цього числа не зменшують."""
+    """Скільки спроб уже є в лінії (нумерація `line_trial_no`). Жоден зсув hold-out і жоден підхід його не зменшують.
+
+    N для DSR — не це число, а `journal_trial_count` (усі лінії, рішення 0026).
+    """
     if not _SYMBOL.fullmatch(research_line):
         raise ValueError("символ лінії не канонічний")
     stmt = (
@@ -717,15 +760,24 @@ async def line_trial_count(session: AsyncSession, research_line: str) -> int:
 
 
 async def holdout_was_opened(session: AsyncSession, experiment_id: str) -> bool:
-    """Чи був уже будь-який перегляд hold-out на лінії до цієї спроби.
+    """Чи був уже будь-який перегляд hold-out на лінії — або вікна, що перетинає її, будь-якою лінією — до цієї спроби.
 
     Зсув сам нічого не відкриває. Але кожна наступна спроба лінії йде після вже зробленого
     перегляду, тож прапорець не обмежений вікном, збереженим у самому експерименті.
     """
     experiment = await _experiment(session, experiment_id)
-    stmt = (
-        select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == experiment.research_line)
-    )
+    condition = HoldoutOpening.research_line == experiment.research_line
+    stored = experiment.params.get("validation") if isinstance(experiment.params, dict) else None
+    if isinstance(stored, dict):
+        # Відрізок спільний для всіх ліній (рішення 0026): перегляд того самого вікна іншою лінією — теж перегляд.
+        condition = or_(
+            condition,
+            and_(
+                HoldoutOpening.holdout_from_ms < int(stored["holdout_to_ms"]),
+                HoldoutOpening.holdout_to_ms > int(stored["holdout_from_ms"]),
+            ),
+        )
+    stmt = select(func.count()).select_from(HoldoutOpening).where(condition)
     return int((await session.execute(stmt)).scalar_one()) > 0
 
 
@@ -748,6 +800,7 @@ async def record_trial(
     if state not in TRIAL_STATES:
         raise ValueError("невідомий стан спроби")
     experiment = await _experiment(session, experiment_id)
+    await _lock_journal(session)
     await _lock_line(session, experiment.research_line)
     if experiment.params.get("validation") != validation_payload(split):
         raise SplitLeakError("розбивка спроби не збігається з експериментом")
@@ -837,6 +890,7 @@ async def _open_holdout(
     end = _millis("holdout_to_ms", holdout_to_ms)
     if start % HOUR_MS != 0 or end % HOUR_MS != 0 or end <= start:
         raise ValueError("вікно hold-out не вирівняне або порожнє")
+    await _lock_journal(session)
     await _lock_line(session, research_line)
     experiment = await _experiment(session, experiment_id)
     if experiment.research_line != research_line:
@@ -849,6 +903,10 @@ async def _open_holdout(
     existing = await _openings(session, research_line)
     if _sealed_holdout(await _line_windows(session, research_line), existing) != (start, end):
         raise HoldoutNotNewerError("hold-out експерименту вже відпущено зсувом")
+    program = await program_sealed_holdout(session)
+    if program is not None and (start, end) != program:
+        # Рішення 0026: відкривається лише спільний запечатаний відрізок; розбіжні вікна ліній — розбирає людина.
+        raise SplitLeakError("відкривається лише запечатаний відрізок програми (рішення 0026)")
     opening_no = _opening_no(existing, start, end)
     payload = None if result is None else _jsonable(dict(result), path="result")
     try:
@@ -1358,6 +1416,18 @@ async def _experiment(session: AsyncSession, experiment_id: str) -> Experiment:
 def _line_key(research_line: str) -> int:
     digest = hashlib.sha256(f"holdout:{research_line}".encode()).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
+
+
+_JOURNAL_LOCK_KEY = int.from_bytes(hashlib.sha256(b"journal:experiments").digest()[:8], "big", signed=True)
+
+
+async def _lock_journal(session: AsyncSession) -> None:
+    """Advisory-lock журналу до кінця транзакції (рішення 0026): N і запечатаний відрізок — спільні для всіх ліній.
+
+    Береться завжди перед `_lock_line` (один порядок — без взаємоблокувань). Повторне взяття в тій самій сесії
+    дозволене (`pg_advisory_xact_lock` реентерабельний).
+    """
+    await session.execute(select(func.pg_advisory_xact_lock(_JOURNAL_LOCK_KEY)))
 
 
 async def _lock_line(session: AsyncSession, research_line: str) -> None:

@@ -1023,7 +1023,7 @@ async def promote_to_candidate(
     seed = int(meta["reproducibility"]["seed"])
     n_trials = result.get("n_trials_line")
     if type(n_trials) is not int or isinstance(n_trials, bool) or n_trials < 1:
-        raise ArtifactError("у відкритті немає N спроб лінії")
+        raise ArtifactError("у відкритті немає N спроб журналу")
     n_replicates = CORRIDOR_REPLICATES
     corridor = corridor_payload(live_corridor(trades, n_replicates=n_replicates, seed=seed))
     meta["status"] = "CANDIDATE"

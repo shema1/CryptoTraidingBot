@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -264,7 +264,8 @@ async def iteration_one_from_journal(
 
     Перегляди G1 рахуються наново на поточному журналі — так, як їх зараз порахувало б `open_holdout_after_gate`.
     З новими спробами лінії вони можуть відрізнятися від звіту ітерації 1 в обидва боки (розкид Sharpe у DSR і
-    суперники в PBO змінюються). `hold_out_opened` — чи на лінії вже є відкриття hold-out: тоді ітерація 2 відмовляє.
+    суперники в PBO змінюються). `hold_out_opened` — чи лінія або будь-яка лінія на цьому самому відрізку вже
+    відкривала hold-out (рішення 0026): тоді ітерація 2 відмовляє.
     """
     same = await _same_folds(session, split=split, trading_symbol=trading_symbol, target=target, costs=costs)
     catalogs = [item for item in same if item.params.get("stage") == CATALOG_STAGE]
@@ -325,8 +326,20 @@ async def iteration_one_from_journal(
                 preview=preview,
             )
         )
+    # Відрізок спільний для всіх ліній (рішення 0026): відкриття вікна, що його перетинає, будь-якою лінією теж
+    # закриває ітерацію 2.
     opened = await session.scalar(
-        select(func.count()).select_from(HoldoutOpening).where(HoldoutOpening.research_line == trading_symbol)
+        select(func.count())
+        .select_from(HoldoutOpening)
+        .where(
+            or_(
+                HoldoutOpening.research_line == trading_symbol,
+                and_(
+                    HoldoutOpening.holdout_from_ms < split.holdout_to_ms,
+                    HoldoutOpening.holdout_to_ms > split.holdout_from_ms,
+                ),
+            )
+        )
     )
     return IterationOneReport(
         selection=selection,

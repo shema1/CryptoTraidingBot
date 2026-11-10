@@ -1,10 +1,10 @@
 """Блочний bootstrap, DSR, PBO, коридор і Gate G1 (ТЗ §5.2.5, §5.3, §5.7, §5А.10).
 
 DSR (Bailey & López de Prado, 2014) рахується з ряду R торгового символу, не з річного Sharpe
-барів бектесту. Кількість спроб — уся лінія, включно з `FAILED` і `PRUNED`; розкид Sharpe між
-спробами — з рядів ≥ `DSR_SPREAD_MIN_TRADES` угод і не менший за `1/(T−1)` кандидата. PBO — CSCV
+барів бектесту. Кількість спроб — увесь журнал, усі лінії (рішення 0026), включно з `FAILED` і `PRUNED`;
+розкид Sharpe між спробами — з рядів ≥ `DSR_SPREAD_MIN_TRADES` угод і не менший за `1/(T−1)` кандидата. PBO — CSCV
 на 16 блоках за часом (Bailey, Borwein, López de Prado & Zhu, 2015) з пропусками: рядок матриці —
-доба walk-forward кандидата; кожна спроба лінії змагається на добах, які покрила (рішення 0014),
+доба walk-forward кандидата; кожна спроба журналу змагається на добах, які покрила (рішення 0014, 0026),
 крім опорних бейзлайнів T2.7: вони в N, але не в матриці (рішення 0016). Частка розбиттів, де
 стратегія, найкраща на одній половині блоків, на іншій не вища за медіану.
 
@@ -40,6 +40,7 @@ from app.ml.validation import (
     MIN_TRADES_PER_FOLD,
     RecordedOpening,
     SplitLeakError,
+    _lock_journal,
     _lock_line,
     _open_holdout,
 )
@@ -598,7 +599,7 @@ def deflated_sharpe(
 ) -> DsrEstimate:
     """Імовірність, що Sharpe спроби вищий за очікуваний максимум з `n_trials` спроб, і з чого вона.
 
-    `trial_returns` — ряди всіх спроб лінії, включно з порожніми; їхня кількість дорівнює `n_trials`.
+    `trial_returns` — ряди всіх спроб журналу (усіх ліній, рішення 0026), включно з порожніми; їх рівно `n_trials`.
     Розкид Sharpe між спробами береться лише з рядів, де угод не менше за `variance_min_trades`:
     ряд із 2–3 угод дає Sharpe у десятки і назавжди обвалив би DSR лінії. Коротші ряди лишаються
     в N. Розкид не менший за `1/(T−1)` кандидата — розкид однієї оцінки за нульової істинної
@@ -883,6 +884,77 @@ def warmup_folds(params: Any, metrics: Any) -> int | None:
 
 
 @dataclass(frozen=True, slots=True)
+class _ScopedEstimates:
+    """DSR і PBO кандидата за лінією і за журналом; у G1 іде гірша з двох (рішення 0026, рев'ю T2.21).
+
+    Додати спроби інших ліній — не завжди суворіше: щільна група схожих Sharpe стискає розкид і знижує SR* (DSR
+    росте), а систематично збиткові суперники тягнуть донизу медіану OOS (PBO падає, як з бейзлайнами в рішенні 0016).
+    Тому береться мінімум DSR і максимум PBO; оцінка, якої немає (`None`), не обирається, поки є інша.
+    """
+
+    dsr_detail: DsrEstimate
+    pbo_detail: PboEstimate
+    dsr_scope: str
+    pbo_scope: str
+    line_dsr: DsrEstimate
+    journal_dsr: DsrEstimate
+    line_pbo: PboEstimate
+    journal_pbo: PboEstimate
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "line": {
+                "n_trials": self.line_dsr.n_trials,
+                "dsr": self.line_dsr.dsr,
+                "pbo": self.line_pbo.pbo,
+                "pbo_strategies": self.line_pbo.n_strategies,
+            },
+            "journal": {
+                "n_trials": self.journal_dsr.n_trials,
+                "dsr": self.journal_dsr.dsr,
+                "pbo": self.journal_pbo.pbo,
+                "pbo_strategies": self.journal_pbo.n_strategies,
+            },
+        }
+
+
+def _worse_scope(
+    returns: Sequence[Sequence[Decimal]],
+    competing: Sequence[TrialSeries],
+    *,
+    candidate_index: int,
+    in_line: Sequence[bool],
+) -> _ScopedEstimates:
+    """Гірша з двох оцінок DSR і PBO: лише спроби лінії кандидата чи всі спроби журналу (рішення 0026)."""
+    if len(returns) != len(competing) or len(in_line) != len(returns) or not in_line[candidate_index]:
+        raise ValueError("лінії спроб не узгоджені з кандидатом")
+    candidate = returns[candidate_index]
+    journal_dsr = deflated_sharpe(candidate, trial_returns=returns, n_trials=len(returns))
+    journal_pbo = pbo_estimate(competing, candidate_index=candidate_index)
+    indexes = [index for index, flag in enumerate(in_line) if flag]
+    local = indexes.index(candidate_index)
+    line_dsr = deflated_sharpe(candidate, trial_returns=[returns[index] for index in indexes], n_trials=len(indexes))
+    line_pbo = pbo_estimate([competing[index] for index in indexes], candidate_index=local)
+    # Нічия — журнал (той самий результат, повніший опис N).
+    dsr_scope = "journal"
+    if line_dsr.dsr is not None and (journal_dsr.dsr is None or line_dsr.dsr < journal_dsr.dsr):
+        dsr_scope = "line"
+    pbo_scope = "journal"
+    if line_pbo.pbo is not None and (journal_pbo.pbo is None or line_pbo.pbo > journal_pbo.pbo):
+        pbo_scope = "line"
+    return _ScopedEstimates(
+        dsr_detail=line_dsr if dsr_scope == "line" else journal_dsr,
+        pbo_detail=line_pbo if pbo_scope == "line" else journal_pbo,
+        dsr_scope=dsr_scope,
+        pbo_scope=pbo_scope,
+        line_dsr=line_dsr,
+        journal_dsr=journal_dsr,
+        line_pbo=line_pbo,
+        journal_pbo=journal_pbo,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _G1:
     """Результат перевірки G1 однієї спроби. Нічого не пише; `open_holdout_after_gate` бере з нього все."""
 
@@ -897,6 +969,7 @@ class _G1:
     pbo_detail: PboEstimate
     dsr: Decimal | None
     pbo: Decimal | None
+    scoped: _ScopedEstimates
     checked_stress: tuple[FoldOutcome, ...]
     unfiltered_total_net: Decimal | None
     scored_unfiltered_total_net: Decimal | None
@@ -916,7 +989,7 @@ async def _evaluate_g1(
     if type(trial_id) is not int or isinstance(trial_id, bool):
         raise ValueError("trial_id має бути int")
     limits = thresholds if thresholds is not None else GateThresholds()
-    experiment, trial, rows = await _load_candidate(session, experiment_id, trial_id)
+    experiment, trial, rows, lines = await _load_candidate(session, experiment_id, trial_id)
     if model_version is not None:
         await _check_model(session, model_version, experiment)
     invalid = await _invalidations(session, [row.id for row in rows])
@@ -957,8 +1030,13 @@ async def _evaluate_g1(
         for row, item in zip(rows, series, strict=True)
     ]
     candidate_index = next(index for index, row in enumerate(rows) if row.id == trial.id)
-    dsr_detail = deflated_sharpe(returns[candidate_index], trial_returns=returns, n_trials=len(series))
-    pbo_detail = pbo_estimate(competing, candidate_index=candidate_index)
+    scoped = _worse_scope(
+        returns,
+        competing,
+        candidate_index=candidate_index,
+        in_line=[lines.get(row.experiment_id) == experiment.research_line for row in rows],
+    )
+    dsr_detail, pbo_detail = scoped.dsr_detail, scoped.pbo_detail
     dsr = dsr_detail.dsr
     pbo = pbo_detail.pbo
     folds = fold_outcomes_from_metrics(trial.metrics)[skip:]
@@ -1008,6 +1086,7 @@ async def _evaluate_g1(
         pbo_detail=pbo_detail,
         dsr=dsr,
         pbo=pbo,
+        scoped=scoped,
         checked_stress=checked_stress,
         unfiltered_total_net=unfiltered_total_net,
         scored_unfiltered_total_net=scored_unfiltered_total_net,
@@ -1141,6 +1220,10 @@ async def open_holdout_after_gate(
             "pbo_splits": pbo_detail.n_splits,
             "pbo_span_from_ms": pbo_detail.span_from_ms,
             "pbo_span_to_ms": pbo_detail.span_to_ms,
+            # Рішення 0026: DSR і PBO — гірша з двох оцінок, за лінією і за журналом.
+            "dsr_scope": ev.scoped.dsr_scope,
+            "pbo_scope": ev.scoped.pbo_scope,
+            "scopes": ev.scoped.payload(),
             "n_trades": decision.n_trades,
             "median_pf": decision.median_pf,
             "median_pf_unbounded": decision.median_pf_unbounded,
@@ -1390,23 +1473,27 @@ async def _load_candidate(
     session: AsyncSession,
     experiment_id: str,
     trial_id: int,
-) -> tuple[Experiment, ExperimentTrial, list[ExperimentTrial]]:
+) -> tuple[Experiment, ExperimentTrial, list[ExperimentTrial], dict[str, str]]:
+    """Кандидат, усі спроби журналу і лінія кожного експерименту (рішення 0026).
+
+    Lock журналу, потім лінії: спроба іншої лінії не допишеться між читанням N і записом відкриття.
+    """
     experiment = (await session.execute(select(Experiment).where(Experiment.id == experiment_id))).scalar_one()
+    await _lock_journal(session)
     await _lock_line(session, experiment.research_line)
     await session.refresh(experiment)
-    stmt = (
-        select(ExperimentTrial)
-        .join(Experiment, Experiment.id == ExperimentTrial.experiment_id)
-        .where(Experiment.research_line == experiment.research_line)
-        .order_by(ExperimentTrial.created_at_ms, ExperimentTrial.id)
-    )
+    # Рішення 0026: N, розкид Sharpe і суперники PBO — усі спроби журналу, усіх ліній (вибір символу — теж вибір).
+    stmt = select(ExperimentTrial).order_by(ExperimentTrial.created_at_ms, ExperimentTrial.id)
     rows = list((await session.execute(stmt)).scalars())
     trial = next((row for row in rows if row.id == trial_id), None)
     if trial is None or trial.experiment_id != experiment_id:
         raise ValueError("спроба не належить експерименту")
     if trial.state != "COMPLETE":
         raise ValueError("Gate G1 оцінює лише COMPLETE")
-    return experiment, trial, rows
+    lines = {
+        str(row[0]): str(row[1]) for row in (await session.execute(select(Experiment.id, Experiment.research_line)))
+    }
+    return experiment, trial, rows, lines
 
 
 def _binned(series: TrialSeries, start: int, bin_ms: int, n_bins: int) -> tuple[np.ndarray, np.ndarray]:

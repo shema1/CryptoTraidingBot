@@ -1012,3 +1012,49 @@ async def test_unfinished_iteration_one_is_not_restored(conn: AsyncConnection, m
                 costs=_zero_costs(),
             )
     assert refused.value.kind == "inconsistent"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_an_opening_of_the_shared_window_by_another_line_also_stops_iteration_two(conn: AsyncConnection) -> None:
+    """Рішення 0026: відрізок спільний — його відкриття лінією ETH теж закриває ітерацію 2 лінії BTC."""
+    from app.ml.research_cycle import iteration_one_from_journal
+    from app.ml.validation import create_experiment
+
+    books, split = _two_fold_setup()
+    sessions = _sessions(conn)
+    await _cycle(sessions, books, split)
+    async with sessions() as session:
+        eth = await create_experiment(
+            session,
+            split=split,
+            research_line="ETH/USDT:USDT",
+            symbols=("ETH/USDT:USDT", BTC),
+            label_type="meta",
+            primary_strategy=BREAKOUT.metadata(),
+            params={},
+            seed=_SEED,
+        )
+        await session.commit()
+    version = await make_model(conn)
+    await conn.execute(
+        insert(HoldoutOpening).values(
+            research_line="ETH/USDT:USDT",
+            holdout_from_ms=split.holdout_from_ms,
+            holdout_to_ms=split.holdout_to_ms,
+            opening_no=1,
+            experiment_id=eth,
+            model_version=version,
+        )
+    )
+    async with sessions() as session:
+        restored = await iteration_one_from_journal(
+            session,
+            split=split,
+            trading_symbol=BTC,
+            symbols=_symbols(books),
+            seed=_SEED,
+            target=_TARGET,
+            costs=_zero_costs(),
+        )
+    assert restored.hold_out_opened is True

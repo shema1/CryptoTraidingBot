@@ -34,6 +34,8 @@ from app.ml.validation import (
     build_split,
     create_experiment,
     invalidate_trial,
+    journal_trial_count,
+    line_trial_count,
     record_trial,
 )
 from tests.db.factories import make_audit, make_model
@@ -389,7 +391,11 @@ async def test_rejected_gate_writes_nothing(conn: AsyncConnection) -> None:
         assert (await session.execute(openings)).scalar_one() == 0
 
 
-async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnection) -> None:
+async def test_n_counts_every_trial_of_the_journal_across_lines(conn: AsyncConnection) -> None:
+    """Рішення 0026: N, розкид DSR і суперники PBO — усі спроби журналу, і іншої лінії теж (вибір символу — вибір).
+
+    До 0026 тест вимагав протилежного (інша лінія в N не входила) — поведінку змінено рішенням, а не послаблено.
+    """
     split = _split()
     _strong_r, junk_r = _paths(len(split.folds) * 2)
     async with AsyncSession(bind=conn) as session:
@@ -416,7 +422,7 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
             params={"name": "sibling"},
             folds=_records(split, junk_r),
         )
-        # Інша лінія (торговий символ ETH) у N цієї лінії не входить.
+        # Інша лінія (торговий символ ETH) — теж у N, у розкиді DSR і в PBO (рішення 0026).
         other_line = await _line(session, split, research_line=ETH)
         for name in ("eth-1", "eth-2"):
             await record_trial(
@@ -435,7 +441,10 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
                 model_version=model,
                 stress=_stress(split),
             )
-        assert caught.value.decision.n_trials == 5
+        assert caught.value.decision.n_trials == 7
+        # Лічильник лінії (нумерація спроб) лишається своїм: 5 спроб BTC, 7 — у журналі.
+        assert await line_trial_count(session, BTC) == 5
+        assert await journal_trial_count(session) == 7
         opened = await open_holdout_after_gate(
             session,
             experiment_id=experiment_id,
@@ -447,13 +456,24 @@ async def test_n_counts_every_trial_of_the_line_and_only_it(conn: AsyncConnectio
         row = (await session.execute(select(HoldoutOpening).where(HoldoutOpening.id == opened.opening_id))).scalar_one()
         result = row.result
         assert result is not None
-        assert result["n_trials_line"] == 5
-        # Розкид DSR — з рядів ≥ 30 угод: кандидат (90), junk і сусідня спроба (по 94); обрізана (6) — ні.
+        assert result["n_trials_line"] == 7
+        # Рішення 0026, рев'ю T2.21: обидві оцінки записані, у G1 — гірша (мінімум DSR, максимум PBO).
+        scopes = result["scopes"]
+        assert (scopes["line"]["n_trials"], scopes["journal"]["n_trials"]) == (5, 7)
+        assert Decimal(result["dsr"]) == min(Decimal(scopes["line"]["dsr"]), Decimal(scopes["journal"]["dsr"]))
+        assert Decimal(result["pbo"]) == max(Decimal(scopes["line"]["pbo"]), Decimal(scopes["journal"]["pbo"]))
+        assert result["dsr_scope"] in ("line", "journal")
+        # Розкид DSR — з рядів ≥ 30 угод з визначеним Sharpe: кандидат (90), junk і сусідня спроба (по 94). Обрізана (6)
+        # — ні; дві спроби ETH — ряд ETH з однакових R (Sharpe не визначений), у розкид не входять, хоч і в N.
         assert result["dsr_spread_trials"] == 3
         assert result["dsr_spread_floor"] is False
         assert Decimal(result["dsr_benchmark_sharpe"]) > 0
-        # PBO: кандидат, junk і спроба сусіднього експерименту; 32 доби з 45 оцінених (кратно 16), усі розбиття.
-        # Відрізок — від першого оціненого фолду кандидата, без прогріву (рішення 0024).
+        # PBO журналу: кандидат, junk, спроба сусіднього експерименту і дві спроби ETH (5); лінії — без ETH (3).
+        # Спроби ETH з постійним R тягнуть медіану OOS і знижують PBO журналу — у G1 іде вищий, лінійний (рішення 0026).
+        # 32 доби з 45 оцінених (кратно 16); відрізок — від першого оціненого фолду кандидата (рішення 0024).
+        assert (scopes["line"]["pbo_strategies"], scopes["journal"]["pbo_strategies"]) == (3, 5)
+        assert result["pbo_scope"] == "line"
+        assert Decimal(scopes["journal"]["pbo"]) < Decimal(scopes["line"]["pbo"])
         assert result["pbo_strategies"] == 3
         assert result["pbo_splits"] == 12870
         start = split.folds[ENTRY_RULE_WARMUP_FOLDS].test_start_ms

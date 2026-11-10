@@ -165,6 +165,10 @@ uv run python -m app.data.collector               # публічний WS лік
   спроба `direct`; повтор на тих самих фолдах — відмова), звіт `docs/research/<дата>-iteration-two-…md`. Коди — як
   вище, і 16 — ітерацію 2 не запущено (причина `kind` і підказка — у лозі `research_iteration_two_refused`); відмова —
   до будь-якого запису.
+- Обидві команди приймають `--trading-symbol` (рішення 0026): дослідницька лінія з `LINE_VARIANTS` (BTC — варіанти
+  baseline/A/B/C, ETH — лише B; без прапорця — `TRADING_SYMBOL`). Нова лінія бере запечатаний відрізок уже
+  існуючих (`program_sealed_holdout`); N для DSR — усі спроби журналу (`journal_trial_count`). Недозволений лінії
+  варіант — код 2 до підключення до БД.
 - launchd-агенти колектора й воркера на macOS — `scripts/macos/launch_agents.sh install|uninstall|status`
   (T1.12, ТЗ §12.1.1): `caffeinate -i -s`, перезапуск лише після ненульового коду, без перехоплення lock.
 

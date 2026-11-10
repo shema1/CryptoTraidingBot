@@ -226,6 +226,19 @@ cd apps/backend && caffeinate -i -s uv run python -m app.ml.research iteration-t
 вона пройшла G1, hold-out лінії вже відкривали або ітерацію 2 на цих фолдах уже прогнано (повтор з іншим seed —
 прихований вибір). Пише одну спробу `direct` у журнал лінії. Звіт — `docs/research/<дата>-iteration-two-btc-<варіант>.md`.
 
+**5. Другий символ — ETH** (рішення 0026, лише варіант `B`; ітерація 1, потім ітерація 2):
+
+```bash
+cd apps/backend && caffeinate -i -s uv run python -m app.ml.research iteration-one --variant B --trading-symbol ETH/USDT:USDT
+```
+
+```bash
+cd apps/backend && caffeinate -i -s uv run python -m app.ml.research iteration-two --variant B --trading-symbol ETH/USDT:USDT
+```
+
+Дані ETH ріжуться по кінцю вже запечатаного відрізка (той самий hold-out, що й у BTC). N для DSR — усі спроби
+журналу, тож у звіті ETH воно стартує з числа спроб BTC. Інший символ або варіант — код 2 (лише новим рішенням).
+
 ## 6. Веб-інтерфейс (поки каркас)
 
 ```bash

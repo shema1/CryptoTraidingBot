@@ -925,3 +925,93 @@ def test_too_few_evaluated_folds_do_not_pass() -> None:
     assert gate(3, GateThresholds(min_evaluated_folds=3)) == ()
     assert loosened_thresholds(GateThresholds(min_evaluated_folds=3)) == ("min_evaluated_folds",)
     assert loosened_thresholds(GateThresholds(min_evaluated_folds=6)) == ()
+
+
+def _exact_sharpe(rng: object, sharpe: float, n: int) -> tuple[Decimal, ...]:
+    import numpy as np
+
+    values = rng.normal(0, 1, n)  # type: ignore[attr-defined]
+    values = (values - values.mean()) / values.std(ddof=1)
+    return tuple(Decimal(str(round(float(value + sharpe), 6))) for value in np.asarray(values))
+
+
+def test_a_tight_cluster_of_other_line_trials_cannot_raise_the_dsr() -> None:
+    """Рев'ю T2.21 / рішення 0026: щільна група схожих Sharpe іншої лінії стискає розкид і знижує SR* — DSR за журналом
+    вищий, ніж за лінією. G1 бере гіршу оцінку (лінія), а не оптимістичнішу."""
+    import numpy as np
+
+    from app.ml.statistics import _worse_scope
+
+    rng = np.random.default_rng(3)
+    candidate = _exact_sharpe(rng, 0.40, 300)
+    eth = [candidate] + [_exact_sharpe(rng, value, 300) for value in (-0.35, -0.1, 0.3, 0.45)]
+    btc = [_exact_sharpe(rng, float(value), 400) for value in rng.normal(-0.03, 0.01, 25)]
+    returns = eth + btc
+    competing = [_no_span(item) for item in returns]
+    scoped = _worse_scope(returns, competing, candidate_index=0, in_line=[True] * len(eth) + [False] * len(btc))
+    assert scoped.journal_dsr.dsr is not None
+    assert scoped.line_dsr.dsr is not None
+    assert scoped.journal_dsr.dsr > scoped.line_dsr.dsr, "сценарій не відтворює ефект — тест порожній"
+    assert scoped.dsr_scope == "line"
+    assert scoped.dsr_detail.dsr == scoped.line_dsr.dsr
+    assert scoped.journal_dsr.n_trials == 30
+    assert scoped.line_dsr.n_trials == 5
+
+
+def test_losing_other_line_trials_cannot_lower_the_pbo() -> None:
+    """Систематично збиткові суперники іншої лінії тягнуть медіану OOS донизу (як бейзлайни в рішенні 0016) і знижують
+    PBO за журналом. G1 бере максимум."""
+    import numpy as np
+
+    from app.ml.statistics import TrialSeries, _worse_scope
+
+    day = 86_400_000
+
+    def series(rng: object, mu: float) -> TrialSeries:
+        days = np.sort(rng.choice(320, size=120, replace=False))  # type: ignore[attr-defined]
+        values = rng.normal(mu, 1.0, size=120)  # type: ignore[attr-defined]
+        return TrialSeries(
+            returns=tuple(Decimal(str(round(float(value), 6))) for value in values),
+            entry_ms=tuple(int(item) * day + 3_600_000 for item in days),
+            covered_from_ms=0,
+            covered_to_ms=320 * day,
+        )
+
+    found = False
+    for seed in range(10):
+        rng = np.random.default_rng(seed)
+        eth = [series(rng, 0.0) for _ in range(7)]
+        btc = [series(rng, -0.15) for _ in range(25)]
+        trials = eth + btc
+        scoped = _worse_scope(
+            [item.returns for item in trials],
+            trials,
+            candidate_index=0,
+            in_line=[True] * len(eth) + [False] * len(btc),
+        )
+        assert scoped.line_pbo.pbo is not None
+        assert scoped.journal_pbo.pbo is not None
+        assert scoped.pbo_detail.pbo == max(scoped.line_pbo.pbo, scoped.journal_pbo.pbo)
+        if scoped.journal_pbo.pbo < scoped.line_pbo.pbo:
+            found = True
+            assert scoped.pbo_scope == "line"
+    assert found, "жоден seed не відтворив зниження PBO — тест порожній"
+
+
+def test_one_line_journal_gives_the_same_estimate_in_both_scopes() -> None:
+    import numpy as np
+
+    from app.ml.statistics import _worse_scope
+
+    rng = np.random.default_rng(5)
+    returns = [_exact_sharpe(rng, value, 120) for value in (0.2, -0.1, 0.05)]
+    scoped = _worse_scope(returns, [_no_span(item) for item in returns], candidate_index=0, in_line=[True] * 3)
+    assert scoped.line_dsr == scoped.journal_dsr
+    assert (scoped.dsr_scope, scoped.pbo_scope) == ("journal", "journal")
+    with pytest.raises(ValueError, match="лінії"):
+        _worse_scope(returns, [_no_span(item) for item in returns], candidate_index=0, in_line=[False, True, True])
+
+
+def _no_span(_returns: tuple[Decimal, ...]) -> TrialSeries:
+    """Спроба без відрізка: у PBO не змагається (тест DSR), ряд для DSR передається окремо."""
+    return TrialSeries(returns=(), entry_ms=(), covered_from_ms=None, covered_to_ms=None)
