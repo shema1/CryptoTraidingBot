@@ -200,8 +200,9 @@ def test_report_shows_the_gate_numbers_reasons_and_that_the_holdout_stayed_seale
     inputs = SimpleNamespace(
         split=split,
         histories=(
-            SimpleNamespace(symbol=BTC, candles=_flat_bars(1500, missing=10)),
-            SimpleNamespace(symbol=ETH, candles=_flat_bars(1500)),
+            # Як у `load_research_inputs`: свічки лише до hold-out — запечатаний відрізок не пропуск.
+            SimpleNamespace(symbol=BTC, candles=_flat_bars(split.holdout_from_ms // HOUR, missing=10)),
+            SimpleNamespace(symbol=ETH, candles=_flat_bars(split.holdout_from_ms // HOUR)),
         ),
     )
     report = IterationOneReport(
@@ -226,7 +227,10 @@ def test_report_shows_the_gate_numbers_reasons_and_that_the_holdout_stayed_seale
     assert REASON_TEXT[G1_EVALUATED_FOLDS] in markdown
     assert "`ema_cross` (не краще за «завжди FLAT»)" in markdown
     assert "Спроб у лінії BTC/USDT:USDT після прогону: **9**" in markdown
-    assert "неповні 4h-кошики, без інтерполяції): BTC 1; ETH 0." in markdown
+    assert (
+        "Пропущених свічок ТФ до hold-out (дірки даних або неповні 4h-кошики, без інтерполяції): BTC 1; ETH 0."
+        in markdown
+    )
     assert "`iteration_two`" in markdown
 
 

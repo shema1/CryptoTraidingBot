@@ -628,7 +628,7 @@ def _data_section(
         f"мінімум угод на фолд {split.min_trades_per_fold}. Два перші фолди — прогрів правила входу (рішення 0024).",
         f"- Таймфрейм рішень і симуляції: {_timeframe_label(split.bar_ms)} "
         "(фічі — 1h-ряд на відкритті свічки, рішення 0025).",
-        "- Пропущених свічок ТФ у вікні (дірки даних або неповні 4h-кошики, без інтерполяції): "
+        "- Пропущених свічок ТФ до hold-out (дірки даних або неповні 4h-кошики, без інтерполяції): "
         + "; ".join(f"{_slug(item.symbol).upper()} {_missing_bars(item, split)}" for item in inputs.histories)
         + ".",
         f"- Таргет: TP {target.tp_atr_mult}·ATR, SL {target.sl_atr_mult}·ATR (ATR цього таймфрейму), "
@@ -741,11 +741,17 @@ def _timeframe_label(bar_ms: int) -> str:
 
 
 def _missing_bars(history: SymbolHistory, split: ResearchSplit) -> int:
-    """Скільки свічок ТФ бракує у вікні даних розбивки від першої свічки символу (кошик з діркою — пропуск)."""
-    inside = [bar.open_time_ms for bar in history.candles if split.data_from_ms <= bar.open_time_ms < split.data_to_ms]
+    """Скільки свічок ТФ бракує до hold-out від першої свічки символу у вікні (кошик з діркою — пропуск).
+
+    Дослідження бачить свічки лише до `holdout_from_ms` (`load_research_inputs` відрізає hold-out), тож і рахунок — до
+    нього: запечатаний рік у пропуски не входить.
+    """
+    inside = [
+        bar.open_time_ms for bar in history.candles if split.data_from_ms <= bar.open_time_ms < split.holdout_from_ms
+    ]
     if not inside:
         return 0
-    expected = (split.data_to_ms - inside[0]) // split.bar_ms
+    expected = (split.holdout_from_ms - inside[0]) // split.bar_ms
     return max(expected - len(inside), 0)
 
 
