@@ -4,7 +4,7 @@
 
 Статуси бота, цикл на закритті свічки, машина станів ордера (граф ТЗ §7.1, write-ahead `SUBMITTING`), розв'язання `SUBMISSION_UNKNOWN`, fills і облік капіталу, входи/виходи, перемикання моделі. Пауза, коли інструмент не торгується, — `instrument_status.py` (T1.7).
 
-> Заплановано: T3.1, T3.3, T3.4, T5.1, T5.2, T5.3, T5.4. Зараз є моделі БД (T0.4) і пауза `INSTRUMENT_NOT_TRADING` (T1.7).
+> Заплановано: T3.3, T3.4, T5.1, T5.2, T5.3, T5.4. Зараз є моделі БД (T0.4), пауза `INSTRUMENT_NOT_TRADING` (T1.7) і машина станів ордера (T3.1).
 
 ## Розділи ТЗ
 
@@ -17,6 +17,9 @@
 | --- | --- | --- |
 | `Bot`, `Signal`, `Order`, `OrderEvent`, `Fill`, `Position`, `DecisionLog` | `models.py` | таблиці торгового ядра |
 | `BOT_STATUSES`, `PAUSE_REASONS`, `SIGNAL_STATUSES`, `ORDER_STATES`, `ORDER_TERMINAL_STATES`, `ORDER_ORIGINS`, `POSITION_STATUSES`, `PROTECTION_STATUSES`, `CLOCK_TOLERANCE_MS` | `models.py` | набори значень як у ТЗ §6.1, §6.3, §7.1, §9, §11.4; допуск годинника `CLOCK_TOLERANCE_MS` = `CLOCK_DRIFT_LIMIT_MS` (1000 мс, `app/core/clock.py`, §4.3; міграція 0001 має його літералом — зміна ліміту потребує нової міграції). Формат `clientOrderId` для CHECK — `CLIENT_ORDER_ID_RE` з `app/exchange/types.py` (T1.1) |
+| `ALLOWED_TRANSITIONS`, `TRANSITION_SOURCES`, `check_transition`, `InvariantViolation`, `OrderConflict` | `order_state.py` | граф станів ордера — єдине місце (ТЗ §7.1 + рішення 0027): ребро → дозволені джерела події (факти біржі, зокрема `OPEN → EXPIRED`, — `WS`/`REST`; рішення бота — `LOCAL`; `SUBMISSION_UNKNOWN → REJECTED` — обидва); тайм-аут входу — скасування через `PENDING_CANCEL`; інше — `InvariantViolation` і лог `order_invariant_violation` (error); програна гонка OCC — `OrderConflict` (лог `order_version_conflict`) |
+| `NewOrder`, `OrderRef`, `create_order`, `transition_order`, `begin_submission`, `EXCHANGE_ID_EDGES` | `order_state.py` | `create_order` — `CREATED` з новим `clientOrderId` (`new_client_order_id(host_id)`, 36 символів) і подією `None → CREATED` (числа — додатні скінченні `Decimal`); `transition_order` — `UPDATE … WHERE id AND version AND state AND clientOrderId` (OCC; чужий `clientOrderId` у ref — `ValueError`, відсутній ордер — `LookupError`, обидва з логом error) і подія в `order_events` в одному savepoint (падіння запису події відкочує стан), коміт — за викликачем; `payload` перевіряється до запису (`Decimal` → рядок); `reject_code` — рівно для `→ REJECTED`; `exchange_order_id` — лише з подією біржі й обов'язковий на першому факті біржі (`EXCHANGE_ID_EDGES`), змінити записаний не дасть тригер; `begin_submission` — write-ahead `CREATED → SUBMITTING` у власній транзакції, закомічений до повернення (мережевий виклик — лише після і поза транзакцією; будь-який виняток — не відправляти) |
+| `exchange_target` | `order_state.py` | статус ордера біржі → стан (`NEW`/`UNTRIGGERED`/`TRIGGERED` → `OPEN`, `CANCELED`/`DEACTIVATED` → `CANCELED`, `UNKNOWN` → немає переходу); застосування статусів, що «перестрибують» стан або застаріли, — T3.3/T3.4 |
 | `instrument_pause_transition`, `apply_instrument_pauses`, `INSTRUMENT_NOT_TRADING` | `instrument_status.py` | додати/зняти причину `INSTRUMENT_NOT_TRADING`; `RUNNING` ↔ `PAUSED` лише через неї; OCC за `bots.version` |
 
 ## Таблиці БД

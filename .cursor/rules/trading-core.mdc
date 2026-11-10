@@ -14,6 +14,9 @@ alwaysApply: false
 - Таймаут / обрив / 5xx → `SUBMISSION_UNKNOWN`, а не `REJECTED`. Після «не знайдено → REJECTED»: вхідний ордер **не повторюється**, вихід `reduceOnly` — новим ордером з новим `clientOrderId`; з термінальних станів переходів немає. Розв'язання — строго за алгоритмом ТЗ §7.2 (до 3 перевірок за `clientOrderId`, ескалація через `unknown_escalation_s`).
 - Поки в бота є ордер у `SUBMISSION_UNKNOWN` — нові ордери цього бота не відправляються.
 - `PENDING_CANCEL → FILLED/PARTIALLY_FILLED` — легальний перехід (ордер встиг виконатись). Не трактувати як помилку.
+- `OPEN/PARTIALLY_FILLED/SUBMISSION_UNKNOWN → CANCELED` — скасування біржею без запиту бота (рішення 0027), лише з подією `WS`/`REST`. Джерело події задане для кожного ребра (`order_state.TRANSITION_SOURCES`): факт біржі з `LOCAL` — помилка інваріанта.
+- `OPEN → EXPIRED` — лише факт біржі; тайм-аут входу `entry_timeout_s` — скасування через `PENDING_CANCEL`, не локальний `EXPIRED` (інакше живий на біржі ордер вибуде з активних і новий вхід дасть подвійну позицію). `SUBMISSION_UNKNOWN → REJECTED` — локально («не знайдено») або з біржі («знайдено відхиленим»).
+- Код: `app/trading/order_state.py` — `transition_order` (OCC за `id`/`version`/`state`/`clientOrderId` + подія в одному savepoint, коміт за викликачем; `payload` перевіряється до запису; `exchange_order_id` — лише з подією біржі й обов'язковий на першому факті), `begin_submission` (write-ahead у власній транзакції з комітом до повернення; виняток — `place_order` не викликати), `OrderConflict` (програна гонка) ≠ `InvariantViolation` (поза графом). Писати в `orders`/`order_events` інше місце не може (тест).
 
 ## Цикл бота
 - `asyncio.Lock` на бота; advisory lock на процес; `version` (OCC) у `bots`.

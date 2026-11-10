@@ -9,18 +9,24 @@ paths:
 
 Джерело вимог: ТЗ §7 (`AppInfo.md`). Ця skill — чекліст, а не заміна ТЗ.
 
-## Таблиця переходів (єдине джерело в коді: `trading/order_state.py`, константа `ALLOWED_TRANSITIONS`)
+## Таблиця переходів (єдине джерело в коді: `trading/order_state.py`, `TRANSITION_SOURCES` / `ALLOWED_TRANSITIONS`)
 
 | З | В |
 |---|---|
 | CREATED | SUBMITTING |
 | SUBMITTING | OPEN, REJECTED, SUBMISSION_UNKNOWN |
-| SUBMISSION_UNKNOWN | OPEN, PARTIALLY_FILLED, FILLED, REJECTED |
-| OPEN | PARTIALLY_FILLED, FILLED, PENDING_CANCEL, EXPIRED |
-| PARTIALLY_FILLED | FILLED, PENDING_CANCEL |
+| SUBMISSION_UNKNOWN | OPEN, PARTIALLY_FILLED, FILLED, REJECTED, CANCELED |
+| OPEN | PARTIALLY_FILLED, FILLED, PENDING_CANCEL, EXPIRED, CANCELED |
+| PARTIALLY_FILLED | FILLED, PENDING_CANCEL, CANCELED |
 | PENDING_CANCEL | CANCELED, FILLED, PARTIALLY_FILLED |
 
 Термінальні: FILLED, CANCELED, REJECTED, EXPIRED. Частковий fill + скасування залишку = CANCELED з `filled_qty > 0`.
+`OPEN/PARTIALLY_FILLED/SUBMISSION_UNKNOWN → CANCELED` — скасування **біржею** без запиту бота (рішення 0027).
+Джерело події задане для кожного ребра (`TRANSITION_SOURCES`): факти біржі (зокрема `OPEN → EXPIRED`) — лише
+`WS`/`REST`, рішення бота (`CREATED → SUBMITTING`, `→ PENDING_CANCEL`, `SUBMITTING → SUBMISSION_UNKNOWN`) — лише
+`LOCAL`, `SUBMISSION_UNKNOWN → REJECTED` — будь-яке («не знайдено» — бот, «знайдено відхиленим» — біржа). Тайм-аут
+входу — скасування через `PENDING_CANCEL`, не локальний `EXPIRED`. Перший факт біржі (`EXCHANGE_ID_EDGES`) несе
+`exchange_order_id`. Статус біржі → стан — `exchange_target`.
 
 ## Порядок роботи
 

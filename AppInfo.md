@@ -595,7 +595,11 @@ EV     = p · TP_net − (1 − p) · SL_net
 | `OPEN` / `PARTIALLY_FILLED` | `PENDING_CANCEL` | відправлено скасування |
 | `PENDING_CANCEL` | `CANCELED` | біржа підтвердила скасування |
 | `PENDING_CANCEL` | `FILLED` / `PARTIALLY_FILLED` | ордер встиг виконатися до скасування |
-| `OPEN` | `EXPIRED` | вичерпано `timeInForce` або `entry_timeout_s` |
+| `OPEN` | `EXPIRED` | біржа повідомила, що вичерпано `timeInForce` (лише факт біржі) |
+| `OPEN` / `PARTIALLY_FILLED` | `CANCELED` | біржа скасувала сама, без запиту бота (залишок IOC, `reduceOnly` без позиції, деактивація) |
+| `SUBMISSION_UNKNOWN` | `CANCELED` | ордер знайдено на біржі вже скасованим |
+
+**Джерело події** задане для кожного переходу (рішення `docs/decisions/0027-exchange-initiated-cancel.md`): факти біржі (прийнято, виконано, скасовано, вичерпано, біржа відхилила, знайдено після невизначеності) — лише з WS/REST; рішення бота (`CREATED → SUBMITTING`, `→ PENDING_CANCEL`, `SUBMITTING → SUBMISSION_UNKNOWN`) — лише локальні; `SUBMISSION_UNKNOWN → REJECTED` — локальне («не знайдено після вікна перевірки») або з біржі («знайдено відхиленим»). Інше джерело — помилка інваріанта, як і недозволений перехід. Тайм-аут входу `entry_timeout_s` бот **не** оформлює як `EXPIRED` сам: він відправляє скасування (`OPEN → PENDING_CANCEL → CANCELED`, розділ 6.3) — інакше ордер, ще живий на біржі, вибув би з активних, і новий вхід дав би подвійну позицію.
 
 Термінальні стани: `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED`. З термінального стану переходів немає: повторна спроба — це **новий** ордер (новий запис і новий `clientOrderId`), і лише для виходів (розділ 7.2). Часткове виконання з наступним скасуванням залишку фіксується як `CANCELED` з `filled_qty > 0`.
 

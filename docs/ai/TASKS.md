@@ -563,13 +563,15 @@
 
 ### Етап 3. Біржовий шар
 
-#### T3.1 · Машина станів ордера `[ ]`
+#### T3.1 · Машина станів ордера `[x]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `order-state-machine` · **ТЗ:** §7.1, §7.2
 - **Зробити:** таблиця переходів в одному місці; з термінальних станів переходів немає; OCC; `order_events` в тій самій транзакції; write-ahead `SUBMITTING`; `clientOrderId = "tb" + HOST_ID + uuid4().hex` (36 символів, ТЗ §7.2).
 - **Готово, коли:** тест кожного дозволеного і недозволеного переходу; property-тест послідовностей подій; конкурентний апдейт. Рев'ю: `trading-safety-reviewer`.
 - **Передано з попередніх задач** (у дужках — задача, у примітці якої подробиці):
   - (T0.4) стани — `ORDER_STATES` з `app/trading/models.py`; граф переходів у БД не дублюється.
   - (T1.1) результат `place_order` класифікується лише через `is_definite_rejection` (`app/exchange/errors.py`); ордер біржі зі статусом `UNKNOWN` не є «знайдено» і переходу не дає.
+- **Примітки (2026-11-10):** `app/trading/order_state.py` — граф в одному місці (`TRANSITION_SOURCES` → `ALLOWED_TRANSITIONS`): ТЗ §7.1 + три ребра «скасовано біржею» `OPEN/PARTIALLY_FILLED/SUBMISSION_UNKNOWN → CANCELED` (рішення 0027, підтверджене власником) і джерело події для кожного ребра (факти біржі, зокрема `OPEN → EXPIRED`, — `WS`/`REST`; рішення бота — `LOCAL`; `SUBMISSION_UNKNOWN → REJECTED` — обидва). `check_transition` → `InvariantViolation` + лог error; `exchange_target` (статус біржі → стан). БД: `create_order` (`CREATED`, `new_client_order_id`, подія), `transition_order` (OCC `id/version/state/clientOrderId` + подія в одному savepoint, коміт за викликачем; `OrderConflict`, `LookupError`, `ValueError` для чужого `clientOrderId`; `payload` перевіряється до запису; `exchange_order_id` — лише з подією біржі й обов'язковий на першому факті), `begin_submission` (write-ahead з комітом до повернення). Міграції немає: граф у БД не дублюється, з термінального стану не виводить тригер `ctb_orders_guard()`. Тести: `tests/trading/test_order_state.py` (таблиця ТЗ літералом, декартів добуток, джерела, hypothesis, «пише лише цей модуль»), `tests/trading/test_order_state_db.py` (кожне ребро з кожним джерелом, OCC, підроблений стан/`clientOrderId`, атомарність, payload, write-ahead з іншого з'єднання, конкурентний апдейт). `_wait_until_blocked` (тут і `tests/db/test_concurrency.py`) очищає знімок `pg_stat_activity` на кожній ітерації.
+- **Рев'ю `trading-safety-reviewer` (Opus 5.5, 2026-11-10): блокерів немає, 4 важливі — виправлено.** (1) `OPEN → EXPIRED` з `LOCAL` → подвійна позиція: тепер лише факт біржі, тайм-аут входу — скасування (ТЗ §7.1, 0027, підтверджено власником); (2) `SUBMISSION_UNKNOWN → REJECTED` з біржі не проходив — тепер і `WS`/`REST`; (3) `payload` з `Decimal` падав після UPDATE — перевірка до запису + savepoint; (4) `clientOrderId` ref не звірявся — тепер у WHERE. Дрібні: лог `LookupError`, `exchange_order_id` лише з подією біржі, докстрінг `begin_submission` (виняток — не відправляти; блокування в одному корутині; ізоляція), тест «пише лише цей модуль», прогалини тестів. Передано: `host_id` з конфігу й `allowed_host_id` (T3.6/T5.1), доказ RiskGate перед входом (T4.1).
 
 #### T3.2 · Bybit: торгові методи та мапінг помилок `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `exchange-adapter` · **ТЗ:** §3, §6.6, §9.1
@@ -582,6 +584,7 @@
   - (T1.6) CCXT `options.recvWindow` = `Settings.recv_window_ms`, підпис — локальним часом; retCode `10002` → `ClockGuard.request_recheck`. **Рішення користувача** (ТЗ §4.3 не змінено): годинник, що випереджає біржу на ≥ 1 с, дає `10002` на **всі** приватні запити, включно з SL, примусовим закриттям і Emergency Stop. Варіант: на `10002` для `reduceOnly` / SL / закриття повторювати з часом, виправленим на виміряний зсув.
   - (T1.7) після відхилення через фільтри — `InstrumentCache.refresh_after_rejection` (коди — `app/exchange/README.md`).
   - (T2.2) у `set_leverage` виставляти `PositionSize.leverage`: воно може бути нижче за `min(конфіг, instruments.max_leverage)`, бо відстань до ліквідації тримає `min_liq_distance_sl_multiple`. Вхідний ордер — лише після підтвердженого `set_leverage` на це значення: інакше лишиться старе, вище плече, і ліквідація може опинитись ближче за SL; не підтверджено — входу немає. Крок `LEVERAGE_STEP` `0.01` — `TODO(verify-bybit)`.
+  - (T3.1) мапінг статусів Bybit у `ExchangeOrderStatus`: `PartiallyFilledCanceled` → `CANCELED` з `filled_qty > 0`, `Deactivated` → `DEACTIVATED` (рішення 0027); стан — `order_state.exchange_target`.
 
 #### T3.3 · Розв'язання `SUBMISSION_UNKNOWN` `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `order-state-machine` · **ТЗ:** §7.2
@@ -591,6 +594,7 @@
   - (T0.4) ордер, знайдений після `REJECTED`, обробляється лише через fills; `IntegrityError` переходу не обриває звірку.
   - (T1.1) ордер зі статусом `UNKNOWN` не є «знайдено» для розв'язання `SUBMISSION_UNKNOWN`.
   - (T1.6) **Рішення користувача** (ТЗ §7.2 не змінено): три перевірки з інтервалом 2–3 с коротші за вікно, в якому Bybit ще може прийняти запит (`recv_window` + ~1 с після відправки), тож «не знайдено → REJECTED» може прийти раніше за пізній вхід. Варіант: остання перевірка — не раніше `submit + recv_window_ms + CLOCK_DRIFT_LIMIT_MS`. `TODO(verify-bybit)`: де Bybit перевіряє `recvWindow`.
+  - (T3.1) переходи — лише `order_state.transition_order`. «Знайдено відхиленим» — `SUBMISSION_UNKNOWN → REJECTED` з `REST`/`WS`, «не знайдено» — з `LOCAL`; «знайдено скасованим» — `→ CANCELED` (0027). Перший факт біржі несе `exchange_order_id`. Застарілі чи повторні статуси (напр. `NEW` при `PENDING_CANCEL`, повторний `FILLED`, `OPEN` при `OPEN`) — no-op, а не `InvariantViolation`; статус, що «перестрибує» стан (`SUBMITTING` + `FILLED`), — через `OPEN` (кожне ребро — подія). Виняток з `begin_submission` — `place_order` не викликати.
 
 #### T3.4 · Fills, `ledger`, `equity_snapshots` `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · **ТЗ:** §7.2, §15
@@ -599,6 +603,7 @@
 - **Передано з попередніх задач** (у дужках — задача, у примітці якої подробиці):
   - (T0.4) ордери `EXCHANGE` — з fill-подій, з `bot_id` і `qty` з виконань; явний мапінг видів `ledger` (TRANSFER, BONUS, комісії ліквідації), невідомий вид — помилка; `equity_snapshots` — `ON CONFLICT DO NOTHING`; символи Bybit → формат CCXT до вставки.
   - (T0.4) обробник fills не оновлює рядок `bots` в одній транзакції зі вставкою ордера/позиції і повторює захисні операції при SQLSTATE `40P01`.
+  - (T3.1) `filled_qty` — кеш `fills`, переходом не пишеться; стан ордера від fills — лише через `transition_order` з джерелом `WS`/`REST`; `payload` події — JSON (`Decimal` → рядок).
 
 #### T3.5 · Приватний WebSocket і реконект `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · **ТЗ:** §5.5, §11.2
@@ -615,6 +620,7 @@
   - (T0.3) ключі біржі — лише `SecretStr`-поля `Settings` (логер маскує їх за значенням).
   - (T0.4) набір `key_check_result` можна уточнити новою міграцією.
   - (T0.6) процесні тести (`tests/db/test_instance_lock_process.py`) обнуляють `BYBIT_*` в оточенні дочірнього процесу.
+  - (T3.1) `create_order(host_id=...)` бере `HOST_ID` від викликача: після T3.6 — лише з конфігу й звірений з `exchange_accounts.allowed_host_id` (інваріант 13).
 
 #### T3.7 · Перевірка припущень про Bybit на Testnet і Demo `[ ]`
 - **Ризик:** R2 · **Модель:** Opus 5.5 (`opus`, `high`) · skill `chaos-scenario` · **ТЗ:** §19
@@ -626,6 +632,7 @@
   - (T1.3) чи вистачає `KLINE_FINALITY_MARGIN_MS` (500 мс) на mainnet.
   - (T1.6) де саме Bybit перевіряє `recvWindow` (див. T3.3).
   - (T2.2) крок `set_leverage` для linear USDT: `LEVERAGE_STEP` `0.01` у `app/risk/sizing.py` (`TODO(verify-bybit)`). `isolated_liq_price` — оцінка для порівняння на Testnet, не точна ціна біржі (комісію закриття формула покриває не повністю).
+  - (T3.1, рішення 0027) TODO(verify-bybit): статуси самоскасування Bybit (`PartiallyFilledCanceled` для IOC, скасування `reduceOnly` без позиції, `Deactivated`) — на Testnet.
 
 ### Етап 4. Ризик і захист
 
@@ -640,6 +647,7 @@
   - (T1.6) перед входом — `ClockGuard.state(scope).entries_allowed` для акаунта бота; причина відмови — у `decision_log`.
   - (T1.7) перед входом — `entry_block` (`INSTRUMENT_UNKNOWN`, `INSTRUMENT_NOT_TRADING`, `INSTRUMENT_RULES_STALE`).
   - (T2.2) ядро входу — `assess_entry`, з `bot_open_positions` (позиції бота) і `open_positions` (акаунта). `entry_price` — котирування на момент відправки, SL/TP — від нього ж (ТЗ §6.6), не ціна сигналу: інакше різниця до `max_slippage_bps` у бюджет ризику не потрапить (вузький стоп — до +13% понад `risk_usd`). Окремо `check_entry_slippage` (котирування проти ціни сигналу; у `assess_entry` його немає). Входи ботів одного акаунта серіалізувати на рівні акаунта, а в `open_positions` і `current_notional` рахувати й вхідні ордери в дорозі (`SUBMITTING`, `NEW`, `SUBMISSION_UNKNOWN`): `asyncio.Lock` на бота не заважає двом ботам одночасно побачити ту саму кількість позицій і обом увійти понад `max_open_positions` / `max_total_exposure_pct`. `entry_is_maker` у v1 завжди `False` (post-only вимкнено, ТЗ §6.6). День і просадка — з `total_equity`; total equity вище за пік зі знімка — нова вершина, не помилка. `RiskLimits` у `risk_config.params`: писати `model_dump_json()`, читати `model_validate_json()` (схема strict; `model_validate` на dict з JSONB відхиляє рядки і float, а float втратив би точність). Якщо `max_funding_rate_abs` заданий, передати ставку і бік, інакше `RISK_FUNDING`. MMR і `mm_deduction` передає гейт: розмір розрахований на тир 1 (deduction 0) — номінал не вище межі тиру 1 risk limit символу (найпростіше — `max_notional_per_symbol_usd` не вище за неї); при deduction > 0 розмір безпечний, але може вийти в рази меншим. `ValueError` на зіпсованих якорях — fail-closed, входу немає. Запис `risk_events` — тут, не в чистих функціях.
+  - (T3.1) `create_order`/`begin_submission` не вимагають доказу проходження RiskGate для `reduce_only=False`: вхід має йти лише після рішення RiskGate (наприклад, рішення як аргумент `begin_submission`).
 
 #### T4.2 · Ліміти рахунку та статуси Risk Engine `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · **ТЗ:** §8.2, §8.5, §15
@@ -719,6 +727,7 @@
   - (T2.11) перед циклом — `require_model_for_start(session, model_version, mode)`: Live лише `APPROVED`, Demo/Testnet ще `CANDIDATE`; `TRAINED` і `RETIRED` не стартують. Модель — лише `load_registered_model` (файли звірені з БД), не `load_model`. Meta — `infer_entry(loaded, values, mode=, columns=FeatureRows.columns, …)` (сам дописує `side_long` і кличе `decide_entry`); `rule_only` — `accept_primary(…, mode=)`. `assert_runtime` блокує розбіжність схеми, `preprocessing_version`, `lightgbm` і записаного `xgboost`. Коридор уже на моделі, тут його не рахувати.
   - (T2.7) напрямок первинної стратегії — `primary_side(spec, candles, entry_index, seed=)` з `app/ml/strategy.py`. Свічка входу — лише її `open_time_ms`; OHLC входу правило не читає. EMA — ті самі 20/50 і те саме вікно, що фічі. Сигнал без ML-фільтра не торгується. Свічка входу мусить бути в `candles` (`entry_index < len`), інакше `ValueError("немає свічки входу")`: буфер закритих свічок цього не має — додати свічку, що відкривається, або змінити сигнатуру на час входу, з parity-тестом проти дослідження (у буфері рівно `FEATURE_LOOKBACK_BARS` вікно попередньої EMA на бар коротше, ніж на повній історії).
   - (T2.1) фічі деривативів читають години до `T - DERIVATIVE_LAG_MS` (1 год): година `[T-2h, T-1h)` має бути в БД до рішення. Перевіряти години `derivative_window(source, T)` для кожного джерела моделі. `BACKFILL_INTERVAL_S` конфіг дозволяє до доби (за замовчуванням 600 с): понад ~50 хв година `[T-2h, T-1h)` не встигне, рядки live стануть недійсними, а бектест торгуватиме ці години — потрібен тест-інваріант між інтервалом і лагом (так само для `SEAL_MARGIN_MS`). Буфер — `FeatureBuffer` з `enabled_sources` моделі; `latest()` не знає часу рішення — перевіряти `entry_open_time_ms == T` (інакше після пропущеної свічки рядок застарілий). `gaps["funding"]` подавати однаково в буфер і офлайн.
+  - (T3.1, рішення 0027) тайм-аут входу `entry_timeout_s` — скасування `OPEN → PENDING_CANCEL → CANCELED`, не локальний `EXPIRED`.
 
 #### T5.3 · Входи, виходи, time-stop `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · **ТЗ:** §6.6

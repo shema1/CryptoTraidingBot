@@ -93,7 +93,8 @@ class TriggerBy(StrEnum):
 
 
 class ExchangeOrderStatus(StrEnum):
-    """Статус ордера **на біржі** (факт). Це не стан машини станів `ORDER_STATES` (ТЗ §7.1) — мапінг робить T3.1.
+    """Статус ордера **на біржі** (факт). Це не стан машини станів `ORDER_STATES` (ТЗ §7.1) — мапінг:
+    `app.trading.order_state.exchange_target` (T3.1, рішення 0027).
 
     - `CANCELED` у деривативах може мати `filled_qty > 0` (частковий fill, далі скасування залишку, ТЗ §7.1).
     - `TRIGGERED` — миттєвий перехід умовного ордера з `UNTRIGGERED` у звичайний. Bybit відносить його до закритих

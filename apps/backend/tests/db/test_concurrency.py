@@ -46,6 +46,8 @@ async def _committed_bot(engine: AsyncEngine) -> tuple[uuid.UUID, uuid.UUID]:
 async def _wait_until_blocked(observer: AsyncConnection, pid: int) -> None:
     """Опитує, доки сесія `pid` не чекає на блокування (детерміновано, без sleep)."""
     for _ in range(_MAX_POLLS):
+        # Статистика кешується на транзакцію спостерігача: без очищення опитування бачать той самий знімок.
+        await observer.execute(text("SELECT pg_stat_clear_snapshot()"))
         waiting = await observer.scalar(
             text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"), {"pid": pid}
         )
