@@ -15,15 +15,16 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import aiohttp
 import pytest
 from pydantic import SecretStr, ValidationError
 
 from app.core.config import RECV_WINDOW_MAX_MS, RECV_WINDOW_MIN_MS
-from app.exchange.bybit import ExchangeMode
+from app.exchange.bybit import PRIVATE_HOSTS, ExchangeMode
 from app.exchange.bybit_codes import PATH_ACCOUNT_INFO, PATH_ORDER_CREATE, PATH_ORDER_REALTIME, PRIVATE_ROUTES
-from app.exchange.bybit_private import PRIVATE_HOSTS, BybitCredentials, CcxtBybitPrivateClient
+from app.exchange.bybit_private import BybitCredentials, CcxtBybitPrivateClient
 from app.exchange.errors import AdapterConfigError, ExchangeUnavailable
 from tests.exchange.test_bybit_ccxt_client import Reply, _PendingRequest
 
@@ -147,7 +148,7 @@ async def test_cursor_is_percent_encoded_once_and_the_signature_covers_the_encod
 
 @pytest.mark.asyncio
 async def test_post_sends_compact_json_body_and_signs_it() -> None:
-    params: dict[str, str | bool] = {
+    params: dict[str, str | bool | int] = {
         "category": "linear",
         "symbol": "BTCUSDT",
         "side": "Buy",
@@ -156,6 +157,7 @@ async def test_post_sends_compact_json_body_and_signs_it() -> None:
         "price": "65000.5",
         "orderLinkId": "tbHOST1abc",
         "reduceOnly": False,
+        "positionIdx": 0,
     }
     async with _client() as (client, session):
         await client.request(PATH_ORDER_CREATE, params)
@@ -167,6 +169,7 @@ async def test_post_sends_compact_json_body_and_signs_it() -> None:
     body = request.body.decode()
     assert json.loads(body) == params
     assert '"reduceOnly":false' in body  # bool — JSON-літерал, не рядок "False"
+    assert '"positionIdx":0' in body  # ціле — число, як вимагає документація v5
     _assert_signed(request, body)
 
 
@@ -187,7 +190,11 @@ async def test_unknown_path_and_wrong_value_types_are_refused_before_the_network
         with pytest.raises(TypeError):
             await client.request(PATH_ORDER_REALTIME, {"openOnly": True})
         with pytest.raises(TypeError):
-            await client.request(PATH_ORDER_CREATE, {"qty": 1})  # type: ignore[dict-item]
+            await client.request(PATH_ORDER_CREATE, {"qty": 1})  # ціле — лише `positionIdx`
+        with pytest.raises(TypeError):
+            await client.request(PATH_ORDER_CREATE, {"qty": Decimal("1")})  # type: ignore[dict-item]
+        with pytest.raises(TypeError):
+            await client.request(PATH_ORDER_CREATE, {"qty": 1.5})  # type: ignore[dict-item]
     assert session.sent == []
 
 

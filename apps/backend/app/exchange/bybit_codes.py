@@ -29,7 +29,16 @@ from app.exchange.errors import (
     RateLimited,
     RequestRejected,
 )
-from app.exchange.types import ExchangeOrderStatus, ExecType, MarginMode, StopOrderType
+from app.exchange.types import (
+    ExchangeOrderStatus,
+    ExecType,
+    MarginMode,
+    OrderType,
+    Side,
+    StopOrderType,
+    TimeInForce,
+    TriggerBy,
+)
 
 # --- Шляхи й маршрути CCXT (`ccxt/abstract/bybit.py`) ---
 PATH_ORDER_CREATE: Final = "v5/order/create"
@@ -88,7 +97,7 @@ _REJECTIONS: Final[Mapping[Operation, Mapping[str, type[RequestRejected]]]] = Ma
                 "10027": OrderRejected,  # торгівлю заборонено
                 "10029": OrderRejected,  # символ не в білому списку ключа
                 "110003": OrderRejected,  # ціна поза дозволеним діапазоном
-                "110017": OrderRejected,  # кількість округлюється до нуля
+                "110017": OrderRejected,  # кількість округлюється до нуля (v5; у CCXT 4.5.91 — правило reduce-only)
                 "110020": OrderRejected,  # понад 500 активних ордерів
                 "110094": OrderRejected,  # номінал нижче мінімуму
                 "110004": InsufficientMargin,  # брак балансу гаманця
@@ -127,7 +136,8 @@ def error_for(op: Operation, code: str, message: str, *, client_order_id: str | 
     if rejection is not None:
         return rejection(code, message)
     if code in _AUTH:
-        return ExchangeAuthError(f"bybit {code}: {message}")
+        # Без `retMsg`: на невірний підпис Bybit може повернути рядок підпису (`origin_string[...]`) разом із ключем.
+        return ExchangeAuthError(f"bybit {code}")
     if code in _CONFIG:
         return AdapterConfigError(f"bybit {code}: {message}")
     if code == RATE_LIMIT_CODE:
@@ -223,3 +233,21 @@ def margin_mode(raw: str) -> MarginMode:
 # `unifiedMarginStatus`: 5 / 6 — UTA 2.0 (pro). Інші (класичний акаунт, UTA 1.0) мають іншу семантику маржі й
 # ордерів (`switch-isolated`, `openOnly`), тож адаптер їх не підтримує. TODO(verify-bybit): статус акаунта Testnet.
 SUPPORTED_UNIFIED_STATUSES: Final = frozenset({5, 6})
+
+
+# --- Значення запиту (домен → Bybit v5) ---
+SIDE_REQUEST: Final[Mapping[Side, str]] = MappingProxyType({Side.BUY: "Buy", Side.SELL: "Sell"})
+ORDER_TYPE_REQUEST: Final[Mapping[OrderType, str]] = MappingProxyType(
+    {OrderType.MARKET: "Market", OrderType.LIMIT: "Limit"}
+)
+TIME_IN_FORCE_REQUEST: Final[Mapping[TimeInForce, str]] = MappingProxyType(
+    {TimeInForce.GTC: "GTC", TimeInForce.IOC: "IOC", TimeInForce.FOK: "FOK"}
+)
+TRIGGER_BY_REQUEST: Final[Mapping[TriggerBy, str]] = MappingProxyType(
+    {TriggerBy.MARK_PRICE: "MarkPrice", TriggerBy.LAST_PRICE: "LastPrice", TriggerBy.INDEX_PRICE: "IndexPrice"}
+)
+# `positionIdx` one-way (ціле в JSON, документація v5); hedge mode адаптер не підтримує.
+ONE_WAY_POSITION_IDX: Final = 0
+# SL/TP на всю позицію (ТЗ §9.1). У режимі `Full` Bybit приймає лише ринкове спрацювання (`tp/slOrderType=Market`).
+TPSL_MODE_FULL: Final = "Full"
+TPSL_ORDER_TYPE: Final = "Market"

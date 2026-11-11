@@ -35,6 +35,8 @@ ExchangeError
 
 from __future__ import annotations
 
+from typing import Final
+
 
 class ExchangeError(Exception):
     """База всіх доменних помилок біржі."""
@@ -130,10 +132,19 @@ class ExchangeAuthError(ExchangeError):
 
 
 class AdapterConfigError(ExchangeError):
-    """Непідтримувана конфігурація: category ≠ linear, hedge mode, режим маржі не isolated (ТЗ §3, §9.1).
+    """Непідтримувана конфігурація або виклик, якого адаптер не робить за побудовою (ТЗ §3, §9.1).
 
-    Адаптер з такою конфігурацією не стартує; позиція не в one-way режимі — помилка, а не пропуск.
+    Конфігурація: category ≠ linear, hedge mode, акаунт не UTA 2.0 чи не isolated, хост не того режиму, ключів немає —
+    адаптер з нею не стартує; позиція не в one-way режимі — помилка, а не пропуск. Виклик: Bybit `retCode 10017` /
+    HTTP 404 (маршрут), `set_margin_mode(CROSS)`, приватний потік до T3.5. Запит із цим винятком не виконано, але
+    `is_definite_rejection` для нього `False`: це помилка налаштування, а не відмова ринку.
     """
+
+
+# Локальні коди відмови `set_position_protection` (без запису на біржу): однакові в адаптері Bybit і у фейку.
+# `ZERO_POSITION` може означати й «REST ще не бачить позицію одразу після fill» — це не відмова ціни SL (T4.3).
+ZERO_POSITION_CODE: Final = "ZERO_POSITION"
+POSITION_SIDE_MISMATCH_CODE: Final = "POSITION_SIDE_MISMATCH"
 
 
 def is_definite_rejection(exc: BaseException) -> bool:

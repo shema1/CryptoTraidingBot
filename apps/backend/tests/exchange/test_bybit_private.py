@@ -14,7 +14,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from app.core.clock import FakeClock
-from app.exchange.bybit import EXECUTION_WINDOW_MS, BybitAdapter, BybitRawResponse, ExchangeMode
+from app.exchange.bybit import EXECUTION_WINDOW_MS, BybitAdapter, BybitRawResponse, ExchangeMode, PrivateValue
 from app.exchange.bybit_codes import (
     PATH_ACCOUNT_INFO,
     PATH_EXECUTION_LIST,
@@ -45,7 +45,8 @@ from app.exchange.types import (
 from tests.exchange.factories import FAKE_NOW_MS, VALID_CLIENT_ORDER_ID
 from tests.exchange.test_bybit_public import _JITTER, SERVER, ScriptedClient, SpyLimiter, _ok, _raw, _sleep_for
 
-Handler = Callable[[str, dict[str, str | bool]], BybitRawResponse]
+Params = dict[str, PrivateValue]
+Handler = Callable[[str, Params], BybitRawResponse]
 DAY = 24 * 3_600_000
 
 
@@ -54,11 +55,11 @@ class ScriptedPrivateClient:
 
     def __init__(self, handler: Handler) -> None:
         self._handler = handler
-        self.calls: list[tuple[str, dict[str, str | bool]]] = []
-        self.private_origin = "https://api-testnet.example"
+        self.calls: list[tuple[str, Params]] = []
+        self.private_origin = "https://api-testnet.bybit.com"
         self.closed = False
 
-    async def request(self, path: str, params: Mapping[str, str | bool]) -> BybitRawResponse:
+    async def request(self, path: str, params: Mapping[str, PrivateValue]) -> BybitRawResponse:
         recorded = dict(params)
         self.calls.append((path, recorded))
         return self._handler(path, recorded)
@@ -247,7 +248,7 @@ async def test_balance_without_usdt_is_zero_and_without_unified_is_malformed(fak
 
 
 def _positions_handler(rows: list[dict[str, object]], *, margin: str = "ISOLATED_MARGIN") -> Handler:
-    def handler(path: str, _params: dict[str, str | bool]) -> BybitRawResponse:
+    def handler(path: str, _params: Params) -> BybitRawResponse:
         if path == PATH_ACCOUNT_INFO:
             return _raw(_account(margin))
         assert path == PATH_POSITION_LIST
@@ -303,9 +304,9 @@ async def test_hedge_mode_position_is_a_config_error_not_a_skip(fake_clock: Fake
 
 @pytest.mark.asyncio
 async def test_position_cursor_is_followed_to_the_end(fake_clock: FakeClock) -> None:
-    seen: list[str | bool | None] = []
+    seen: list[PrivateValue | None] = []
 
-    def handler(path: str, params: dict[str, str | bool]) -> BybitRawResponse:
+    def handler(path: str, params: Params) -> BybitRawResponse:
         if path == PATH_ACCOUNT_INFO:
             return _raw(_account())
         seen.append(params.get("cursor"))
@@ -388,7 +389,7 @@ def test_order_status_mapping(raw: str, expected: ExchangeOrderStatus) -> None:
 
 
 def _by_link(realtime: list[dict[str, object]], history: list[dict[str, object]]) -> Handler:
-    def handler(path: str, params: dict[str, str | bool]) -> BybitRawResponse:
+    def handler(path: str, params: Params) -> BybitRawResponse:
         assert params == {"category": "linear", "symbol": "BTCUSDT", "orderLinkId": VALID_CLIENT_ORDER_ID}
         return _raw(_list(realtime if path == PATH_ORDER_REALTIME else history))
 
@@ -462,9 +463,9 @@ async def test_filled_order_without_average_price_is_malformed(fake_clock: FakeC
 @pytest.mark.asyncio
 async def test_executions_split_into_seven_day_windows_skip_funding_and_sort(fake_clock: FakeClock) -> None:
     start = FAKE_NOW_MS - 10 * DAY
-    windows: list[tuple[str | bool, str | bool]] = []
+    windows: list[tuple[PrivateValue, PrivateValue]] = []
 
-    def handler(path: str, params: dict[str, str | bool]) -> BybitRawResponse:
+    def handler(path: str, params: Params) -> BybitRawResponse:
         assert path == PATH_EXECUTION_LIST
         windows.append((params["startTime"], params["endTime"]))
         if params["startTime"] == str(start):
@@ -508,6 +509,22 @@ async def test_unknown_exec_type_and_conflicting_duplicate_are_malformed(fake_cl
         with pytest.raises(ValueError, match="end_ms"):
             await adapter.fetch_executions(priority=RequestPriority.RECONCILE, start_ms=start, end_ms=start)
         assert private.calls == []
+
+
+@pytest.mark.asyncio
+async def test_open_ended_executions_reach_the_exchange_now_even_if_the_local_clock_lags(fake_clock: FakeClock) -> None:
+    """Локальний годинник може відставати від біржі (до 1 с, ТЗ §4.3): fill «у біржовому зараз» не губиться."""
+    start = FAKE_NOW_MS - DAY
+    seen: list[Params] = []
+
+    def handler(_path: str, params: Params) -> BybitRawResponse:
+        seen.append(params)
+        return _raw(_list([_exec_row(execTime=str(FAKE_NOW_MS + 900))]))
+
+    async with _open(fake_clock, handler) as (adapter, _limiter, _private):
+        fills = await adapter.fetch_executions(priority=RequestPriority.RECONCILE, start_ms=start)
+    assert [fill.ts_ms for fill in fills] == [FAKE_NOW_MS + 900]
+    assert seen == [{"category": "linear", "startTime": str(start), "limit": "100", "settleCoin": "USDT"}]
 
 
 # --- Помилки й повтори ---
@@ -598,7 +615,7 @@ async def test_rate_limit_headers_tighten_the_private_group(fake_clock: FakeCloc
 
 
 def _verify_handler(*, margin: str = "ISOLATED_MARGIN", status: int = 5, index: int = 0) -> Handler:
-    def handler(path: str, _params: dict[str, str | bool]) -> BybitRawResponse:
+    def handler(path: str, _params: Params) -> BybitRawResponse:
         if path == PATH_ACCOUNT_INFO:
             return _raw(_account(margin, status))
         return _raw(_list([_position_row(positionIdx=index, size="0", side="", avgPrice="0")]))
@@ -638,3 +655,72 @@ async def test_unknown_margin_mode_is_malformed_not_guessed(fake_clock: FakeCloc
     async with _open(fake_clock, _verify_handler(margin="SOMETHING")) as (adapter, _limiter, _private):
         with pytest.raises(MalformedResponse, match="marginMode"):
             await adapter.verify_account_config(["BTC/USDT:USDT"])
+
+
+# --- Зв'язування режиму, ключа й транспорту ---
+
+
+@pytest.mark.parametrize(
+    ("mode", "origin"),
+    [
+        (ExchangeMode.DEMO, "https://api.bybit.com"),
+        (ExchangeMode.LIVE, "https://api-demo.bybit.com"),
+        (ExchangeMode.TESTNET, "https://api-testnet.example"),
+    ],
+)
+def test_private_client_of_another_mode_is_refused(fake_clock: FakeClock, mode: ExchangeMode, origin: str) -> None:
+    private = ScriptedPrivateClient(lambda _p, _q: _raw(_ok({})))
+    private.private_origin = origin
+    with pytest.raises(AdapterConfigError, match="приватний URL"):
+        BybitAdapter(
+            mode=mode,
+            limiter=SpyLimiter(fake_clock, role=ProcessRole.TRADING),
+            client=ScriptedClient(_no_public),
+            private_client=private,
+        )
+
+
+def test_private_client_does_not_combine_with_credentials_or_recv_window(fake_clock: FakeClock) -> None:
+    from pydantic import SecretStr
+
+    from app.exchange.bybit_private import BybitCredentials
+
+    credentials = BybitCredentials(api_key=SecretStr("TESTKEYtestkey0123"), api_secret=SecretStr("TESTSECRET0123"))
+    for extra in ({"credentials": credentials}, {"recv_window_ms": 5_000}):
+        with pytest.raises(AdapterConfigError):
+            BybitAdapter(
+                mode=ExchangeMode.TESTNET,
+                limiter=SpyLimiter(fake_clock, role=ProcessRole.TRADING),
+                client=ScriptedClient(_no_public),
+                private_client=ScriptedPrivateClient(lambda _p, _q: _raw(_ok({}))),
+                **extra,  # type: ignore[arg-type]
+            )
+    with pytest.raises(AdapterConfigError, match="recv_window_ms"):
+        BybitAdapter(
+            mode=ExchangeMode.TESTNET,
+            limiter=SpyLimiter(fake_clock, role=ProcessRole.TRADING),
+            client=ScriptedClient(_no_public),
+            recv_window_ms=5_000,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "error sign! origin_string[1700000000000TESTKEYtestkey01235000category=linear]",
+        "Error sign, please check your signature generation algorithm. origin_string[TESTKEYtestkey0123",
+    ],
+)
+async def test_signature_echo_with_the_key_never_reaches_the_exception(fake_clock: FakeClock, message: str) -> None:
+    async with _open(fake_clock, lambda _p, _q: _raw(_err(10004, message))) as (adapter, _limiter, _private):
+        with pytest.raises(ExchangeAuthError) as caught:
+            await adapter.fetch_balance(priority=RequestPriority.RECONCILE)
+    assert "TESTKEY" not in str(caught.value)
+    assert "TESTKEY" not in repr(caught.value)
+    # Той самий рядок підпису в будь-якому іншому коді теж вирізається.
+    async with _open(fake_clock, lambda _p, _q: _raw(_err(10001, message))) as (adapter, _limiter, _private):
+        with pytest.raises(RequestRejected) as rejected:
+            await adapter.fetch_balance(priority=RequestPriority.RECONCILE)
+    assert "TESTKEY" not in str(rejected.value)
+    assert "origin_string[***]" in rejected.value.reason

@@ -50,6 +50,8 @@ from typing import Literal, TypeVar, get_args
 
 from app.core.clock import now_ms
 from app.exchange.errors import (
+    POSITION_SIDE_MISMATCH_CODE,
+    ZERO_POSITION_CODE,
     AdapterConfigError,
     DuplicateClientOrderId,
     ExchangeAuthError,
@@ -1090,9 +1092,11 @@ class FakeExchangeAdapter:
         instrument = self._known_symbol(request.symbol)
         position = self._positions.get(request.symbol)
         if position is None:
-            raise RequestRejected("ZERO_POSITION", "немає позиції для SL/TP")
+            raise RequestRejected(ZERO_POSITION_CODE, "немає позиції для SL/TP")
         if position.side is not request.position_side:
-            raise RequestRejected("POSITION_SIDE_MISMATCH", f"позиція {position.side}, запит {request.position_side}")
+            raise RequestRejected(
+                POSITION_SIDE_MISMATCH_CODE, f"позиція {position.side}, запит {request.position_side}"
+            )
         for name, value in (("stop_loss", request.stop_loss), ("take_profit", request.take_profit)):
             if value is not None and not _is_multiple(value, instrument.tick_size):
                 raise RequestRejected("INVALID_PRICE", f"{name} не кратна tick_size {instrument.tick_size}")

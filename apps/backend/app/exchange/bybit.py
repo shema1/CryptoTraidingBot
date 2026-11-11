@@ -1,13 +1,14 @@
-"""Адаптер Bybit v5: публічні ринкові дані та `fetch_time` (ТЗ §3, §4; T1.3).
+"""Адаптер Bybit v5: публічні ринкові дані, `fetch_time` (T1.3) і приватний REST — читання, запис, перевірка
+акаунта (ТЗ §3, §4, §7, §9; T3.2).
 
-Один клас на demo / testnet / live. Режим змінює лише публічний хост: testnet — `set_sandbox_mode`,
-demo і live — публічний mainnet (ТЗ §13: у demo ринкові дані ті самі, що на mainnet; хост `api-demo`
-лише для приватних методів, T3.2). `category=linear` підставляється в кожен запит даних; інша категорія —
-`AdapterConfigError` до будь-якого вводу-виводу.
+Один клас на demo / testnet / live. Публічний хост: testnet — `set_sandbox_mode`, demo і live — mainnet (ТЗ §13: у
+demo ринкові дані ті самі, що на mainnet). Приватний хост — точним збігом за режимом (`PRIVATE_HOSTS`: testnet,
+`api-demo`, mainnet), перевіряється до першого запиту. `category=linear` підставляється в кожен запит; інша
+категорія — `AdapterConfigError` до будь-якого вводу-виводу.
 
-Торгові методи протоколу (`place_order`, позиції, приватний WS) — T3.2/T3.5. Перевірка one-way і isolated
-теж потребує приватного API і лишається на старті торгового клієнта (T3.2). Цей клас навмисно їх не
-оголошує: до T3.2 він не є повним `ExchangeAdapter`.
+Клас реалізує весь протокол `ExchangeAdapter`; `subscribe_private_stream` до T3.5 явно відмовляє. Конфігурацію
+акаунта (UTA 2.0, isolated, one-way) перевіряє `verify_account_config` — метод адаптера, не протоколу. Транспорт,
+коди й маршрути приватного API — `bybit_private.py`, `bybit_codes.py`; таблиці — `app/exchange/README.md`.
 
 Ціни й кількості беруться з рядків тіла Bybit (`Decimal(str)`). Unified-методи CCXT віддають `float` —
 їх не використовуємо. Усі REST-виклики йдуть через `RateLimiter` (група `MARKET`).
@@ -41,12 +42,12 @@ from __future__ import annotations
 import asyncio
 import random
 import re
-from collections.abc import Awaitable, Callable, Collection, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Final, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias, TypeVar, cast
 from urllib.parse import quote, unquote
 
 from pydantic import ValidationError
@@ -59,26 +60,35 @@ from app.exchange import bybit_codes
 from app.exchange.bybit_codes import (
     PATH_ACCOUNT_INFO,
     PATH_EXECUTION_LIST,
+    PATH_ORDER_CANCEL,
+    PATH_ORDER_CREATE,
     PATH_ORDER_HISTORY,
     PATH_ORDER_REALTIME,
     PATH_POSITION_LIST,
+    PATH_SET_LEVERAGE,
+    PATH_SET_MARGIN_MODE,
+    PATH_TRADING_STOP,
     PATH_WALLET_BALANCE,
     RECV_WINDOW_CODE,
     SUPPORTED_UNIFIED_STATUSES,
     Operation,
 )
 from app.exchange.errors import (
+    POSITION_SIDE_MISMATCH_CODE,
+    ZERO_POSITION_CODE,
     AdapterConfigError,
     ExchangeAuthError,
     ExchangeOutcomeUnknown,
     ExchangeTimeout,
     ExchangeUnavailable,
     MalformedResponse,
+    RequestRejected,
 )
 from app.exchange.rate_limit import (
     FIXED_METHOD_PRIORITY as _FIXED_PRIORITY,
 )
 from app.exchange.rate_limit import (
+    NON_RETRYABLE_METHODS,
     EndpointGroup,
     Jitter,
     RateLimiter,
@@ -101,13 +111,18 @@ from app.exchange.types import (
     MarkIndexCandle,
     OpenInterest,
     Order,
+    OrderAck,
     OrderType,
+    PlaceOrderRequest,
     Position,
+    PositionProtection,
     PositionSide,
     PremiumIndex,
+    PrivateStreamEvent,
     Side,
     Timeframe,
     TimeInForce,
+    TriggerBy,
 )
 
 if TYPE_CHECKING:
@@ -120,6 +135,8 @@ _Point = OpenInterest | PremiumIndex | MarkIndexCandle | LongShortRatio
 _P = TypeVar("_P", bound=_Point)
 _BucketParse = Callable[..., tuple[list[_Point], int, int | None, list[int]]]
 _KlineParse = Callable[..., tuple[list[_Point], int, int, list[int]]]
+# Значення параметра приватного запиту: GET — лише рядки, тіло POST — ще `bool` і ціле (`positionIdx`).
+PrivateValue: TypeAlias = str | bool | int
 
 LINEAR_CATEGORY: Final = "linear"
 # Сторінки Bybit v5 (документація): kline ≤ 1000, funding ≤ 200, instruments ≤ 1000,
@@ -144,8 +161,13 @@ POSITION_PAGE: Final = 200
 ORDER_PAGE: Final = 50
 EXECUTION_PAGE: Final = 100
 EXECUTION_WINDOW_MS: Final = 7 * 24 * 3_600_000
+# `fetch_executions(end_ms=None)`: запас над локальним «зараз», більший за допустимий зсув годинника (1 с, ТЗ §4.3),
+# щоб fill, який біржа вже записала «у своєму зараз», не випав за межу.
+_EXECUTION_CLOCK_SLACK_MS: Final = 5_000
 # Захист від курсора, що ніколи не закінчується, на одному вікні приватного списку.
 _PRIVATE_PAGE_CAP: Final = 200
+# `orderId` Bybit — UUID (36 символів); довший рядок не є id ордера біржі.
+_EXCHANGE_ORDER_ID_MAX: Final = 64
 # Валюта розрахунку лінійних USDT-перпетуалів (ТЗ §0): фільтр списків без символу і монета балансу.
 SETTLE_COIN: Final = "USDT"
 # Скільки транспортних спроб (таймаут, 5xx, обрив) на одне ідемпотентне читання, включно з першою.
@@ -156,6 +178,8 @@ READ_BACKOFF_CAP_MS: Final = 2_000
 _NANO_DIGITS: Final = 21
 _DECIMAL_CHARS: Final = 100
 _MSG_CHARS: Final = 120
+# Рядок підпису, який Bybit може повернути в `retMsg` на невірний підпис (у ньому ключ API). У виняток не потрапляє.
+_ORIGIN_STRING: Final = re.compile(r"origin_string\[[^\]]*\]?", re.IGNORECASE)
 
 PATH_TIME: Final = "v5/market/time"
 PATH_KLINE: Final = "v5/market/kline"
@@ -215,8 +239,23 @@ class ExchangeMode(StrEnum):
     LIVE = "live"
 
 
+# Точний хост приватного REST для кожного режиму. Live — лише mainnet; demo — окремий хост Demo Trading.
+PRIVATE_HOSTS: Final[Mapping[ExchangeMode, str]] = {
+    ExchangeMode.TESTNET: "api-testnet.bybit.com",
+    ExchangeMode.DEMO: "api-demo.bybit.com",
+    ExchangeMode.LIVE: "api.bybit.com",
+}
+
+
+def _assert_private_origin(mode: ExchangeMode, origin: object) -> None:
+    """Приватний хост — рівно той, що для режиму: ключ demo чи testnet не піде на mainnet і навпаки."""
+    expected = f"https://{PRIVATE_HOSTS[mode]}"
+    if origin != expected:
+        raise AdapterConfigError(f"приватний URL Bybit для {mode.value} має бути {expected}")
+
+
 class BybitRawResponse:
-    """Сира відповідь публічного REST: HTTP-статус, розібране JSON-тіло (або рядок), заголовки."""
+    """Сира відповідь REST (публічного чи приватного): HTTP-статус, розібране JSON-тіло (або рядок), заголовки."""
 
     __slots__ = ("body", "headers", "status")
 
@@ -246,7 +285,7 @@ class BybitPublicClient(Protocol):
 
 
 class BybitAdapter:
-    """Публічні методи Bybit. Див. docstring модуля."""
+    """Адаптер Bybit v5 (`ExchangeAdapter`): публічні й приватні методи. Див. docstring модуля."""
 
     def __init__(
         self,
@@ -260,10 +299,15 @@ class BybitAdapter:
         read_attempts: int = READ_ATTEMPTS,
         credentials: BybitCredentials | None = None,
         private_client: BybitPrivateClient | None = None,
-        recv_window_ms: int = DEFAULT_RECV_WINDOW_MS,
+        recv_window_ms: int | None = None,
         on_recv_window_rejected: Callable[[], None] | None = None,
     ) -> None:
         """Без `credentials` і `private_client` приватні методи — `AdapterConfigError` до мережі (публічні дані — так).
+
+        `credentials` (+ `recv_window_ms`, за замовчуванням `DEFAULT_RECV_WINDOW_MS`) — адаптер сам створює клієнт
+        CCXT; `private_client` — готовий транспорт (тести), без `credentials` і `recv_window_ms`. Хост приватного
+        клієнта має точно збігатися з `PRIVATE_HOSTS[mode]`, інакше `AdapterConfigError`: demo-бот не торгуватиме
+        на mainnet через помилку зв'язування.
 
         `on_recv_window_rejected` — що робити на `retCode 10002` (час підпису поза вікном біржі): у торговому процесі —
         `ClockGuard.request_recheck` (T1.6, ТЗ §4.3). Його збій лише логується.
@@ -286,11 +330,18 @@ class BybitAdapter:
         if on_recv_window_rejected is not None and not callable(on_recv_window_rejected):
             raise TypeError("on_recv_window_rejected має бути викликаним")
         self._on_recv_window_rejected = on_recv_window_rejected
-        if private_client is None and credentials is not None:
+        if private_client is not None:
+            if credentials is not None or recv_window_ms is not None:
+                raise AdapterConfigError("private_client передається без credentials і recv_window_ms")
+            _assert_private_origin(mode, private_client.private_origin)
+        elif credentials is not None:
             # Лінивий імпорт: `bybit_private` сам імпортує транспорт із цього модуля.
             from app.exchange.bybit_private import CcxtBybitPrivateClient
 
-            private_client = CcxtBybitPrivateClient(mode, credentials, recv_window_ms=recv_window_ms)
+            window = DEFAULT_RECV_WINDOW_MS if recv_window_ms is None else recv_window_ms
+            private_client = CcxtBybitPrivateClient(mode, credentials, recv_window_ms=window)
+        elif recv_window_ms is not None:
+            raise AdapterConfigError("recv_window_ms без credentials нічого не означає")
         self._private_client = private_client
         self._closed = False
 
@@ -938,9 +989,14 @@ class BybitAdapter:
     async def fetch_order_by_client_id(
         self, *, priority: RequestPriority, symbol: str, client_order_id: str
     ) -> Order | None:
-        """Ордер за `orderLinkId` у будь-якому статусі: спершу `/v5/order/realtime` (знаходить і нещодавно закриті),
-        потім `/v5/order/history` (7 діб; скасовані без fills і відхилені — лише 24 год). `None` — лише коли обидва
-        відповіли й не знайшли. TODO(verify-bybit): як довго закритий ордер видно в realtime (T3.7).
+        """Ордер за `orderLinkId` у будь-якому статусі: спершу `/v5/order/realtime` (за `orderLinkId` біржа ігнорує
+        `openOnly` і шукає і серед активних, і серед останніх 500 закритих), потім `/v5/order/history` (7 діб;
+        скасовані без fills і відхилені — лише 24 год). `None` — лише коли обидва відповіли й не знайшли.
+
+        Обмеження (документація v5): кеш закритих у realtime очищається після рестарту сервісу Bybit, а history
+        «може запізнюватися». Тож `None` одразу після відправки — ще не доказ відсутності: розв'язання
+        `SUBMISSION_UNKNOWN` (T3.3) перевіряє кілька разів із паузами. TODO(verify-bybit), T3.7: MARKET-ордер — пошук
+        одразу після відповіді.
         """
         exchange_id = _canonical_symbol(symbol)
         if type(client_order_id) is not str or not 0 < len(client_order_id) <= CLIENT_ORDER_ID_LEN:
@@ -967,10 +1023,13 @@ class BybitAdapter:
 
         Діапазон ділиться на вікна ≤ 7 діб (обмеження Bybit), кожне — курсором. Funding не повертається (T3.4).
         Дубль `execId` у різних вікнах — один fill; той самий `execId` з іншим змістом — `MalformedResponse`.
-        `end_ms=None` — до локального «зараз». TODO(verify-bybit): `endTime` включний; `settleCoin` без символу.
+        `end_ms=None` — до «зараз» біржі: локальний годинник може відставати (до `CLOCK_DRIFT_LIMIT_MS`, ТЗ §4.3), тож
+        межа — локальне «зараз» плюс `_EXECUTION_CLOCK_SLACK_MS`, а останнє вікно йде без `endTime` (біржа сама бере
+        `startTime + 7 діб`). TODO(verify-bybit): `endTime` включний; `settleCoin` без символу; «лише `startTime`».
         """
         start = _require_ms("start_ms", start_ms)
-        end = now_ms() + 1 if end_ms is None else _require_ms("end_ms", end_ms)
+        open_ended = end_ms is None
+        end = now_ms() + _EXECUTION_CLOCK_SLACK_MS if end_ms is None else _require_ms("end_ms", end_ms)
         if end <= start:
             raise ValueError("end_ms має бути більшим за start_ms")
         scope = _symbol_or_settle(symbol)
@@ -981,10 +1040,11 @@ class BybitAdapter:
             params = {
                 "category": LINEAR_CATEGORY,
                 "startTime": str(window_start),
-                "endTime": str(window_end - 1),
                 "limit": str(EXECUTION_PAGE),
                 **scope,
             }
+            if not (open_ended and window_end == end):
+                params["endTime"] = str(window_end - 1)
             rows = await self._paged(
                 path=PATH_EXECUTION_LIST, params=params, priority=priority, group=EndpointGroup.EXECUTION_LIST
             )
@@ -1014,6 +1074,183 @@ class BybitAdapter:
         rows = await self._position_rows(priority=RequestPriority.RECONCILE, exchange_symbols=requested)
         for row in rows:
             _require_one_way(row)
+
+    # --- Приватні методи: запис (T3.2) ---
+
+    async def place_order(self, request: PlaceOrderRequest, *, priority: RequestPriority) -> OrderAck:
+        """Ордер `/v5/order/create` (one-way, `positionIdx=0`). Викликати лише після коміту `SUBMITTING` (ТЗ §7.2).
+
+        Нативні SL/TP входу — на позицію в режимі `Full` (ТЗ §9.1): SL — `slTriggerBy` з запиту (за замовчуванням
+        mark), TP — last; обидва спрацьовують ринковим ордером. Не повторюється ні після ліміту (`retry=False`), ні
+        після транспортного збою чи збою сервера: усе, крім `RequestRejected`, — `SUBMISSION_UNKNOWN`. Відповідь без
+        нашого `orderLinkId` чи без `orderId` — `MalformedResponse` (теж невизначеність, а не успіх).
+        """
+        if type(request) is not PlaceOrderRequest:
+            raise TypeError("request має бути PlaceOrderRequest")
+        body: dict[str, PrivateValue] = {
+            "category": LINEAR_CATEGORY,
+            "symbol": _canonical_symbol(request.symbol),
+            "side": bybit_codes.SIDE_REQUEST[request.side],
+            "orderType": bybit_codes.ORDER_TYPE_REQUEST[request.order_type],
+            "qty": _wire_decimal(request.qty, what="qty"),
+        }
+        if request.order_type is OrderType.LIMIT:
+            if request.price is None:
+                raise ValueError("LIMIT потребує price")
+            body["price"] = _wire_decimal(request.price, what="price")
+            body["timeInForce"] = bybit_codes.TIME_IN_FORCE_REQUEST[request.time_in_force or TimeInForce.GTC]
+        body["orderLinkId"] = request.client_order_id
+        body["reduceOnly"] = request.reduce_only
+        body["positionIdx"] = bybit_codes.ONE_WAY_POSITION_IDX
+        body.update(
+            _protection_fields(
+                stop_loss=request.stop_loss,
+                take_profit=request.take_profit,
+                sl_trigger_by=request.sl_trigger_by,
+                tp_trigger_by=request.tp_trigger_by,
+            )
+        )
+        result = await self._private_write(
+            path=PATH_ORDER_CREATE,
+            params=body,
+            priority=priority,
+            group=EndpointGroup.ORDER_CREATE,
+            op="place",
+            retry_limit="place_order" not in NON_RETRYABLE_METHODS,
+            client_order_id=request.client_order_id,
+        )
+        order_id = result.get("orderId")
+        if type(order_id) is not str or order_id == "":
+            raise MalformedResponse("bybit: створення ордера без orderId")
+        if result.get("orderLinkId") != request.client_order_id:
+            raise MalformedResponse("bybit: створення ордера повернуло інший orderLinkId")
+        return _build(lambda: OrderAck(client_order_id=request.client_order_id, exchange_order_id=order_id))
+
+    async def cancel_order(
+        self,
+        *,
+        priority: RequestPriority,
+        symbol: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
+    ) -> None:
+        """Скасування `/v5/order/cancel` за **одним** ідентифікатором. Не повторюється (`retry=False`, без повтору
+        після збою): повтор — рішення викликача. `110001`/`110008`/`110010` — `OrderNotActive`. Відповідь про інший
+        ордер — `MalformedResponse`."""
+        exchange_id = _canonical_symbol(symbol)
+        given = [
+            (key, value)
+            for key, value in (("orderLinkId", client_order_id), ("orderId", exchange_order_id))
+            if value is not None
+        ]
+        if len(given) != 1:
+            raise ValueError("cancel_order: потрібен рівно один ідентифікатор ордера")
+        key, value = given[0]
+        limit = CLIENT_ORDER_ID_LEN if key == "orderLinkId" else _EXCHANGE_ORDER_ID_MAX
+        if type(value) is not str or not 0 < len(value) <= limit:
+            raise ValueError(f"cancel_order: ідентифікатор ордера — непорожній рядок до {limit} символів")
+        result = await self._private_write(
+            path=PATH_ORDER_CANCEL,
+            params={"category": LINEAR_CATEGORY, "symbol": exchange_id, key: value},
+            priority=priority,
+            group=EndpointGroup.ORDER_CANCEL,
+            op="cancel",
+            retry_limit="cancel_order" not in NON_RETRYABLE_METHODS,
+        )
+        if result.get(key) != value:
+            raise MalformedResponse("bybit: скасування повернуло інший ордер")
+
+    async def set_leverage(self, *, priority: RequestPriority, symbol: str, leverage: Decimal) -> None:
+        """Плече символу `/v5/position/set-leverage`: one-way — `buyLeverage = sellLeverage`. `110043` (не змінено)
+        — успіх. Лімітер може повторити після ліміту (ідемпотентно); збій мережі чи сервера — без повтору."""
+        exchange_id = _canonical_symbol(symbol)
+        if type(leverage) is not Decimal or not leverage.is_finite() or leverage <= 0:
+            raise ValueError("leverage має бути скінченним Decimal > 0")
+        text = _wire_decimal(leverage, what="leverage")
+        await self._private_write(
+            path=PATH_SET_LEVERAGE,
+            params={"category": LINEAR_CATEGORY, "symbol": exchange_id, "buyLeverage": text, "sellLeverage": text},
+            priority=priority,
+            group=EndpointGroup.SET_LEVERAGE,
+            op="leverage",
+            retry_limit=True,
+        )
+
+    async def set_margin_mode(self, *, priority: RequestPriority, symbol: str, mode: MarginMode) -> None:
+        """Режим маржі. На UTA він один на **весь акаунт** (`/v5/account/set-margin-mode`), тож `symbol` лише
+        перевіряється. Адаптер вмикає тільки `ISOLATED` (ТЗ §0, §9.1): `CROSS` — `AdapterConfigError` до мережі,
+        бо перемкнув би маржу всіх позицій акаунта. Спершу читає `/v5/account/info`: режим уже такий — успіх без
+        запису. Відмова (`110073`, `3400045`) — `RequestRejected` з причинами біржі; успіх з непорожніми `reasons` —
+        `MalformedResponse`."""
+        _canonical_symbol(symbol)
+        if type(mode) is not MarginMode:
+            raise ValueError("mode має бути MarginMode")
+        if mode is not MarginMode.ISOLATED:
+            raise AdapterConfigError("адаптер Bybit вмикає лише ISOLATED_MARGIN (на UTA — для всього акаунта)")
+        info = await self._account_info(priority=priority)
+        if info.margin_mode is mode:
+            return
+        result = await self._private_write(
+            path=PATH_SET_MARGIN_MODE,
+            params={"setMarginMode": bybit_codes.MARGIN_MODE_REQUEST[mode]},
+            priority=priority,
+            group=EndpointGroup.SET_MARGIN_MODE,
+            op="margin",
+            retry_limit=True,
+        )
+        reasons = result.get("reasons", [])
+        if reasons != []:
+            raise MalformedResponse("bybit: успіх зміни режиму маржі з причинами відмови")
+
+    async def set_position_protection(self, request: PositionProtection) -> None:
+        """SL (і TP, якщо заданий) позиції `/v5/position/trading-stop`, `tpslMode=Full`, `positionIdx=0`.
+
+        Ідемпотентність — **читанням** позиції (`position/list` за символом, пріоритет `PROTECTION`): ті самі SL і TP
+        уже стоять — успіх без запису (код «not modified» для `trading-stop` у документації v5 не підтверджено,
+        `TODO(verify-bybit)`; тип тригера в `position/list` не видно). Немає позиції — `RequestRejected`
+        (`ZERO_POSITION`), інша сторона — `RequestRejected` (`POSITION_SIDE_MISMATCH`), без запису. Читання
+        повторюється після збою, запис — ні. Висновок «SL є» робить викликач лише з позиції (ТЗ §9.2).
+        """
+        if type(request) is not PositionProtection:
+            raise TypeError("request має бути PositionProtection")
+        exchange_id = _canonical_symbol(request.symbol)
+        priority = RequestPriority.PROTECTION
+        rows = await self._position_rows(priority=priority, exchange_symbols=[exchange_id])
+        side, stop_loss, take_profit = _protection_state(rows, exchange_id)
+        if side is None:
+            raise RequestRejected(ZERO_POSITION_CODE, f"немає позиції {request.symbol} для SL/TP")
+        if side is not request.position_side:
+            raise RequestRejected(
+                POSITION_SIDE_MISMATCH_CODE, f"позиція {side.value}, запит {request.position_side.value}"
+            )
+        if stop_loss == request.stop_loss and (request.take_profit is None or take_profit == request.take_profit):
+            return
+        body: dict[str, PrivateValue] = {
+            "category": LINEAR_CATEGORY,
+            "symbol": exchange_id,
+            "tpslMode": bybit_codes.TPSL_MODE_FULL,
+            "positionIdx": bybit_codes.ONE_WAY_POSITION_IDX,
+        }
+        protection = _protection_fields(
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            sl_trigger_by=request.sl_trigger_by,
+            tp_trigger_by=request.tp_trigger_by,
+        )
+        protection.pop("tpslMode", None)
+        body.update(protection)
+        await self._private_write(
+            path=PATH_TRADING_STOP,
+            params=body,
+            priority=priority,
+            group=EndpointGroup.TRADING_STOP,
+            op="protection",
+            retry_limit=True,
+        )
+
+    def subscribe_private_stream(self) -> AsyncGenerator[PrivateStreamEvent, None]:
+        """Приватний WebSocket — T3.5. До того — явна відмова на першій ітерації, а не тихий порожній потік."""
+        return _private_stream_refused()
 
     # --- Приватний транспорт ---
 
@@ -1081,11 +1318,36 @@ class BybitAdapter:
             raise MalformedResponse(f"bybit: порожній успіх читання {path}")
         return body
 
+    async def _private_write(
+        self,
+        *,
+        path: str,
+        params: Mapping[str, PrivateValue],
+        priority: RequestPriority,
+        group: EndpointGroup,
+        op: Operation,
+        retry_limit: bool,
+        client_order_id: str | None = None,
+    ) -> dict[str, object]:
+        """Запит, що змінює стан: без транспортного повтору (повтор — рішення машини станів або викликача, ТЗ §7.2).
+        `{}` — біржа відповіла «не змінено» (успіх ідемпотентного запису)."""
+        body = await self._private(
+            path=path,
+            params=params,
+            priority=priority,
+            group=group,
+            op=op,
+            retry_limit=retry_limit,
+            retry_transport=False,
+            client_order_id=client_order_id,
+        )
+        return {} if body is None else _result(body)
+
     async def _private(
         self,
         *,
         path: str,
-        params: Mapping[str, str | bool],
+        params: Mapping[str, PrivateValue],
         priority: RequestPriority,
         group: EndpointGroup,
         op: Operation,
@@ -1123,7 +1385,7 @@ class BybitAdapter:
         self,
         client: BybitPrivateClient,
         path: str,
-        params: Mapping[str, str | bool],
+        params: Mapping[str, PrivateValue],
         group: EndpointGroup,
     ) -> Callable[[], Awaitable[BybitRawResponse]]:
         async def operation() -> BybitRawResponse:
@@ -1151,8 +1413,10 @@ class BybitAdapter:
         if code is None:
             raise MalformedResponse("bybit: немає retCode")
         if code != "0":
-            text = _message(response.body) or ""
+            text = _ORIGIN_STRING.sub("origin_string[***]", _message(response.body) or "")
             short = " ".join(text.split())[:_MSG_CHARS]
+            if op == "margin":
+                short = _with_reasons(short, response.body)
             if code == RECV_WINDOW_CODE:
                 self._notify_recv_window()
             error = bybit_codes.error_for(op, code, short, client_order_id=client_order_id)
@@ -2092,6 +2356,86 @@ def _flag(row: dict[str, object], key: str) -> bool:
     if type(raw) is not bool:
         raise MalformedResponse(f"bybit: {key} не є bool")
     return raw
+
+
+def _wire_decimal(value: Decimal, *, what: str) -> str:
+    """`Decimal` → рядок запиту Bybit без експоненти (`1E+1` → `10`), лише скінченне й > 0."""
+    if type(value) is not Decimal or not value.is_finite() or value <= 0:
+        raise ValueError(f"{what} має бути скінченним Decimal > 0")
+    return format(value, "f")
+
+
+def _protection_fields(
+    *,
+    stop_loss: Decimal | None,
+    take_profit: Decimal | None,
+    sl_trigger_by: TriggerBy,
+    tp_trigger_by: TriggerBy,
+) -> dict[str, PrivateValue]:
+    """SL/TP режиму `Full`: тригер — із запиту, спрацювання — ринковим ордером (у `Full` Bybit інших не приймає).
+    Поле, якого немає в запиті, не передається (біржа його не змінює; `"0"` означало б «зняти»)."""
+    fields: dict[str, PrivateValue] = {}
+    if stop_loss is None and take_profit is None:
+        return fields
+    fields["tpslMode"] = bybit_codes.TPSL_MODE_FULL
+    if stop_loss is not None:
+        fields["stopLoss"] = _wire_decimal(stop_loss, what="stop_loss")
+        fields["slTriggerBy"] = bybit_codes.TRIGGER_BY_REQUEST[sl_trigger_by]
+        fields["slOrderType"] = bybit_codes.TPSL_ORDER_TYPE
+    if take_profit is not None:
+        fields["takeProfit"] = _wire_decimal(take_profit, what="take_profit")
+        fields["tpTriggerBy"] = bybit_codes.TRIGGER_BY_REQUEST[tp_trigger_by]
+        fields["tpOrderType"] = bybit_codes.TPSL_ORDER_TYPE
+    return fields
+
+
+def _protection_state(
+    rows: list[dict[str, object]], exchange_id: str
+) -> tuple[PositionSide | None, Decimal | None, Decimal | None]:
+    """Сторона, SL і TP ненульової позиції символу з `position/list`; `(None, None, None)` — позиції немає.
+
+    Рядок hedge mode — `AdapterConfigError`; чужий символ, від'ємний розмір чи дві ненульові позиції one-way —
+    `MalformedResponse` (захист не вгадує, яку позицію він захищає)."""
+    found: tuple[PositionSide, Decimal | None, Decimal | None] | None = None
+    for row in rows:
+        _require_one_way(row)
+        if row.get("symbol") != exchange_id:
+            raise MalformedResponse("bybit: position/list повернув інший символ")
+        size = _decimal(_optional_text(row, "size"), what="size")
+        if size < 0:
+            raise MalformedResponse("bybit: від'ємний розмір позиції")
+        if size == 0:
+            continue
+        if found is not None:
+            raise MalformedResponse("bybit: дві ненульові позиції one-way одного символу")
+        side = _POSITION_SIDES.get(_optional_text(row, "side"))
+        if side is None:
+            raise MalformedResponse("bybit: сторона ненульової позиції не Buy/Sell")
+        found = (side, _optional_price(row, "stopLoss"), _optional_price(row, "takeProfit"))
+    return (None, None, None) if found is None else found
+
+
+def _with_reasons(message: str, body: object) -> str:
+    """Причини відмови `set-margin-mode` (`result.reasons[]`: код і текст біржі, без секретів) — у текст винятку."""
+    result = body.get("result") if type(body) is dict else None
+    reasons = result.get("reasons") if type(result) is dict else None
+    if type(reasons) is not list:
+        return message
+    parts: list[str] = []
+    for item in reasons[:3]:
+        if type(item) is not dict:
+            continue
+        code = item.get("reasonCode")
+        text = item.get("reasonMsg")
+        code_text = code if type(code) is str else "?"
+        reason_text = " ".join(text.split())[:_MSG_CHARS] if type(text) is str else ""
+        parts.append(f"{code_text}: {reason_text}")
+    return message if not parts else f"{message} ({'; '.join(parts)})"
+
+
+async def _private_stream_refused() -> AsyncGenerator[PrivateStreamEvent, None]:
+    raise AdapterConfigError("приватний WebSocket Bybit ще не реалізовано (T3.5)")
+    yield  # недосяжно: робить функцію async-генератором, як вимагає протокол
 
 
 def _require_one_way(row: dict[str, object]) -> None:

@@ -176,7 +176,8 @@ class ExchangeAdapter(Protocol):
         `stop_loss`, ТЗ §9.2), а не з результату чи типу винятку цього виклику: `RequestRejected` — цей запит не
         застосовано (попередній SL міг лишитися), `ExchangeOutcomeUnknown` — невідомо. Рух SL лише в бік зменшення
         ризику перевіряє Position Protection Manager, а не адаптер.
-        TODO(verify-bybit): код «not modified» для `trading-stop` (T3.2).
+        Bybit: ідемпотентність — читанням позиції перед записом (код «not modified» для `trading-stop` у документації
+        v5 немає, TODO(verify-bybit) — T3.7); немає позиції чи інша сторона — `RequestRejected` без запису.
         Пріоритет фіксований: `PROTECTION` — зняти його аргументом неможливо.
         """
         ...
@@ -188,7 +189,8 @@ class ExchangeAdapter(Protocol):
     async def set_margin_mode(self, *, priority: RequestPriority, symbol: str, mode: MarginMode) -> None:
         """Встановити режим маржі. Ідемпотентно: той самий режим — успіх.
 
-        TODO(verify-bybit): в Unified Trading Account режим маржі задається на рівні акаунта, а не символу (T3.2/T3.7).
+        Bybit UTA: режим один на весь акаунт (документація v5, `/v5/account/set-margin-mode`), `symbol` лише
+        перевіряється. Адаптер Bybit вмикає тільки `ISOLATED`; `CROSS` — `AdapterConfigError` до мережі (ТЗ §0, §9.1).
         """
         ...
 

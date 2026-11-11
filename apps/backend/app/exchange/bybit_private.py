@@ -3,7 +3,7 @@
 Ключі — `BybitCredentials` (`SecretStr`): значення розкриваються лише один раз, при створенні клієнта CCXT, і
 ніколи не потрапляють у логи, повідомлення винятків чи `repr`. Звідки їх брати (`.env`, `Settings`) — T3.6.
 
-Хост приватного API — за режимом, точним збігом (`PRIVATE_HOSTS`): testnet — `api-testnet.bybit.com`
+Хост приватного API — за режимом, точним збігом (`bybit.PRIVATE_HOSTS`): testnet — `api-testnet.bybit.com`
 (`set_sandbox_mode`), demo — `api-demo.bybit.com` (`enable_demo_trading`), live — `api.bybit.com`. Інший хост —
 `AdapterConfigError` до будь-якого запиту.
 
@@ -30,6 +30,8 @@ from app.exchange.bybit import (
     HTTP_TIMEOUT_MS,
     BybitRawResponse,
     ExchangeMode,
+    PrivateValue,
+    _assert_private_origin,
     _CcxtTransport,
     _load_ccxt,
     _wire_query,
@@ -37,12 +39,9 @@ from app.exchange.bybit import (
 from app.exchange.bybit_codes import PRIVATE_ROUTES
 from app.exchange.errors import AdapterConfigError, ExchangeUnavailable
 
-# Точний хост приватного REST для кожного режиму. Live — лише mainnet; demo — окремий хост Demo Trading.
-PRIVATE_HOSTS: Final[Mapping[ExchangeMode, str]] = {
-    ExchangeMode.TESTNET: "api-testnet.bybit.com",
-    ExchangeMode.DEMO: "api-demo.bybit.com",
-    ExchangeMode.LIVE: "api.bybit.com",
-}
+# Ціле в тілі POST — лише ці поля (документація v5: `positionIdx` — integer). Кількість чи ціна цілим — помилка
+# викликача: числа йдуть рядком без експоненти.
+_INTEGER_FIELDS: Final = frozenset({"positionIdx"})
 
 
 class BybitCredentials(BaseModel):
@@ -70,10 +69,11 @@ class BybitPrivateClient(Protocol):
         """Схема й хост приватного REST без шляху, напр. `https://api-testnet.bybit.com`."""
         ...
 
-    async def request(self, path: str, params: Mapping[str, str | bool]) -> BybitRawResponse:
+    async def request(self, path: str, params: Mapping[str, PrivateValue]) -> BybitRawResponse:
         """Один підписаний запит на шлях з `bybit_codes.PRIVATE_ROUTES` (метод — з маршруту).
 
-        Мережева помилка — `ExchangeTimeout` / `ExchangeUnavailable`, не порожнє тіло. GET приймає лише рядки.
+        Мережева помилка — `ExchangeTimeout` / `ExchangeUnavailable`, не порожнє тіло. GET приймає лише рядки, тіло
+        POST — рядки, `bool` і ціле лише для `positionIdx`: числа мають прийти вже рядком без експоненти.
         """
         ...
 
@@ -137,7 +137,7 @@ class CcxtBybitPrivateClient(_CcxtTransport):
     def private_origin(self) -> str:
         return self._origin
 
-    async def request(self, path: str, params: Mapping[str, str | bool]) -> BybitRawResponse:
+    async def request(self, path: str, params: Mapping[str, PrivateValue]) -> BybitRawResponse:
         if self._closed:
             raise ExchangeUnavailable("клієнт Bybit закрито")
         route = PRIVATE_ROUTES.get(path)
@@ -151,8 +151,10 @@ class CcxtBybitPrivateClient(_CcxtTransport):
             wire = _wire_query({key: str(value) for key, value in params.items()})
         else:
             for key, value in params.items():
-                if type(key) is not str or type(value) not in (str, bool):
-                    raise TypeError("тіло приватного POST Bybit — рядки й bool")
+                if type(key) is not str or type(value) not in (str, bool, int):
+                    raise TypeError("тіло приватного POST Bybit — рядки, bool і цілі")
+                if type(value) is int and key not in _INTEGER_FIELDS:
+                    raise TypeError(f"ціле в тілі POST Bybit — лише {sorted(_INTEGER_FIELDS)}")
             wire = dict(params)
         return await self._send(ccxt_method, wire, path=path)
 
@@ -177,10 +179,3 @@ def _private_origin(exchange: Any) -> str:
     if type(template) is not str or "{hostname}" not in template:
         raise AdapterConfigError("CCXT не дав приватний URL Bybit")
     return template.replace("{hostname}", hostname)
-
-
-def _assert_private_origin(mode: ExchangeMode, origin: str) -> None:
-    """Приватний хост — рівно той, що для режиму: ключ demo чи testnet не піде на mainnet і навпаки."""
-    expected = f"https://{PRIVATE_HOSTS[mode]}"
-    if origin != expected:
-        raise AdapterConfigError(f"приватний URL Bybit для {mode.value} має бути {expected}")

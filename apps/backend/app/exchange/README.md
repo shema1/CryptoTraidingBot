@@ -6,13 +6,13 @@
 (live / demo / testnet — один код), `FakeExchangeAdapter` з ін'єкцією збоїв для тестів, централізований rate limiter.
 Прямі виклики CCXT поза цим пакетом заборонені (AGENTS.md інваріант 4).
 
-> Заплановано: T3.2 — методи запису (`place_order`, `cancel_order`, `set_leverage`, `set_margin_mode`,
-> `set_position_protection`) і contract-набір на Testnet; T3.5 — приватний WebSocket.
+> Заплановано: T3.2 — contract-набір на Testnet (коміт 3, потрібні ключі власника); T3.5 — приватний WebSocket.
 > Зараз є контракт, доменні типи, винятки, `FakeExchangeAdapter` (T1.1), rate limiter (T1.2),
 > публічні REST-методи Bybit і `fetch_time` (`bybit.py`, T1.3), моделі БД (T0.4), кеш `instruments`
-> і округлення (T1.7), приватний REST Bybit для читання й перевірка акаунта (`bybit_private.py`, `bybit_codes.py`,
-> T3.2, коміт 1).
-> `BybitAdapter` поки не є повним `ExchangeAdapter`: запис — T3.2 (коміт 2), приватний WS — T3.5.
+> і округлення (T1.7), приватний REST Bybit — читання, запис і перевірка акаунта (`bybit_private.py`,
+> `bybit_codes.py`, T3.2).
+> `BybitAdapter` реалізує весь протокол `ExchangeAdapter` (перевіряє mypy), але `subscribe_private_stream` до T3.5
+> явно відмовляє (`AdapterConfigError` на першій ітерації).
 > Годинник, що випереджає біржу на ~1 с і більше, дає `10002` на всі приватні запити, і на SL та закритті теж —
 > рішення для захисту відкрите (`docs/ai/TASKS.md`, T1.6; повтор із виправленим часом — T3.3/T4).
 > T3.3 (з T1.6): біржа може прийняти запит до `recv_window` + ~1 с після відправки, тож «не знайдено» за
@@ -132,7 +132,7 @@ ExchangeError
 
 **TODO(verify-bybit)** (T3.2/T3.7, і kline — лишається з T1.3): вікно унікальності `orderLinkId`; reduceOnly-ордер більший
 за позицію; чи діє `minNotional` на reduceOnly; яку `qty` мають TP/SL позиції в режимі `Full` і чи видно їх у списку
-відкритих ордерів; режим маржі в UTA — на рівні акаунта; Demo зберігає ордери 7 днів; код «not modified» для
+відкритих ордерів; Demo зберігає ордери 7 днів; код «not modified» для
 `trading-stop`; чи вистачає запасу остаточності kline на mainnet; чи MARKET уже `Filled` одразу після відповіді на Testnet.
 
 ## Публічний Bybit (`bybit.py`, T1.3)
@@ -215,14 +215,16 @@ ExchangeError
 recv_window_ms=..., on_recv_window_rejected=...)`. Без `credentials` (у тестах — без `private_client`) будь-який
 приватний метод — `AdapterConfigError` до мережі. Звідки ключі (`.env`, `Settings`) і перевірка їхніх дозволів — T3.6;
 до того їх передає викликач (contract-набір Testnet — з оточення, `docs/runbooks/getting-started.md`).
-`CcxtBybitPrivateClient` — окремий екземпляр CCXT з ключем. Хост — за режимом, точним збігом (`PRIVATE_HOSTS`):
+`CcxtBybitPrivateClient` — окремий екземпляр CCXT з ключем. Хост — за режимом, точним збігом (`bybit.PRIVATE_HOSTS`):
 testnet — `api-testnet.bybit.com` (`set_sandbox_mode`), demo — `api-demo.bybit.com` (`enable_demo_trading`), live —
-`api.bybit.com`; інший — `AdapterConfigError` до першого запиту. Клієнт відправляє лише шляхи з
+`api.bybit.com`; інший — `AdapterConfigError` до першого запиту. Те саме адаптер перевіряє й для готового
+`private_client` (його не можна поєднувати з `credentials` чи `recv_window_ms`). Клієнт відправляє лише шляхи з
 `bybit_codes.PRIVATE_ROUTES` (11 маршрутів, виведення коштів серед них немає). Підпис робить `sign()` CCXT:
 `X-BAPI-SIGN` = HMAC-SHA256 від `timestamp + key + recvWindow + (query | JSON-тіло)`, `X-BAPI-RECV-WINDOW` =
 `recv_window_ms` (`Settings.recv_window_ms`, `RECV_WINDOW_MS`, 5000 мс), час — локальний годинник
 (`adjustForTimeDifference=False`; розбіжність стереже `ClockGuard`, T1.6). GET-значення кодує клієнт (`_wire_query`,
-курсор — рівно раз; підписано те саме, що пішло в URL), POST — компактний JSON, `bool` — JSON-літерал. Значення
+курсор — рівно раз; підписано те саме, що пішло в URL), POST — компактний JSON, `bool` — JSON-літерал, ціле —
+лише `positionIdx` (числа — рядком без експоненти). Значення
 ключів розкриваються лише при створенні CCXT; `verbose=False`, а DEBUG-записи CCXT (у них заголовки з ключем і
 підписом) приватний клієнт не пише взагалі.
 
@@ -231,7 +233,8 @@ testnet — `api-testnet.bybit.com` (`set_sandbox_mode`), demo — `api-demo.byb
 401 і інший 403 — `ExchangeAuthError`; 404 — `AdapterConfigError`; інший не-200 — `ExchangeOutcomeUnknown`;
 `retCode ≠ 0` — `bybit_codes.error_for(операція, код, ...)` і лог `bybit_private_error` (шлях, операція, код, тип
 винятку; без тіла запиту). Читання: ліміт повторює лімітер (`retry=True`), транспортний збій і `ExchangeUnavailable` —
-адаптер до `read_attempts` з backoff. Запис (коміт 2) транспортно не повторюється: повтор — рішення машини станів.
+адаптер до `read_attempts` з backoff. Запис транспортно не повторюється (`_private_write`): повтор — рішення машини
+станів або викликача.
 
 Коди (`bybit_codes.error_for`, allowlist за документацією v5 від 2026-11-10):
 
@@ -245,14 +248,15 @@ testnet — `api-testnet.bybit.com` (`set_sandbox_mode`), demo — `api-demo.byb
 | `110013` | `leverage` | `RequestRejected` |
 | `110043` | `leverage` | успіх («не змінено») |
 | `110073`, `3400045` | `margin` | `RequestRejected` |
-| `10003`, `10004`, `10005`, `10010` | будь-яка | `ExchangeAuthError` |
+| `10003`, `10004`, `10005`, `10010` | будь-яка | `ExchangeAuthError` без `retMsg` (на невірний підпис Bybit може повернути рядок підпису з ключем) |
 | `10017` | будь-яка | `AdapterConfigError` |
 | `10006` | будь-яка | `RateLimited` (зазвичай раніше його перехоплює лімітер) |
 | `10000`, `10016`, `110079`, `-1`, `429` | будь-яка | `ExchangeUnavailable`: читання повторюється, результат запису невідомий |
 | `10002` | будь-яка | `ExchangeOutcomeUnknown` + колбек `on_recv_window_rejected` (`ClockGuard.request_recheck`) |
 | інший | будь-яка | `ExchangeOutcomeUnknown` |
 
-Збій колбека `on_recv_window_rejected` лише пишеться в лог (`bybit_recv_window_callback_failed`) і не підміняє помилку
+У тексті будь-якого винятку `origin_string[...]` з `retMsg` замінюється на `origin_string[***]`. Збій колбека
+`on_recv_window_rejected` лише пишеться в лог (`bybit_recv_window_callback_failed`) і не підміняє помилку
 запиту. Статуси ордера: `New` і `Created` → `NEW`; `PartiallyFilled`, `Untriggered`, `Triggered`, `Filled`,
 `Rejected`, `Deactivated` — однойменні; `Cancelled` і `PartiallyFilledCanceled` → `CANCELED` (у деривативах
 `Cancelled` буває з `cumExecQty > 0`); інший → `UNKNOWN`. `execType`: `Trade`, `AdlTrade`, `BustTrade`, `Delivery` —
@@ -263,9 +267,20 @@ fill; `Funding` — пропуск (funding — `ledger`, T3.4); інший — 
 | `fetch_balance` | `account/wallet-balance` (`UNIFIED`, `USDT`) → `WALLET_BALANCE` | доступна маржа = `walletBalance − totalPositionIM − totalOrderIM − locked − bonus` (`availableToWithdraw` застарів) |
 | `fetch_positions` | `account/info` → `ACCOUNT_INFO`; `position/list` → `POSITION_LIST` | режим маржі — акаунта (UTA); по запиту на символ або `settleCoin=USDT` з курсором; `positionIdx ≠ 0` → `AdapterConfigError`; нульові пропускаються; SL/TP `""`/`"0"` → `None` |
 | `fetch_open_orders` | `order/realtime` (`openOnly=0`, `limit=50`) → `ORDER_REALTIME` | символ або `settleCoin`, курсор |
-| `fetch_order_by_client_id` | `order/realtime` → `ORDER_REALTIME`, потім `order/history` → `ORDER_HISTORY` | `None` лише коли обидва відповіли без збігу; два рядки з одним `orderLinkId` — `MalformedResponse` |
-| `fetch_executions` | `execution/list` (`limit=100`) → `EXECUTION_LIST` | вікна ≤ 7 діб (`endTime` = кінець вікна − 1), курсор; дубль `execId` — один fill, той самий `execId` з іншим змістом — `MalformedResponse`; за зростанням |
+| `fetch_order_by_client_id` | `order/realtime` → `ORDER_REALTIME`, потім `order/history` → `ORDER_HISTORY` | за `orderLinkId` realtime ігнорує `openOnly` і бачить активні та останні 500 закритих; `None` лише коли обидва відповіли без збігу; два рядки з одним `orderLinkId` — `MalformedResponse`. Кеш закритих очищається після рестарту сервісу Bybit, а history «може запізнюватися», тож `None` одразу після відправки — не доказ (T3.3) |
+| `fetch_executions` | `execution/list` (`limit=100`) → `EXECUTION_LIST` | вікна ≤ 7 діб (`endTime` = кінець вікна − 1), курсор; дубль `execId` — один fill, той самий `execId` з іншим змістом — `MalformedResponse`; за зростанням. `end_ms=None` — межа «локальне зараз + 5 с» (годинник може відставати від біржі), останнє вікно без `endTime` |
 | `verify_account_config(symbols)` | `account/info`, `position/list` (пріоритет `RECONCILE`) | `unifiedMarginStatus` 5 або 6 (UTA 2.0), `marginMode = ISOLATED_MARGIN`, `positionIdx = 0` у кожному рядку символу; інакше `AdapterConfigError`; нічого не перемикає |
+
+| Метод запису | Ендпоінт → група, повтор лімітером | Поведінка |
+| --- | --- | --- |
+| `place_order` | `order/create` → `ORDER_CREATE`, `retry=False` | `positionIdx=0`, `orderLinkId`, `reduceOnly` явно; LIMIT — `price` і `timeInForce` (без TIF — `GTC`), MARKET — без них; SL/TP входу — `tpslMode=Full`, `slTriggerBy`/`tpTriggerBy` з запиту (SL — mark, TP — last), `sl/tpOrderType=Market`; числа — рядком без експоненти; відповідь без нашого `orderLinkId` чи `orderId` — `MalformedResponse` |
+| `cancel_order` | `order/cancel` → `ORDER_CANCEL`, `retry=False` | рівно один з `orderLinkId` / `orderId` (інакше `ValueError` до мережі); відповідь про інший ордер — `MalformedResponse` |
+| `set_leverage` | `position/set-leverage` → `SET_LEVERAGE`, `retry=True` | `buyLeverage = sellLeverage` (one-way); `110043` — успіх |
+| `set_margin_mode` | `account/info` → `ACCOUNT_INFO`, потім `account/set-margin-mode` → `SET_MARGIN_MODE`, `retry=True` | на UTA — на весь акаунт; лише `ISOLATED` (`CROSS` — `AdapterConfigError` до мережі); уже такий — без запису; причини відмови `result.reasons[]` — у тексті `RequestRejected`; успіх з непорожніми `reasons` — `MalformedResponse` |
+| `set_position_protection` | `position/list` → `POSITION_LIST`, потім `position/trading-stop` → `TRADING_STOP`, пріоритет `PROTECTION`, `retry=True` | спершу читання позиції: ті самі SL і TP (TP не заданий — не порівнюється й не передається) — успіх без запису; немає позиції — `RequestRejected("ZERO_POSITION")`, інша сторона — `RequestRejected("POSITION_SIDE_MISMATCH")`; запис — `tpslMode=Full`, `positionIdx=0` |
+
+Жоден запис адаптер не повторює після таймауту, обриву чи збою сервера; `place_order` і `cancel_order` — ще й після
+ліміту. Тип тригера SL у `position/list` не видно, тож ідемпотентність `set_position_protection` порівнює лише ціни.
 
 Курсор пагінації — не більше `_PRIVATE_PAGE_CAP` (200) сторінок, далі `MalformedResponse`. Групу `ACCOUNT_INFO`
 (5/s) додано консервативно: ліміту `/v5/account/info` у таблиці Bybit не знайдено.
@@ -273,7 +288,9 @@ fill; `Funding` — пропуск (funding — `ledger`, T3.4); інший — 
 **TODO(verify-bybit)** → T3.7: формула доступної маржі; чи бачить `order/realtime` умовні ордери без `orderFilter`;
 скільки закритий ордер видно в realtime; `endTime` у `execution/list` включний і `settleCoin` без символу;
 `feeCurrency` linear (порожнє → `USDT`); ліміт `ACCOUNT_INFO`; `110072` саме для `create`; статус акаунта Testnet
-(`unifiedMarginStatus`); `10002` — чи міг запит дійти.
+(`unifiedMarginStatus`); `10002` — чи міг запит дійти; код «not modified» для `trading-stop` (`34040` у v5 не
+задокументовано) і чи `trading-stop` з тими самими цінами змінює тип тригера; коди «вже встановлено» для
+`set-margin-mode`.
 
 ## Публічний потік ліквідацій (`liquidations.py`, T1.10)
 
@@ -346,10 +363,7 @@ fill; `Funding` — пропуск (funding — `ledger`, T3.4); інший — 
 
 Групи публічних методів уже в `bybit.py`: `fetch_time`, `fetch_instruments`, `fetch_candles`, `fetch_funding_history`,
 `fetch_open_interest`, `fetch_premium_index`, `fetch_mark_price_candles`, `fetch_index_price_candles`,
-`fetch_long_short_ratio` → `MARKET`. Приватні читання — таблиця в розділі «Приватний Bybit». Запис (T3.2, коміт 2):
-`place_order` → `ORDER_CREATE` (`retry=False`); `cancel_order` → `ORDER_CANCEL` (`retry=False`);
-`set_position_protection` → `TRADING_STOP` (`retry=True`, ідемпотентний); `set_leverage` → `SET_LEVERAGE`;
-`set_margin_mode` → `SET_MARGIN_MODE`.
+`fetch_long_short_ratio` → `MARKET`. Приватні методи (читання й запис) — таблиці в розділі «Приватний Bybit».
 
 ## `FakeExchangeAdapter` (лише тести)
 
@@ -374,6 +388,9 @@ fill; `Funding` — пропуск (funding — `ledger`, T3.4); інший — 
 - Огляд: `calls` / `calls_to(method)` (включно з невдалими викликами) зберігають `priority` (`None` лише в
   `subscribe_private_stream`; в `args` пріоритет не дублюється), `all_orders()`, `stream_subscribers`,
   `pending_stream_events()`. Фейк лімітер не викликає.
+- Відмінності від Bybit, про які треба пам'ятати в тестах торгового ядра: `set_margin_mode` у фейка — на символ,
+  приймає `CROSS` і з відкритою позицією відмовляє `POSITION_EXISTS`; Bybit (UTA) — на весь акаунт, `CROSS` —
+  `AdapterConfigError`. Коди `ZERO_POSITION_CODE` / `POSITION_SIDE_MISMATCH_CODE` (`errors.py`) — однакові.
 
 ## Кеш інструментів і округлення (T1.7, ТЗ §8.3, §15)
 
@@ -459,7 +476,10 @@ handshake), `test_bybit_private.py` (записані відповіді при�
 `verify_account_config`, відмова без ключів до мережі), `test_bybit_private_ccxt.py` (справжній CCXT з підміненою
 сесією: хости режимів, HMAC перераховується в тесті й збігається з `X-BAPI-SIGN` для GET і POST, курсор закодовано
 раз і підписано в цій формі, маршрут і типи значень до мережі, ключ, секрет і підпис не доходять до записів
-`logging` і текстів помилок), `test_bybit_codes.py` (таблиця кодів записана літералом: кожен відомий код ×
+`logging` і текстів помилок), `test_bybit_private_write.py` (запис: тіла `order/create` з SL/TP `Full` і без,
+`cancel`, плече, режим маржі через читання акаунта й відмова `CROSS`, захист з ідемпотентністю читанням, жоден запис
+не повторюється після збою, групи й `retry` лімітера, відмова приватного потоку, статична перевірка протоколу),
+`test_bybit_codes.py` (таблиця кодів записана літералом: кожен відомий код ×
 кожна операція, лише відмова з переліку — `is_definite_rejection`; статуси, `stopOrderType`, `execType`, режим
 маржі). Повний contract-набір на Testnet/Demo — T3.2, коміт 3: він ставить ордери.
 
@@ -473,6 +493,6 @@ handshake), `test_bybit_private.py` (записані відповіді при�
 | T1.3 | `[x]` | `bybit.py`: `fetch_time`, свічки, інструменти, funding; `category=linear`; група `MARKET` |
 | T1.7 | `[x]` | кеш `instruments`, округлення qty/ціни, пауза `INSTRUMENT_NOT_TRADING`, початок скану свічок від `launchTime` |
 | T1.10 | `[~]` | `liquidations.py`: публічний WS `allLiquidation`, розбір кадру; добовий прогін колектора ще відкритий |
-| T3.2 | `[~]` | приватний REST (ключі, підпис, хости режимів), мапінг кодів, читання, `verify_account_config`; запис і Testnet — далі |
+| T3.2 | `[~]` | приватний REST (ключі, підпис, хости режимів), мапінг кодів, читання, запис, `verify_account_config`; contract-набір на Testnet — далі |
 | T3.5 | `[ ]` | Приватний WebSocket і реконект |
 | T3.8 | `[ ]` | Черга лімітера на акаунт: UID окремо, IP спільний |
