@@ -173,6 +173,8 @@ def test_documented_bybit_limits_are_the_single_source() -> None:
     assert groups[EndpointGroup.SET_LEVERAGE] == GroupLimit(10, 1_000)
     assert groups[EndpointGroup.WALLET_BALANCE] == GroupLimit(50, 1_000)
     assert groups[EndpointGroup.SET_MARGIN_MODE] == GroupLimit(5, 1_000)
+    # Ліміту `/v5/account/info` у таблиці Bybit не знайдено: консервативні 5/s, TODO(verify-bybit) — T3.7.
+    assert groups[EndpointGroup.ACCOUNT_INFO] == GroupLimit(5, 1_000)
     assert EndpointGroup.MARKET not in groups
 
 

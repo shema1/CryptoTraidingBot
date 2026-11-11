@@ -91,6 +91,7 @@
 | 47 | T3.5 | Приватний WebSocket і реконект | R3 | fable / xhigh | T3.2 |
 | 48 | T3.6 | Ключі з `.env` і перевірка дозволів при старті | R2 | opus / high | T0.3, T3.2 |
 | 49 | T3.7 | Перевірка припущень про Bybit на Testnet і Demo | R2 | opus / high | T3.2–T3.5 |
+| 49а | T3.8 | Черга лімітера на акаунт: UID окремо, IP спільний | R3 | fable / xhigh | T1.2, T3.2 |
 | 50 | T4.1 | `RiskGate` і pre-trade перевірки | R3 | fable / xhigh | T2.2, T3.4 |
 | 51 | T4.2 | Ліміти рахунку та статуси Risk Engine | R3 | fable / xhigh | T4.1 |
 | 52 | T4.3 | Position Protection Manager | R3 | fable / xhigh | T3.3, T3.5 |
@@ -98,7 +99,7 @@
 | 54 | T4.5 | Періодична звірка і розрив WS | R3 | fable / xhigh | T4.4 |
 | 55 | T4.6 | Протокол Emergency Stop | R3 | fable / xhigh | T4.2, T4.4 |
 | 56 | T4.7 | Chaos-тести на `FakeExchangeAdapter` | R2 | opus / xhigh | T4.1–T4.6 |
-| 57 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T4.1 |
+| 57 | T5.1 | Статуси бота, OCC, блокування | R3 | fable / xhigh | T0.6, T3.8, T4.1 |
 | 58 | T5.2 | Цикл бота на закритті свічки | R3 | fable / xhigh | T5.1, T2.11, T4.3 |
 | 59 | T5.3 | Входи, виходи, time-stop | R3 | fable / xhigh | T5.2 |
 | 60 | T5.4 | Перемикання моделі (`MODEL_SWAP`) | R3 | fable / xhigh | T5.2 |
@@ -573,7 +574,7 @@
 - **Примітки (2026-11-10):** `app/trading/order_state.py` — граф в одному місці (`TRANSITION_SOURCES` → `ALLOWED_TRANSITIONS`): ТЗ §7.1 + три ребра «скасовано біржею» `OPEN/PARTIALLY_FILLED/SUBMISSION_UNKNOWN → CANCELED` (рішення 0027, підтверджене власником) і джерело події для кожного ребра (факти біржі, зокрема `OPEN → EXPIRED`, — `WS`/`REST`; рішення бота — `LOCAL`; `SUBMISSION_UNKNOWN → REJECTED` — обидва). `check_transition` → `InvariantViolation` + лог error; `exchange_target` (статус біржі → стан). БД: `create_order` (`CREATED`, `new_client_order_id`, подія), `transition_order` (OCC `id/version/state/clientOrderId` + подія в одному savepoint, коміт за викликачем; `OrderConflict`, `LookupError`, `ValueError` для чужого `clientOrderId`; `payload` перевіряється до запису; `exchange_order_id` — лише з подією біржі й обов'язковий на першому факті), `begin_submission` (write-ahead з комітом до повернення). Міграції немає: граф у БД не дублюється, з термінального стану не виводить тригер `ctb_orders_guard()`. Тести: `tests/trading/test_order_state.py` (таблиця ТЗ літералом, декартів добуток, джерела, hypothesis, «пише лише цей модуль»), `tests/trading/test_order_state_db.py` (кожне ребро з кожним джерелом, OCC, підроблений стан/`clientOrderId`, атомарність, payload, write-ahead з іншого з'єднання, конкурентний апдейт). `_wait_until_blocked` (тут і `tests/db/test_concurrency.py`) очищає знімок `pg_stat_activity` на кожній ітерації.
 - **Рев'ю `trading-safety-reviewer` (Opus 5.5, 2026-11-10): блокерів немає, 4 важливі — виправлено.** (1) `OPEN → EXPIRED` з `LOCAL` → подвійна позиція: тепер лише факт біржі, тайм-аут входу — скасування (ТЗ §7.1, 0027, підтверджено власником); (2) `SUBMISSION_UNKNOWN → REJECTED` з біржі не проходив — тепер і `WS`/`REST`; (3) `payload` з `Decimal` падав після UPDATE — перевірка до запису + savepoint; (4) `clientOrderId` ref не звірявся — тепер у WHERE. Дрібні: лог `LookupError`, `exchange_order_id` лише з подією біржі, докстрінг `begin_submission` (виняток — не відправляти; блокування в одному корутині; ізоляція), тест «пише лише цей модуль», прогалини тестів. Передано: `host_id` з конфігу й `allowed_host_id` (T3.6/T5.1), доказ RiskGate перед входом (T4.1).
 
-#### T3.2 · Bybit: торгові методи та мапінг помилок `[ ]`
+#### T3.2 · Bybit: торгові методи та мапінг помилок `[~]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `exchange-adapter` · **ТЗ:** §3, §6.6, §9.1
 - **Зробити:** `place_order` (з нативними TP/SL, `tpslMode=Full`, `reduceOnly`), `cancel_order`, `fetch_order_by_client_id`, `fetch_positions`, `fetch_open_orders`, `set_leverage`, `set_margin_mode`, `set_position_protection`, `fetch_balance`, `fetch_executions`; мапінг кодів помилок у доменні винятки; таймаут ≠ відхилення; one-way + isolated перевіряються на старті.
 - **Готово, коли:** contract-тести на Fake і на Testnet (мінімальний розмір). Рев'ю: `trading-safety-reviewer`.
@@ -585,6 +586,7 @@
   - (T1.7) після відхилення через фільтри — `InstrumentCache.refresh_after_rejection` (коди — `app/exchange/README.md`).
   - (T2.2) у `set_leverage` виставляти `PositionSize.leverage`: воно може бути нижче за `min(конфіг, instruments.max_leverage)`, бо відстань до ліквідації тримає `min_liq_distance_sl_multiple`. Вхідний ордер — лише після підтвердженого `set_leverage` на це значення: інакше лишиться старе, вище плече, і ліквідація може опинитись ближче за SL; не підтверджено — входу немає. Крок `LEVERAGE_STEP` `0.01` — `TODO(verify-bybit)`.
   - (T3.1) мапінг статусів Bybit у `ExchangeOrderStatus`: `PartiallyFilledCanceled` → `CANCELED` з `filled_qty > 0`, `Deactivated` → `DEACTIVATED` (рішення 0027); стан — `order_state.exchange_target`.
+- **Примітки (2026-11-11, коміт 1 з 3 — план: приватний транспорт і читання; запис; contract-набір Testnet):** `app/exchange/bybit_private.py` — `BybitCredentials` (`SecretStr`), `CcxtBybitPrivateClient` (окремий екземпляр CCXT з ключем; хост за режимом точним збігом `PRIVATE_HOSTS`: testnet — `api-testnet`, demo — `api-demo` через `enable_demo_trading`, live — `api.bybit.com`; лише маршрути `PRIVATE_ROUTES`; `recvWindow` = `recv_window_ms`, підпис локальним часом; DEBUG-записи CCXT вимкнено — у них заголовки з ключем). `app/exchange/bybit_codes.py` — allowlist кодів за операцією (`error_for`), статуси (`Cancelled` і `PartiallyFilledCanceled` → `CANCELED`), `execType` (`Funding` — пропуск, невідомий — `MalformedResponse`), `stopOrderType`, режим маржі акаунта. retCode `429` (high server load) — `ExchangeUnavailable`, як інші збої сервера: читання повторюється, результат запису невідомий. `BybitAdapter` (`bybit.py`): спільне ядро `_CcxtTransport` для публічного й приватного клієнтів; `fetch_balance`, `fetch_positions`, `fetch_open_orders`, `fetch_order_by_client_id` (realtime, потім history), `fetch_executions` (вікна ≤ 7 діб, дедуп `execId`), `verify_account_config` (UTA 2.0, `ISOLATED_MARGIN`, one-way; нічого не перемикає); без ключів — `AdapterConfigError` до мережі; `10002` → колбек `on_recv_window_rejected`. `rate_limit.py`: група `ACCOUNT_INFO` (5/s, консервативно, `TODO(verify-bybit)`). Розведення черги лімітера Demo/Live і `role=TRADING` торгового процесу — передано в T3.8. Тести: `tests/exchange/test_bybit_private.py` (записані відповіді), `test_bybit_private_ccxt.py` (справжній CCXT: HMAC перераховується в тесті, ключ і підпис не доходять до записів `logging`), `test_bybit_codes.py` (таблиця кодів літералом). `.env.example` і runbook не змінено: ключі Testnet читатиме лише contract-набір (коміт 3). Далі — коміт 2 (`place_order`, `cancel_order`, `set_leverage`, `set_margin_mode`, `set_position_protection`), рев'ю `trading-safety-reviewer`, коміт 3 (`-m testnet`, ключі власника).
 
 #### T3.3 · Розв'язання `SUBMISSION_UNKNOWN` `[ ]`
 - **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `order-state-machine` · **ТЗ:** §7.2
@@ -594,6 +596,7 @@
   - (T0.4) ордер, знайдений після `REJECTED`, обробляється лише через fills; `IntegrityError` переходу не обриває звірку.
   - (T1.1) ордер зі статусом `UNKNOWN` не є «знайдено» для розв'язання `SUBMISSION_UNKNOWN`.
   - (T1.6) **Рішення користувача** (ТЗ §7.2 не змінено): три перевірки з інтервалом 2–3 с коротші за вікно, в якому Bybit ще може прийняти запит (`recv_window` + ~1 с після відправки), тож «не знайдено → REJECTED» може прийти раніше за пізній вхід. Варіант: остання перевірка — не раніше `submit + recv_window_ms + CLOCK_DRIFT_LIMIT_MS`. `TODO(verify-bybit)`: де Bybit перевіряє `recvWindow`.
+  - (T3.2) `fetch_order_by_client_id` шукає в `order/realtime`, потім в `order/history`: скасовані без fills і відхилені ордери history тримає лише 24 год, тож «не знайдено» пізніше — не доказ відсутності. retCode `10002` — `ExchangeOutcomeUnknown` (не відмова) + `ClockGuard.request_recheck`; повтор `reduceOnly`/SL із виправленим часом — рішення тут (T1.6).
   - (T3.1) переходи — лише `order_state.transition_order`. «Знайдено відхиленим» — `SUBMISSION_UNKNOWN → REJECTED` з `REST`/`WS`, «не знайдено» — з `LOCAL`; «знайдено скасованим» — `→ CANCELED` (0027). Перший факт біржі несе `exchange_order_id`. Застарілі чи повторні статуси (напр. `NEW` при `PENDING_CANCEL`, повторний `FILLED`, `OPEN` при `OPEN`) — no-op, а не `InvariantViolation`; статус, що «перестрибує» стан (`SUBMITTING` + `FILLED`), — через `OPEN` (кожне ребро — подія). Виняток з `begin_submission` — `place_order` не викликати.
 
 #### T3.4 · Fills, `ledger`, `equity_snapshots` `[ ]`
@@ -603,6 +606,7 @@
 - **Передано з попередніх задач** (у дужках — задача, у примітці якої подробиці):
   - (T0.4) ордери `EXCHANGE` — з fill-подій, з `bot_id` і `qty` з виконань; явний мапінг видів `ledger` (TRANSFER, BONUS, комісії ліквідації), невідомий вид — помилка; `equity_snapshots` — `ON CONFLICT DO NOTHING`; символи Bybit → формат CCXT до вставки.
   - (T0.4) обробник fills не оновлює рядок `bots` в одній транзакції зі вставкою ордера/позиції і повторює захисні операції при SQLSTATE `40P01`.
+  - (T3.2) `fetch_executions` funding не повертає (`execType=Funding` — пропуск): для `ledger` funding брати з іншого джерела Bybit (`TODO(verify-bybit)`, не вигадувати ендпоінт). Порожній `feeCurrency` адаптер приймає як `USDT` (`TODO(verify-bybit)`, T3.7).
   - (T3.1) `filled_qty` — кеш `fills`, переходом не пишеться; стан ордера від fills — лише через `transition_order` з джерелом `WS`/`REST`; `payload` події — JSON (`Decimal` → рядок).
 
 #### T3.5 · Приватний WebSocket і реконект `[ ]`
@@ -620,6 +624,7 @@
   - (T0.3) ключі біржі — лише `SecretStr`-поля `Settings` (логер маскує їх за значенням).
   - (T0.4) набір `key_check_result` можна уточнити новою міграцією.
   - (T0.6) процесні тести (`tests/db/test_instance_lock_process.py`) обнуляють `BYBIT_*` в оточенні дочірнього процесу.
+  - (T3.2) ключ адаптера — `bybit_private.BybitCredentials` (`SecretStr`); поля ключів у `Settings` — щоб маскер логів знав значення (`secret_values()`). На старті — `BybitAdapter.verify_account_config(symbols)` до звірки (T4.4); `AdapterConfigError` — боти акаунта не стартують.
   - (T3.1) `create_order(host_id=...)` бере `HOST_ID` від викликача: після T3.6 — лише з конфігу й звірений з `exchange_accounts.allowed_host_id` (інваріант 13).
 
 #### T3.7 · Перевірка припущень про Bybit на Testnet і Demo `[ ]`
@@ -632,7 +637,16 @@
   - (T1.3) чи вистачає `KLINE_FINALITY_MARGIN_MS` (500 мс) на mainnet.
   - (T1.6) де саме Bybit перевіряє `recvWindow` (див. T3.3).
   - (T2.2) крок `set_leverage` для linear USDT: `LEVERAGE_STEP` `0.01` у `app/risk/sizing.py` (`TODO(verify-bybit)`). `isolated_liq_price` — оцінка для порівняння на Testnet, не точна ціна біржі (комісію закриття формула покриває не повністю).
+  - (T3.2) `TODO(verify-bybit)` приватного REST (перелік — `app/exchange/README.md`, «Приватний Bybit»): формула доступної маржі isolated; умовні ордери в `order/realtime` без `orderFilter`; скільки закритий ордер видно в realtime; `endTime` у `execution/list` включний, `settleCoin` без символу; `feeCurrency` linear; ліміт `/v5/account/info`; `110072` саме для `order/create`; `unifiedMarginStatus` акаунта Testnet; `34040` для `trading-stop` (у документації немає); коди «вже встановлено» для `set-margin-mode`.
   - (T3.1, рішення 0027) TODO(verify-bybit): статуси самоскасування Bybit (`PartiallyFilledCanceled` для IOC, скасування `reduceOnly` без позиції, `Deactivated`) — на Testnet.
+
+#### T3.8 · Черга лімітера на акаунт: UID окремо, IP спільний `[ ]`
+- **Ризик:** R3 · **Модель:** Fable 5.1 (`fable`, `xhigh`) · skill `exchange-adapter` · **ТЗ:** §6.5, §8.1
+- **Зробити:** UID-групи `RateLimiter` — окремо на кожен акаунт біржі, частка IP торгового процесу — спільна; пауза на 429 / `10006` одного акаунта не зупиняє запити іншого, IP-бан (HTTP 403 «access too frequent») — зупиняє всі; торговий процес `python -m app` створює лімітер з `role=ProcessRole.TRADING`.
+- **Готово, коли:** тести: 429 акаунта A не затримує `PROTECTION` акаунта B; IP-бан зупиняє обидва; сума запитів акаунтів не перевищує частку IP процесу; заголовки `X-Bapi-Limit*` стискають групу лише свого акаунта.
+- **Передано з попередніх задач** (у дужках — задача, у примітці якої подробиці):
+  - (T1.2) зараз одна черга на процес, тож 429 одного UID зупинить SL іншого (ТЗ §8.1); торговий процес лімітер ще не створює.
+  - (T3.2) `BybitAdapter` бере `limiter` ззовні й ходить у групу ендпоінта (`app/exchange/README.md`, «Приватний Bybit»); адаптер на акаунт — свій, черга UID — має бути своя.
 
 ### Етап 4. Ризик і захист
 

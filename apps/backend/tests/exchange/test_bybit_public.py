@@ -85,10 +85,10 @@ _R = TypeVar("_R")
 class SpyLimiter(RateLimiter):
     """Журнал пріоритету й заголовків поверх справжньої черги (час зрушує `FakeClock`)."""
 
-    def __init__(self, clock: FakeClock) -> None:
+    def __init__(self, clock: FakeClock, *, role: ProcessRole = ProcessRole.COLLECTOR) -> None:
         super().__init__(
             RateLimitConfig(
-                role=ProcessRole.COLLECTOR,
+                role=role,
                 share_pct=50,
                 ip_requests=10_000,
                 backoff_base_ms=1,

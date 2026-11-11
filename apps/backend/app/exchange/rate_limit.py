@@ -135,6 +135,7 @@ class EndpointGroup(StrEnum):
     SET_LEVERAGE = "SET_LEVERAGE"  # POST /v5/position/set-leverage — 10/s
     WALLET_BALANCE = "WALLET_BALANCE"  # GET /v5/account/wallet-balance — 50/s
     SET_MARGIN_MODE = "SET_MARGIN_MODE"  # POST /v5/account/set-margin-mode — 5/s
+    ACCOUNT_INFO = "ACCOUNT_INFO"  # GET /v5/account/info — TODO(verify-bybit): ліміт; консервативно 5/s
 
 
 class RateLimiterError(RuntimeError):
@@ -188,6 +189,7 @@ def default_group_limits() -> Mapping[EndpointGroup, GroupLimit]:
             EndpointGroup.SET_LEVERAGE: GroupLimit(10, per_second),
             EndpointGroup.WALLET_BALANCE: GroupLimit(50, per_second),
             EndpointGroup.SET_MARGIN_MODE: GroupLimit(5, per_second),
+            EndpointGroup.ACCOUNT_INFO: GroupLimit(5, per_second),
         }
     )
 
