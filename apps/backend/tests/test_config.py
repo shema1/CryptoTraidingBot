@@ -91,6 +91,20 @@ def test_secret_values_returns_only_set_secrets() -> None:
     assert sorted(settings.secret_values()) == sorted([DB_PASSWORD, RO_PASSWORD])
 
 
+def test_testnet_key_is_a_secret_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ключ Testnet для contract-набору (T3.2): `SecretStr`, не видно в `repr`/дампі, маскер логів знає значення."""
+    key, secret = "TESTNETkey0123456789", "TESTNETsecret0123456789abcdef"
+    monkeypatch.setenv("BYBIT_TESTNET_API_KEY", key)
+    monkeypatch.setenv("BYBIT_TESTNET_API_SECRET", secret)
+    settings = _settings()
+    assert type(settings.bybit_testnet_api_key) is SecretStr
+    assert type(settings.bybit_testnet_api_secret) is SecretStr
+    assert sorted(settings.secret_values()) == sorted([key, secret])
+    for text in (repr(settings), str(settings), settings.model_dump_json()):
+        assert key not in text
+        assert secret not in text
+
+
 def test_secrets_are_hidden_in_repr_str_and_dump() -> None:
     settings = _settings(postgres_password=SecretStr(DB_PASSWORD))
     assert DB_PASSWORD not in repr(settings)

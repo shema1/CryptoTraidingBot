@@ -77,7 +77,10 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 Межі й точні формулювання — коментарі в `.env.example`, опис полів — `apps/backend/app/core/README.md`.
 
-> Заплановано: ключі біржі `BYBIT_<MODE>_API_KEY` / `BYBIT_<MODE>_API_SECRET` (лише право торгівлі, без виводу) — T3.6;
+Ключ Bybit Testnet (`BYBIT_TESTNET_API_KEY`, `BYBIT_TESTNET_API_SECRET`) потрібен лише для перевірки адаптера біржі
+на Testnet — крок 5Б. Торговий процес його поки не читає.
+
+> Заплановано: ключі біржі для торгівлі `BYBIT_<MODE>_API_KEY` / `BYBIT_<MODE>_API_SECRET` (лише право торгівлі, без виводу) — T3.6;
 > `HOST_ID` комп'ютера й `allowed_host_id` акаунтів — T5.1; токен Telegram — T5.6; URL heartbeat — T5.7. Додавати їх
 > у `.env` зараз не потрібно — конфіг їх ще не читає.
 
@@ -239,6 +242,34 @@ cd apps/backend && caffeinate -i -s uv run python -m app.ml.research iteration-t
 Дані ETH ріжуться по кінцю вже запечатаного відрізка (той самий hold-out, що й у BTC). N для DSR — усі спроби
 журналу, тож у звіті ETH воно стартує з числа спроб BTC. Інший символ або варіант — код 2 (лише новим рішенням).
 
+## 5Б. Перевірка адаптера біржі на Bybit Testnet (ключ Testnet)
+
+Testnet — окрема «пісочниця» Bybit з тестовими грошима: реальних коштів там немає. Набір тестів ставить і скасовує
+ордери, відкриває й закриває мінімальну позицію BTC, тож на Testnet потрібен тестовий баланс.
+
+1. Зареєструйте **окремий** акаунт на <https://testnet.bybit.com> (логін основного акаунта Bybit там не працює).
+2. Поповніть тестовий баланс USDT: на Testnet є кнопка запиту тестових монет (розділ активів). Вистачить ~1000 USDT.
+3. Створіть API-ключ (API Management → Create New Key → ключ, згенерований системою):
+   - права — лише читання й торгівля для контрактів / Unified Trading (ордери, позиції);
+   - **не вмикайте** виведення (Withdraw) і перекази (Transfer);
+   - прив'язку до IP можна не вмикати (Testnet).
+4. Додайте в `.env` (кожне значення — без пробілів і лапок):
+   ```
+   BYBIT_TESTNET_API_KEY=<ключ>
+   BYBIT_TESTNET_API_SECRET=<секрет>
+   ```
+   Секрет Bybit показує один раз — збережіть його в менеджері паролів.
+5. Запустіть набір:
+   ```bash
+   cd apps/backend && uv run pytest -q -m testnet tests/exchange/test_bybit_testnet_contract.py
+   ```
+
+Що робить набір: перевіряє, що обидва хости — Testnet (до першого запиту); перемикає **тестовий** акаунт у режим
+маржі `ISOLATED_MARGIN` (на Unified Trading Account — для всього акаунта Testnet); перевіряє one-way; далі —
+contract-тести: час, інструменти, свічки, баланс, далекий LIMIT-ордер і його скасування, дубль `clientOrderId`,
+вхід MARKET з SL/TP → підтягування SL → вихід reduceOnly → виконання. Позицію, яка вже була за `BTCUSDT`, набір не
+чіпає й падає на передумові. Тест приватного WebSocket позначено як очікувану відмову до T3.5.
+
 ## 6. Веб-інтерфейс (поки каркас)
 
 ```bash
@@ -275,6 +306,13 @@ cd apps/web && npm run dev    # http://127.0.0.1:5173
 | `python -m app.ml.research` → код 13, `research_data_insufficient` | немає свічок або інструментів для символів | крок 5А.1 і воркер |
 | `python -m app.ml.research` → код 10, `research_lock_held` | уже йде інший дослідницький прогін на цій БД | дочекатися його завершення |
 | `python -m app.ml.research` → код 14, `research_split_rejected` | hold-out лінії вже зафіксований першим прогоном, а свіжі дані дають інше вікно | не запускати повторно «для перевірки»: повторний прогін лінії — рішення T2.17 (кожен прогін додає спроби в N) |
+| testnet-набір → `немає ключа Bybit Testnet` | у `.env` немає `BYBIT_TESTNET_API_KEY` / `_SECRET` | крок 5Б |
+| testnet-набір → `ExchangeAuthError: bybit 10003` | ключ не з Testnet (mainnet чи Demo) або видалений | створити ключ саме на testnet.bybit.com, крок 5Б |
+| testnet-набір → `ExchangeAuthError: bybit 10005` | у ключа немає права торгівлі | увімкнути права на ордери й позиції, крок 5Б |
+| testnet-набір → `bybit 10010` | ключ прив'язаний до іншої IP-адреси | зняти прив'язку до IP або додати поточну адресу |
+| testnet-набір → `bybit retCode 10002` | годинник комп'ютера розходиться з біржею | увімкнути синхронізацію часу ОС |
+| testnet-набір → `InsufficientMargin` / `110007` | мало тестових USDT | поповнити тестовий баланс, крок 5Б |
+| testnet-набір → `передумова: позиції за символом немає` | на Testnet уже відкрита позиція BTCUSDT | закрити її вручну на testnet.bybit.com |
 | health → 503, `"database": false` | БД недоступна | `docker compose ps`, крок 4 |
 | змінюючий запит → 503 `IDEMPOTENCY_STORE_UNAVAILABLE` | не застосовано міграції або БД недоступна | `uv run alembic upgrade head` |
 | 403 `HOST_NOT_ALLOWED` / `ORIGIN_NOT_ALLOWED` | запит не на `127.0.0.1:<API_PORT>` або UI з адреси поза `API_ALLOWED_ORIGINS` | відкривати UI з `http://127.0.0.1:5173` або додати адресу в `API_ALLOWED_ORIGINS` |

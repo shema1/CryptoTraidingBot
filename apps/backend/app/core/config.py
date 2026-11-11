@@ -155,8 +155,13 @@ class Settings(BaseSettings):
     )
 
     # --- Час (ТЗ §4.3, T1.6) ---
-    # recvWindow приватних запитів Bybit, мс (2000 … 10000). Використовує торговий клієнт (T3.2).
+    # recvWindow приватних запитів Bybit, мс (2000 … 10000): `BybitAdapter(recv_window_ms=...)` → CCXT (T3.2).
     recv_window_ms: Annotated[int, Field(ge=RECV_WINDOW_MIN_MS, le=RECV_WINDOW_MAX_MS)] = DEFAULT_RECV_WINDOW_MS
+
+    # --- Ключ Bybit Testnet (ТЗ §14): лише право торгівлі, без права виводу ---
+    # Поки читає лише contract-набір `-m testnet` (T3.2); набори ключів усіх режимів і перевірка дозволів — T3.6.
+    bybit_testnet_api_key: SecretStr | None = None
+    bybit_testnet_api_secret: SecretStr | None = None
 
     @field_validator("log_dir")
     @classmethod

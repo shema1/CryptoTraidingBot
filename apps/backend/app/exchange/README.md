@@ -6,7 +6,8 @@
 (live / demo / testnet — один код), `FakeExchangeAdapter` з ін'єкцією збоїв для тестів, централізований rate limiter.
 Прямі виклики CCXT поза цим пакетом заборонені (AGENTS.md інваріант 4).
 
-> Заплановано: T3.2 — contract-набір на Testnet (коміт 3, потрібні ключі власника); T3.5 — приватний WebSocket.
+> Заплановано: T3.2 — прогін contract-набору на Testnet (`test_bybit_testnet_contract.py`), коли власник додасть ключ
+> Testnet у `.env`; T3.5 — приватний WebSocket.
 > Зараз є контракт, доменні типи, винятки, `FakeExchangeAdapter` (T1.1), rate limiter (T1.2),
 > публічні REST-методи Bybit і `fetch_time` (`bybit.py`, T1.3), моделі БД (T0.4), кеш `instruments`
 > і округлення (T1.7), приватний REST Bybit — читання, запис і перевірка акаунта (`bybit_private.py`,
@@ -481,7 +482,10 @@ handshake), `test_bybit_private.py` (записані відповіді при�
 не повторюється після збою, групи й `retry` лімітера, відмова приватного потоку, статична перевірка протоколу),
 `test_bybit_codes.py` (таблиця кодів записана літералом: кожен відомий код ×
 кожна операція, лише відмова з переліку — `is_definite_rejection`; статуси, `stopOrderType`, `execType`, режим
-маржі). Повний contract-набір на Testnet/Demo — T3.2, коміт 3: він ставить ордери.
+маржі), `test_bybit_testnet_contract.py` (`-m testnet`, ключ `BYBIT_TESTNET_API_KEY` / `_SECRET` з `.env` через
+`Settings`; немає ключа — тест падає з інструкцією; обидва хости перевіряються до першого запиту, акаунт Testnet
+переводиться в `ISOLATED_MARGIN` і проходить `verify_account_config`; далі — увесь `ExchangeAdapterContract`, тест
+приватного потоку — `xfail(strict=True)` до T3.5). Contract-набір на Demo — T3.7.
 
 ## Стан реалізації
 

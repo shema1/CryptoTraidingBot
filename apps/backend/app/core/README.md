@@ -75,7 +75,9 @@
 | `research_symbols` | `RESEARCH_SYMBOLS` | BTC, ETH, SOL, XRP, BNB, DOGE, ADA, LTC (`…/USDT:USDT`) | 5–8 USDT-perpetual для навчання (ТЗ §5А.6); у `.env` через кому; дубль або інший формат — помилка валідації |
 | `backfill_start_ms` | `BACKFILL_START_MS` | `1577836800000` | початок історії свічок і funding, мс UTC (2020-01-01T00:00:00Z); має бути кратним 1h |
 | `backfill_interval_s` | `BACKFILL_INTERVAL_S` | `600` | інтервал інкрементального докачування, секунди; 60 … 86400 |
-| `recv_window_ms` | `RECV_WINDOW_MS` | `5000` | recvWindow приватних запитів Bybit, мс; 2000 … 10000. Bybit приймає запит, коли `server_time − recv_window ≤ timestamp < server_time + 1000`: нижня межа — допустиме відставання годинника (1 с) плюс стільки ж на передачу. Годинник, що випереджає біржу на ~1 с і більше, ламає всі приватні запити незалежно від вікна. Поки ні на що не впливає: читатиме торговий клієнт (T3.2, CCXT `options.recvWindow`) |
+| `recv_window_ms` | `RECV_WINDOW_MS` | `5000` | recvWindow приватних запитів Bybit, мс; 2000 … 10000. Bybit приймає запит, коли `server_time − recv_window ≤ timestamp < server_time + 1000`: нижня межа — допустиме відставання годинника (1 с) плюс стільки ж на передачу. Годинник, що випереджає біржу на ~1 с і більше, ламає всі приватні запити незалежно від вікна. Передається в `BybitAdapter(recv_window_ms=...)` → CCXT `options.recvWindow` (T3.2); торговий процес створює адаптер з T3.6/T5 |
+| `bybit_testnet_api_key` | `BYBIT_TESTNET_API_KEY` | — | `SecretStr`; ключ API Bybit Testnet (лише торгівля, без виводу). Поки читає лише contract-набір `-m testnet` (`tests/exchange/test_bybit_testnet_contract.py`, T3.2); набори ключів усіх режимів — T3.6. Маскується в логах за значенням |
+| `bybit_testnet_api_secret` | `BYBIT_TESTNET_API_SECRET` | — | `SecretStr`; секрет того самого ключа |
 
 ## Логування
 
